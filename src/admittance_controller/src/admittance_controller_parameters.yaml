@@ -1,0 +1,423 @@
+admittance_controller:
+  joints: {
+    type: string_array,
+    description: "Specifies which joints will be used by the controller. ",
+    read_only: true
+  }
+  command_joints: {
+    type: string_array,
+    default_value: [],
+    description: "(optional) Specifies the joints for writing into another controllers reference. This parameter is only relevant when chaining the output of this controller to the input of another controller.",
+    read_only: true
+  }
+  command_interfaces:
+    {
+      type: string_array,
+      description: "Specifies which command interfaces the controller will claim.",
+      read_only: true
+    }
+
+  state_interfaces:
+    {
+      type: string_array,
+      description: "Specifies which state interfaces the controller will claim.",
+      read_only: true
+    }
+
+  chainable_command_interfaces:
+    {
+      type: string_array,
+      default_value: ["position", "velocity"],
+      description: "Specifies which reference interfaces the controller will export. Normally, the position and velocity are used.",
+      read_only: true
+    }
+
+  kinematics:
+    plugin_name: {
+      type: string,
+      description: "Specifies the name of the kinematics plugin to load."
+    }
+    plugin_package: {
+      type: string,
+      description: "Specifies the package name that contains the kinematics plugin."
+    }
+    base: {
+      type: string,
+      description: "Specifies the base link of the robot description used by the kinematics plugin."
+    }
+    tip: {
+      type: string,
+      description: "Specifies the end effector link of the robot description used by the kinematics plugin."
+    }
+    alpha: {
+      type: double,
+      default_value: 0.01,
+      description: "Specifies the damping coefficient for the Jacobian pseudo inverse."
+    }
+
+  ft_sensor:
+    name: {
+      type: string,
+      description: "Specifies the name of the force torque sensor in the robot description which will be used in the admittance calculation."
+    }
+    frame:
+      id: {
+        type: string,
+        description: "Specifies the frame/link name of the force torque sensor."
+      }
+    filter_coefficient: {
+      type: double,
+      default_value: 0.05,
+      description: "Specifies the filter coefficient for the sensor's exponential filter."
+    }
+
+  control:
+    frame:
+      id: {
+        type: string,
+        description: "Specifies the control frame used for admittance calculation."
+      }
+
+  fixed_world_frame: # Gravity points down (neg. Z) in this frame (Usually: world or base_link)
+    frame:
+      id: {
+        type: string,
+        description: "Specifies the world frame use for admittance calculation. Gravity must point down in this frame."
+      }
+
+  gravity_compensation:
+    frame:
+      id: {
+        type: string,
+        description: "Specifies the frame which center of gravity (CoG) is defined in. Normally, the force torque sensor frame should be used."
+      }
+    CoG:
+      pos: {
+        type: double_array,
+        description: "Specifies the position of the center of gravity (CoG) of the end effector in the gravity compensation frame.",
+        validation: {
+          fixed_size<>: 3
+        }
+      }
+      force: {
+        type: double,
+        default_value: 0.0,
+        description: "Specifies the weight of the end effector, e.g mass * 9.81."
+      }
+
+  admittance:
+    selected_axes:
+      {
+        type: bool_array,
+        description: "Specifies whether the axes x, y, z, rx, ry, and rz should be included in the admittance calculation.",
+        validation: {
+          fixed_size<>: 6
+        }
+      }
+    mass: {
+      type: double_array,
+      description: "Specifies the mass values for x, y, z, rx, ry, and rz used in the admittance calculation.",
+      validation: {
+        fixed_size<>: 6,
+        element_bounds<>: [ 0.0001, 1000000.0 ]
+      }
+    }
+    damping_ratio: {
+      type: double_array,
+      description: "Specifies damping ratio values for x, y, z, rx, ry, and rz used in the admittance calculation.
+      The damping ratio is defined as: zeta = D / (2 * sqrt( M * S )).
+      Only used on axes whose damping_absolute entry is zero.",
+      validation: {
+        fixed_size<>: 6
+      }
+    }
+    min_normal_drive_force_n: {
+      type: double,
+      default_value: 0.0,
+      description: "Lower bound [N] on the control-frame normal component of the
+      admittance driving force (measured + commanded wrench).  Zero disables it.
+      A wall is a unilateral constraint - it can push the tool away but never
+      pull it in - so a driving force more negative than the commanded press
+      cannot come from real contact.  Without a floor such a value is read as
+      'not pressed hard enough yet' and the compliance dives into the surface at
+      its velocity cap, which turns a transient bad reading into a runaway.
+      Set this to the magnitude of the commanded contact force (or slightly
+      more) so an impossible reading presses at the ordinary rate instead.",
+      validation: {
+        gt_eq<>: [ 0.0 ]
+      }
+    }
+    absolute_normal_force: {
+      type: bool,
+      default_value: false,
+      description: "Treat the measured control-frame normal force as a
+      non-negative reaction magnitude before adding the commanded wrench.
+      This changes only the configured translational normal axis; tangential
+      forces, torques, and the commanded wrench keep their signs.  Enable only
+      for a unilateral contact profile whose sensor normal sign is not stable."
+    }
+    normal_force_hold_lower_n: {
+      type: double,
+      default_value: 0.0,
+      description: "Lower measured normal-reaction boundary [N] for the
+      force-hold band.  Together with normal_force_hold_upper_n, this suppresses
+      force chasing and holds the current normal compliance offset while the
+      measured reaction remains in range.  Zero disables the band.",
+      validation: {
+        gt_eq<>: [ 0.0 ]
+      }
+    }
+    normal_force_hold_upper_n: {
+      type: double,
+      default_value: 0.0,
+      description: "Upper measured normal-reaction boundary [N] for the
+      force-hold band.  Must be greater than normal_force_hold_lower_n when the
+      band is enabled.",
+      validation: {
+        gt_eq<>: [ 0.0 ]
+      }
+    }
+    normal_force_hold_hysteresis_n: {
+      type: double,
+      default_value: 0.0,
+      description: "Inward margin [N] used only when entering the force-hold
+      band.  For an 8..18 N band with 1 N hysteresis, correction stops after
+      entering 9..17 N and restarts only outside 8..18 N.",
+      validation: {
+        gt_eq<>: [ 0.0 ]
+      }
+    }
+    damping_absolute: {
+      type: double_array,
+      default_value: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      description: "Absolute damping D [N*s/m] or [N*m*s/rad] per axis. When an entry is greater
+      than zero it overrides damping_ratio on that axis. Required on force-controlled axes:
+      damping_ratio derives D = zeta * 2 * sqrt(M * S), which collapses to zero damping as the
+      stiffness of that axis approaches zero, leaving an undamped free mass.",
+      validation: {
+        fixed_size<>: 6,
+        element_bounds<>: [ 0.0, 1000000.0 ]
+      }
+    }
+    stiffness: {
+      type: double_array,
+      description: "Specifies the stiffness values for x, y, z, rx, ry, and rz used in the admittance calculation.",
+      validation: {
+        fixed_size<>: 6,
+        element_bounds<>: [ 0.0, 100000000.0 ]
+      }
+    }
+    joint_damping: {
+      type: double,
+      description: "Specifies the joint damping applied used in the admittance calculation.",
+      default_value: 5,
+      validation: {
+        gt_eq: [ 0.0 ]
+      }
+    }
+
+  # RB10 painting safety extension.  The upstream 4.40.1 controller keeps the
+  # last wrench forever; these parameters make the workspace overlay fail
+  # closed and bound the selected TCP normal-axis compliance motion.
+  wrench_reference_timeout_s: {
+    type: double,
+    default_value: 0.10,
+    description: "Maximum age of the last received wrench reference before it is replaced by zero and compliance is disabled.",
+    validation: {
+      gt: [ 0.0 ]
+    }
+  }
+  compliance_enable_timeout_s: {
+    type: double,
+    default_value: 0.10,
+    description: "Maximum age of the explicit compliance-enable heartbeat before compliance is disabled.",
+    validation: {
+      gt: [ 0.0 ]
+    }
+  }
+  compliance_enabled_by_default: {
+    type: bool,
+    default_value: false,
+    description: "Unsafe compatibility switch. Keep false for real painting so a fresh enable heartbeat is mandatory."
+  }
+  normal_axis_index: {
+    type: int,
+    default_value: 1,
+    description: "Translational control-frame axis to bound (0=x, 1=y, 2=z).",
+    validation: {
+      bounds<>: [ 0, 2 ]
+    }
+  }
+  max_normal_trim_m: {
+    type: double,
+    default_value: 0.005,
+    description: "Maximum absolute compliant displacement along the configured normal axis.",
+    validation: {
+      gt: [ 0.0 ]
+    }
+  }
+  max_normal_velocity_mps: {
+    type: double,
+    default_value: 0.010,
+    description: "Maximum absolute compliant Cartesian velocity along the configured normal axis.",
+    validation: {
+      gt: [ 0.0 ]
+    }
+  }
+  max_normal_acceleration_mps2: {
+    type: double,
+    default_value: 0.050,
+    description: "Maximum absolute compliant Cartesian acceleration along the configured normal axis.",
+    validation: {
+      gt: [ 0.0 ]
+    }
+  }
+
+  # Roller line-contact balancing.  The controller shifts the measured F/T
+  # moment from the sensor origin to the configured roller contact centre,
+  # then regulates the inferred centre-of-pressure (CoP) error.  Monitoring
+  # and motion are separate so a new tool can be commissioned fail-closed.
+  roller_balance:
+    monitoring_enabled: {
+      type: bool,
+      default_value: false,
+      read_only: true,
+      description: "Publish contact-centre torque and CoP diagnostics without enabling rotational motion."
+    }
+    control_enabled: {
+      type: bool,
+      default_value: false,
+      read_only: true,
+      description: "Enable bounded rotational admittance for roller balancing. Enable only after F/T sign, tare, CoG, and contact-centre geometry commissioning."
+    }
+    rotation_axis_index: {
+      type: int,
+      default_value: 2,
+      read_only: true,
+      description: "Control-frame rotation axis used to balance the roller (0=rx, 1=ry, 2=rz).",
+      validation: {
+        bounds<>: [ 0, 2 ]
+      }
+    }
+    contact_center_offset_m: {
+      type: double_array,
+      default_value: [0.0, 0.0, 0.0],
+      read_only: true,
+      description: "Vector from control-frame origin to roller/wall contact centre, expressed in the control frame.",
+      validation: {
+        fixed_size<>: 3
+      }
+    }
+    roller_length_m: {
+      type: double,
+      default_value: 0.175,
+      read_only: true,
+      description: "Usable roller line-contact length; CoP bands must lie inside half this value.",
+      validation: {
+        gt: [ 0.0 ]
+      }
+    }
+    minimum_normal_force_n: {
+      type: double,
+      default_value: 8.0,
+      read_only: true,
+      description: "Minimum measured normal reaction and commanded press required before CoP is valid for control.",
+      validation: {
+        gt: [ 0.0 ]
+      }
+    }
+    cop_enter_m: {
+      type: double,
+      default_value: 0.008,
+      read_only: true,
+      description: "Absolute CoP offset at which angular correction starts. Must exceed cop_exit_m.",
+      validation: {
+        gt: [ 0.0 ]
+      }
+    }
+    cop_exit_m: {
+      type: double,
+      default_value: 0.005,
+      read_only: true,
+      description: "Absolute CoP offset below which angular correction stops and the current trim is held.",
+      validation: {
+        gt: [ 0.0 ]
+      }
+    }
+    torque_bias_nm: {
+      type: double,
+      default_value: 0.0,
+      read_only: true,
+      description: "Residual contact-centre torque about the balance axis after the execution-scoped tare."
+    }
+    torque_to_cop_sign: {
+      type: double,
+      default_value: 1.0,
+      read_only: true,
+      description: "Exactly +1 or -1; maps signed contact-centre torque/normal-force to roller-axis CoP direction.",
+      validation: {
+        bounds<>: [ -1.0, 1.0 ]
+      }
+    }
+    rotation_feedback_sign: {
+      type: double,
+      default_value: 1.0,
+      read_only: true,
+      description: "Exactly +1 or -1; maps signed CoP boundary error to corrective rotational wrench.",
+      validation: {
+        bounds<>: [ -1.0, 1.0 ]
+      }
+    }
+    filter_time_constant_s: {
+      type: double,
+      default_value: 0.10,
+      read_only: true,
+      description: "Additional first-order contact-torque filter time constant. Zero disables this extra filter.",
+      validation: {
+        gt_eq<>: [ 0.0 ]
+      }
+    }
+    max_rotation_trim_rad: {
+      type: double,
+      default_value: 0.008726646259971648,
+      read_only: true,
+      description: "Hard measured/commanded balance-axis rotation envelope (default 0.5 degree). Normal corrections brake inside soft_limit_ratio times this value.",
+      validation: {
+        gt: [ 0.0 ]
+      }
+    }
+    soft_limit_ratio: {
+      type: double,
+      default_value: 0.9,
+      read_only: true,
+      description: "Fraction of the hard rotation envelope used for smooth command braking/holding. Soft saturation does not abort the painting path.",
+      validation: {
+        gt: [ 0.0 ],
+        lt: [ 1.0 ]
+      }
+    }
+    max_rotation_velocity_radps: {
+      type: double,
+      default_value: 0.003490658503988659,
+      read_only: true,
+      description: "Maximum balance-axis angular velocity (default 0.2 degree/s).",
+      validation: {
+        gt: [ 0.0 ]
+      }
+    }
+    max_rotation_acceleration_radps2: {
+      type: double,
+      default_value: 0.017453292519943295,
+      read_only: true,
+      description: "Maximum balance-axis angular acceleration (default 1 degree/s^2).",
+      validation: {
+        gt: [ 0.0 ]
+      }
+    }
+
+  # general settings
+  enable_parameter_update_without_reactivation: {
+    type: bool,
+    default_value: true,
+    description: "If enabled, the parameters will be dynamically updated while the controller is running."
+  }

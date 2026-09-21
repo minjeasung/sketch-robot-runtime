@@ -1,0 +1,21 @@
+RR-00A_B__EOAT no-camera roller52 mesh metadata
+=================================================
+
+source_visual: rr_00a_b_eoat_no_camera_visual.stl
+source_collision: rr_00a_b_eoat_no_camera_collision.stl
+outputs:
+  - rr_00a_b_eoat_no_camera_visual_roller52.stl
+  - rr_00a_b_eoat_no_camera_collision_roller52.stl
+
+Only the separated roller cylinder component was modified.
+The roller component original bounding box was approximately:
+  x length: 0.175 m
+  y diameter: 0.077 m
+  z diameter: 0.077 m
+
+The generated roller52 component bounding box is:
+  x length: 0.175 m
+  y diameter: 0.052 m
+  z diameter: 0.052 m
+
+The bracket/support geometry and mesh origin were preserved.

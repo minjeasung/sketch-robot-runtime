@@ -1,0 +1,8 @@
+mode,force_n,duration_s,description
+APPROACH,0.0,2.0,move near surface with MoveIt/JTC while wrench reference is zero
+RAMP_UP,1.0,2.0,ramp to a small validation force
+CONTACT,1.0,5.0,externally execute a contact path segment
+RAMP_DOWN,0.0,1.0,ramp force reference to zero
+RETRACT,0.0,2.0,lift from the surface with wrench reference zero
+NONCONTACT,0.0,3.0,externally execute a clearance travel segment
+IDLE,0.0,2.0,hold zero wrench

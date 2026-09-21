@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>스케치 로봇 시스템</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#101720;color:#ecf1f8}body{max-width:1050px;margin:40px auto;padding:0 24px}h1{font-size:28px;margin-bottom:8px}p{color:#afbdd0;line-height:1.6}.panel{background:#192331;border:1px solid #334257;border-radius:12px;padding:22px;margin:20px 0}.row{display:flex;gap:16px;flex-wrap:wrap;align-items:center}label{display:flex;gap:8px;align-items:center}input,select,button,a.button{font:inherit;border-radius:7px;padding:10px;border:1px solid #475974;background:#223247;color:inherit}button,a.button{cursor:pointer;text-decoration:none}button.primary{background:#1d65c1;border-color:#3e8ced}button:disabled{opacity:.4;cursor:default}input[type=checkbox]{accent-color:#579dfa}.process-row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:12px 0;border-bottom:1px solid #334257}.process-row span{flex:1;min-width:250px}.process-row button{padding:6px 10px}pre{max-height:320px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;line-height:1.6}#error{color:#ffadad;white-space:pre-wrap}#state{font-weight:700;color:#8fc7ff}#profile-help{min-height:26px}.caption{font-size:13px}a{color:#8fc7ff}summary{cursor:pointer}
+</style></head><body>
+<h1>스케치 로봇 시스템</h1><p>로봇과 카메라를 한 번에 시작하고, 스케치 화면에서 작업하세요.</p>
+<section class="panel"><div class="row"><strong>시스템</strong><span id="state">확인 중</span><span id="domain" class="caption"></span></div><p id="detail">API 서버 연결 중…</p>
+<div class="row"><label>API 토큰 <input type="password" id="token" autocomplete="off" placeholder="설정한 경우 입력"></label><button id="connect">연결 확인</button><a href="/docs" target="_blank">API 문서 ↗</a></div><br><div class="row"><label>실행 모드 <select id="profile"><option value="dry_run">실장비 연결 · 모의 실행</option><option value="work">실장비 연결 · 작업 허용</option><option value="fake">가상 하드웨어 · 모의 실행</option></select></label><label>로봇 IP <input id="robot-ip" value="10.0.2.7" size="13"></label></div>
+<p id="profile-help">로봇·카메라에 연결하지만 작업 경로와 힘 출력은 모의 실행합니다.</p>
+<div class="row"><label><input type="checkbox" id="zed" checked>ZED 시작</label><label><input type="checkbox" id="d405" checked>D405 시작</label><label><input type="checkbox" id="rviz" checked>RViz 표시</label></div>
+<p class="caption">카메라 드라이버를 별도로 실행한 경우 해당 카메라의 체크를 해제하세요.</p>
+<div class="row"><button id="start" class="primary" disabled>전체 시작</button><button id="stop" disabled>전체 종료</button><a class="button" href="/sketch/" target="_blank" rel="noopener">스케치 화면 열기 ↗</a></div>
+<p id="error" role="alert"></p></section>
+<section class="panel"><strong>프로세스 관리</strong><p class="caption">선행 프로세스가 실행 중이어야 개별 시작할 수 있습니다. 종료·재시작 시 의존 프로세스도 종료됩니다.</p><div id="processes"></div></section>
+<section class="panel"><strong>작업 준비 상태</strong><p id="readiness">시스템을 시작하면 표시됩니다.</p><p class="caption">프로세스 기동과 작업 준비 상태는 별도로 확인합니다. 실제 작업은 스케치 화면에서 실행합니다. 전체 종료는 비상정지 버튼을 대체하지 않습니다.</p><details><summary>상태 상세</summary><pre id="status-json"></pre></details></section>
+<section class="panel"><strong>실행 로그</strong> <select id="log-process"></select><pre id="logs">아직 실행 로그가 없습니다.</pre></section>
+<script src="/sketch/js/system.js"></script></body></html>

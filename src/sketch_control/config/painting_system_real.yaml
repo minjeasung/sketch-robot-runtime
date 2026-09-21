@@ -1,0 +1,711 @@
+# Authoritative RB10 roller-painting profile.
+#
+# Safe startup contract:
+#   real_painting_enabled=false, dry_run=true, force output disabled.
+# A real contact run must explicitly override all three interlocks from the
+# top-level launch: real_painting_enabled:=true dry_run:=false
+# painting_force_enabled:=true.
+
+# This section is appended last to ros2_control_node by the top-level launch.
+# It is the authoritative painting controller profile; the older
+# rbpodo_bringup/admittance_profiles/painting_normal_y.yaml remains only for
+# backward-compatible launches that do not use rb10_painting_system.launch.py.
+admittance_controller:
+  ros__parameters:
+    wrench_reference_timeout_s: 0.10
+    compliance_enable_timeout_s: 0.10
+    compliance_enabled_by_default: false
+    normal_axis_index: 1
+    # Displacement budget the compliance may consume before the trim limit is
+    # reported.  It must cover the whole geometric uncertainty chain, not just
+    # the nominal contact: D405 plane RMS residual (4 mm) + normal angle error
+    # over the 175 mm roller half-length (~1.5 mm/deg) + contact-search stop
+    # overshoot (~1 mm) + wall texture.  The previous 5 mm was smaller than
+    # that sum, so an ordinary surface aborted on ADMITTANCE_TRIM_LIMIT.
+    max_normal_trim_m: 0.020
+    # Normal-axis tracking rate needed to follow surface waviness at the
+    # 20 mm/s paint traverse.
+    # The prior 15 mm/s cap was visible as a normal-direction wave while the
+    # tool traversed tangentially.  Three millimetres per second still follows
+    # a 15% surface slope at the 20 mm/s paint speed without repeatedly diving
+    # into and unloading the roller.
+    max_normal_velocity_mps: 0.003
+    # Must stay above the ordinary contact transient F/M, otherwise the clamp
+    # saturates on every normal ramp.  0.050 saturated at 0.4 N with M = 6 kg.
+    # Reach the 3 mm/s correction cap in about 60 ms instead of stepping to it
+    # in one controller cycle.
+    max_normal_acceleration_mps2: 0.05
+
+    # v5 roller line-contact balance.  Diagnostics run immediately, but the
+    # rotational output stays fail-closed until the signed end-load test and
+    # tool CoG/contact-centre checks in docs/ROLLER_BALANCE_CONTROL.md pass.
+    # The ros2_control loop remains 100 Hz.  A 0.10 s torque filter plus the
+    # low angular rate/acceleration limits gives a deliberately slow response.
+    roller_balance:
+      monitoring_enabled: true
+      control_enabled: false
+      # Roller long axis = TCP +X, wall normal = TCP +Y, so end-load balance
+      # is the moment about TCP +Z.
+      rotation_axis_index: 2
+      # Outer roller/wall contact centre measured from the TCP origin.
+      contact_center_offset_m: [0.0, -0.27020, 0.0]
+      roller_length_m: 0.175
+      minimum_normal_force_n: 8.0
+      # Start correcting beyond 8 mm; stop inside 5 mm and hold that trim.
+      # This is a force-scaled torque band T=Fn*x, not a fixed zero target.
+      cop_enter_m: 0.008
+      cop_exit_m: 0.005
+      torque_bias_nm: 0.0
+      torque_to_cop_sign: 1.0
+      rotation_feedback_sign: 1.0
+      filter_time_constant_s: 0.10
+      max_rotation_trim_rad: 0.008726646259971648       # 0.5 deg
+      # Brake the COMMANDED offset inside +/-0.45 deg. Ordinary soft
+      # saturation holds only the correction, not the 20 mm/s painting path.
+      soft_limit_ratio: 0.9
+      max_rotation_velocity_radps: 0.003490658503988659 # 0.2 deg/s
+      max_rotation_acceleration_radps2: 0.017453292519943295 # 1 deg/s^2
+
+    ft_sensor:
+      # tau = dt * (1 - alpha) / alpha.  At the 100 Hz controller rate 0.02
+      # gives tau = 0.49 s, which is 10 mm of travel at paint speed before a
+      # force change is even visible - and it moves back toward the 0.005
+      # value that controllers_admittance.yaml documents as too slow.
+      # 0.20 gives tau = 0.04 s.
+      filter_coefficient: 0.20
+
+    gravity_compensation:
+      frame: {id: tcp}
+      # Must be measured before real contact painting is enabled.
+      CoG:
+        pos: [0.0, 0.0, 0.0]
+        force: 0.0
+
+    admittance:
+      # TCP +Y is the force-compliant surface normal. v5's dedicated roller
+      # balance path conditionally adds Rz itself only when
+      # roller_balance.control_enabled=true; leaving Rz false here preserves
+      # the monitor-only commissioning default.
+      selected_axes: [false, true, false, false, false, false]
+      mass: [10.0, 6.0, 10.0, 1.0, 1.0, 1.0]
+      # A force-controlled axis must not carry a position spring: the K*x term
+      # competes with the commanded force, so the steady-state force error is
+      # K * (surface error).  At 1000 N/m that was 1.0 N per mm against a
+      # 1.6 N target, and 1.6 N could only ever produce 1.6 mm of travel.
+      # 100 N/m gives 0.1 N/mm and 16 mm of authority.
+      # 100 N/m on the normal axis is the configuration that completed a full
+      # 20/20 job at a 3 N target (2026-08-14).  K=0 (pure force control) was
+      # tried once and is architecturally cleaner - it removes the 0.3 N
+      # steady-state error and decouples force from waypoint placement - but it
+      # was not validated, and it makes damping_absolute[1] the only damping
+      # source (the damping_ratio fallback derives 0 when stiffness is 0).
+      # Revisit it deliberately, not while chasing something else.
+      stiffness: [1000.0, 100.0, 1000.0, 100.0, 100.0, 10.0]
+      # Retained for the position-controlled axes only.
+      damping_ratio: [2.828427, 3.266, 2.828427, 2.828427, 2.828427, 2.828427]
+      # Absolute damping wins where it is non-zero.  Required here: with the
+      # normal stiffness reduced, damping_ratio would derive
+      # D = zeta * 2 * sqrt(M * S) and collapse toward an undamped free mass.
+      # D = 160 N*s/m gives 19 mm/s of normal travel at a 3.0 N error.
+      # damping_ratio[1] is set so the ratio path yields the same 160.0, so a
+      # dropped override cannot silently produce an undamped axis.
+      # 160 raises the wall-coupled damping ratio 0.44 -> 0.59 (Ke~3000):
+      # the 2026-08-14 run showed a 2.5 s 0<->5.5 N entry bounce at 1.6 N
+      # target; at 3.0 N the same 3.4x peak ratio would hit the 8 N
+      # envelope.  Free-space authority at 3 N error is still 19 mm/s.
+      # 2026-08-14 measured on the wall: the normal force limit-cycled at
+      # 2.20 Hz, +-3.08 N about a 2.84 N mean.  Inverting that gives a contact
+      # stiffness of ~1046 N/m, so the +-3 N swing is +-2.9 mm of penetration
+      # about a 2.9 mm equilibrium - the roller reached zero penetration every
+      # cycle and bounced, which the operator could see as the EOAT trembling
+      # along the normal.  Linear stability was fine (zeta 0.96); the chatter
+      # comes from the contact being unilateral, so the cure is to overdamp.
+      # 300 gives zeta 1.81. The profile-level 3 mm/s cap is the active normal
+      # correction-rate authority.
+      # Rz uses explicit damping because its stiffness is removed while the
+      # contact trim is held. Final angular slew/braking limits are applied
+      # AFTER joint damping; contact stability still requires commissioning.
+      damping_absolute: [0.0, 300.0, 0.0, 0.0, 0.0, 25.0]
+      # Unilateral-contact floor on the normal driving force. Set just above
+      # the commissioned drive bound: real contact can never drive the compliance
+      # harder into the wall than the command asks for, so anything beyond
+      # this is a bad reading and must not be acted on.  Without it a normal
+      # reading that fell to -46 N drove the trim in at the velocity cap
+      # (2026-08-14).  The force monitor still sees the unclamped wrench.
+      # Must stay ABOVE the commanded contact force: with the tool off the
+      # surface the legitimate driving force is exactly -command, so a floor
+      # below that would clamp ordinary approach and cap the reachable force.
+      # Keep the commissioned 32 N defensive bound unchanged.
+      min_normal_drive_force_n: 32.0
+      # The RBPodo/AFT normal channel has reversed sign while contact was
+      # physically maintained.  Interpret measured TCP normal force as a
+      # reaction magnitude, then add the still-signed -Y press command.
+      # This does not absolute tangential forces, torques, or commands.
+      absolute_normal_force: true
+      # True boundary controller, not a hidden midpoint target. From below it
+      # corrects toward 21 N; from above it corrects toward 29 N. Once entered,
+      # preserve the current normal trim throughout the full 20..30 N band.
+      normal_force_hold_lower_n: 20.0
+      normal_force_hold_upper_n: 30.0
+      normal_force_hold_hysteresis_n: 1.0
+      joint_damping: 12.0
+
+# Normal real-painting path: the executor stops at the measured 10 mm
+# pre-contact pose and invokes the repeatable runtime tare under fresh
+# force-off/compliance-off/stationary heartbeats. The fixed-bias supervised
+# profile below is a disabled legacy fallback, not the normal execution path.
+rbpodo_ft_tare:
+  ros__parameters:
+    # The execution-scoped tare is performed at the measured 10 mm
+    # pre-contact pose. Do not run a competing launch-pose tare on activation.
+    auto_tare_on_activate: false
+    runtime_tare:
+      max_stddev: [0.5, 0.5, 0.5, 0.05, 0.05, 0.05]
+      max_abs_post_tare_residual: [0.5, 0.5, 0.5, 0.05, 0.05, 0.05]
+      min_recent_joint_samples: 50
+      max_recent_joint_excursion_rad: 0.0005
+      max_tare_joint_excursion_rad: 0.001
+    supervised_tare:
+      enabled: false
+      # 2026-08-11 real rbpodo SystemState.eft profile. Commissioned with the
+      # roller fully free, compliance off, the robot stationary, and the joint
+      # pose below. The joint envelope identifies this tare pose; it is not a
+      # collision-clearance guarantee and never replaces visual free-space confirmation.
+      expected_bias: [65.77, 2.47, 276.00, -1.955, 0.997, -0.1155]
+      max_abs_bias_delta: [1.0, 1.0, 1.0, 0.1, 0.1, 0.05]
+      max_stddev: [0.5, 0.5, 0.5, 0.05, 0.05, 0.05]
+      expected_joint_positions: [0.0003189465, -0.9519414306, 2.4623770714,
+        -1.6286282539, 1.5665779114, -0.00009492455]
+      max_abs_joint_position_delta_rad: [0.01, 0.01, 0.01, 0.01, 0.01, 0.01]
+      min_recent_joint_samples: 50
+      max_recent_joint_excursion_rad: 0.0005
+      max_tare_joint_excursion_rad: 0.001
+
+moveit_executor:
+  ros__parameters:
+    execution_backend: follow_joint_trajectory
+    follow_joint_trajectory_action: /joint_trajectory_controller/follow_joint_trajectory
+    use_eoat_segments: true
+    real_painting_enabled: false
+    dry_run: true
+    painting_force_enabled: false
+    require_contact_before_paint: true
+
+    # v2 compatibility only; v3 uses the separated values below.
+    segment_contact_offset_m: 0.026
+    minimum_travel_clearance_m: 0.010
+    max_paint_force_n: 45.0
+    painting_ramp_feedback_timeout_s: 6.0
+    painting_ramp_settle_s: 0.10
+    # Zero preserves the normal path behavior. Set explicitly for a stationary
+    # one-point commissioning PAINT row only.
+    stationary_paint_hold_s: 0.0
+
+    contact_geometry_offset_m: 0.026
+    # Stop one centimetre off the measured surface, tare in this exact pose,
+    # then let the bounded CONTACT_SEARCH consume at most this clearance.
+    precontact_clearance_m: 0.010
+    travel_clearance_m: 0.010
+    safety_approach_offset_m: 0.080
+    final_retreat_offset_m: 0.080
+    contact_search_step_m: 0.0005
+    contact_search_max_distance_m: 0.020
+    # The bounded search is 40 steps of 0.5 mm over contact_search_max_distance_m.
+    # At 2 mm/s each step costs ~0.25 s of travel plus a MoveIt Cartesian plan
+    # round trip. A full-distance search therefore needs substantially more
+    # time than the former timeout allowed.
+    # contact_search_max_distance_m stays the real safety bound.
+    # 40 steps x (0.25 s travel + ~0.2 s planning + 0.15 s inter-step dwell
+    # for contact-confirmation settling) ~= 24 s worst case; 30 s keeps the
+    # timeout a liveness guard, never the effective bound - the distance
+    # limit above remains the real safety bound.
+    contact_search_timeout_s: 30.0
+    contact_search_speed_mps: 0.002
+    contact_search_mode_ack_timeout_s: 1.0
+    # Guard status is source-stamped at 100 Hz. A mode edge must receive an
+    # exact post-command ACK before force motion may continue.
+    force_guard_status_timeout_s: 0.50
+    force_guard_mode_ack_timeout_s: 1.0
+    # A PAINT Cartesian request is made with force/compliance already armed.
+    # Never leave that physical state waiting indefinitely for MoveIt.
+    # A PAINT Cartesian request is issued with force and compliance already
+    # armed, so this bounds how long the roller may sit loaded while MoveIt
+    # plans.  3.0 s was tuned on a small work area; a 0.85 x 0.79 m area with
+    # its larger collision scene overran it and aborted a healthy run
+    # (2026-08-14).  Holding a stationary 3 N against the wall for longer is
+    # harmless, and the monitor envelope still guards the force independently.
+    paint_cartesian_planning_timeout_s: 15.0
+    ft_timeout_s: 0.20
+    fjt_result_timeout_margin_s: 5.0
+    # A cancel the controller has ACCEPTED still needs its terminal result
+    # delivered; 2026-08-14 a contact-search early-stop cancel was accepted
+    # and the CANCELED result took >2 s to arrive (DDS/CPU hiccup), tripping
+    # the unknown-motion latch and killing the job.  The robot is already
+    # decelerating after acceptance, so a longer wait costs only latency.
+    fjt_cancel_timeout_s: 5.0
+    runtime_tare_enabled: true
+    runtime_tare_service: /rbpodo_ft_tare/runtime_free_space_tare
+    runtime_tare_timeout_s: 20.0
+    # Settle time between trajectory stop and the hardware tare request.
+    # The hardware demands 0.5 s of joint history within 0.0005 rad; servo
+    # ringing after an approach stop can exceed that for >1 s, and a rejected
+    # tare ("joints moved immediately before the request") terminates the
+    # whole multi-row job (observed 2026-08-14 at row 2, step 8/20, with the
+    # old 0.75 s).  A later third-stroke tare still measured 0.54 N Fz
+    # standard deviation after 2.0 s (0.50 N limit), so hold the stopped pose
+    # for 3.0 s before sampling.  The noise threshold itself remains unchanged.
+    runtime_tare_quiet_s: 3.0
+    runtime_tare_min_clearance_m: 0.010
+    runtime_tare_min_actual_clearance_m: 0.007
+    runtime_tare_max_tcp_position_error_m: 0.003
+    runtime_tare_max_tcp_orientation_error_deg: 3.0
+    runtime_tare_max_tcp_tf_age_s: 0.20
+    runtime_tare_verify_duration_s: 0.40
+    runtime_tare_max_force_norm_n: 0.75
+    runtime_tare_max_torque_norm_nm: 0.10
+
+sketch_to_waypoints:
+  ros__parameters:
+    eoat_segment_frame: link0
+    publish_eoat_segments: true
+    real_painting_enabled: false
+    dry_run: true
+    # Keep the commissioned 20 mm/s traverse speed. The row force value is the
+    # 20 N lower-band activation request; the controller regulates a 20..30 N
+    # band and does not chase this as a point target.
+    default_paint_force_n: 20.0
+
+    contact_geometry_offset_m: 0.026
+    precontact_clearance_m: 0.010
+    travel_clearance_m: 0.010
+    safety_approach_offset_m: 0.080
+    final_retreat_offset_m: 0.080
+    roller_length_m: 0.175
+    fill_overlap: 0.30
+
+    # Commissioning speeds (2026-08-14, operator request): free-space moves
+    # run at survey speed.  paint_speed_mps is deliberately NOT one of them:
+    # it is the only speed that drags a loaded roller across the wall.  At
+    # 0.05 m/s the first traverse jammed 3 s in - tangential 2.5 -> 8.5 N and
+    # torque 0.23 -> 1.95 Nm within one second, then a sustained -50 N normal
+    # load that persisted after the robot stopped.  With rx/rz compliance
+    # still disabled the tool cannot yield to a catching roller, so raise
+    # this one only in small steps with the torque trace watched.
+    # 2026-08-14: all speeds restored to the values that were in use during
+    # the runs that completed a paint stroke.  Raising them was tried while
+    # chasing a stroke-not-executing fault and did not explain it.
+    paint_speed_mps: 0.020
+    approach_speed_mps: 0.005
+    contact_search_speed_mps: 0.002
+    contact_search_max_distance_m: 0.020
+    # The bounded search is 40 steps of 0.5 mm over contact_search_max_distance_m.
+    # At 2 mm/s each step costs ~0.25 s of travel plus a MoveIt Cartesian plan
+    # round trip. A full-distance search therefore needs substantially more
+    # time than the former timeout allowed.
+    # contact_search_max_distance_m stays the real safety bound.
+    # 40 steps x (0.25 s travel + ~0.2 s planning + 0.15 s inter-step dwell
+    # for contact-confirmation settling) ~= 24 s worst case; 30 s keeps the
+    # timeout a liveness guard, never the effective bound - the distance
+    # limit above remains the real safety bound.
+    contact_search_timeout_s: 30.0
+    retract_speed_mps: 0.010
+    travel_speed_mps: 0.030
+
+    work_area_pixel_tolerance_px: 1.0
+    work_area_containment_tolerance_m: 0.001
+    work_area_plane_tolerance_m: 0.002
+
+wall_projector:
+  ros__parameters:
+    front_view_source: d405
+    allow_wall_fallback: false
+    d405_image_topic: /d405/d405/color/image_raw
+    d405_camera_info_topic: /d405/d405/color/camera_info
+    d405_optical_frame: d405_color_optical_frame
+
+d405_surface_refiner:
+  ros__parameters:
+    defer_target_capture_until_arrival: true
+    cloud_topic: /d405/d405/depth/color/points
+    require_capture_trigger: true
+    lock_after_refinement: true
+    stable_samples: 1
+    spatial_samples: 1
+    max_spatial_samples: 1
+    capture_timeout_s: 1.2
+
+    max_points: 120000
+    voxel_size_m: 0.003
+    ransac_iterations: 180
+    roi_margin_m: 0.080
+    roi_plane_window_m: 0.30
+    target_roi_half_width_m: 0.35
+    target_roi_half_height_m: 0.35
+    min_roi_points: 150
+    min_inliers: 100
+    min_inlier_ratio: 0.65
+    ransac_distance_threshold_m: 0.004
+    max_rms_residual_m: 0.004
+    max_residual_m: 0.012
+    max_fit_residual_m: 0.012
+    max_normal_delta_deg: 12.0
+    max_plane_shift_m: 0.25
+    max_tf_age_s: 0.25
+    # ZED gives the global seed; D405 is authoritative for the final wall.
+    # Fit a broad candidate, then validate only its coherent local support.
+    support_band_half_width_m: 0.006
+    min_broad_inlier_ratio: 0.15
+    min_support_points: 100
+    support_span_quantile: 0.02
+    min_support_span_m: 0.15
+    max_target_support_offset_m: 0.32
+    min_secondary_plane_inliers: 100
+    max_secondary_plane_relative_inliers: 0.60
+    min_secondary_plane_separation_m: 0.020
+    min_secondary_plane_normal_delta_deg: 5.0
+    calibration_file: ~/sketch_robot_ws/d405_eyeinhand_charuco_calibration.json
+    calibration_hash_check_period_s: 1.0
+
+environment_scanner:
+  ros__parameters:
+    scan_accumulation_sec: 5.0
+    auto_scan_on_start: false
+    auto_rescan: false
+    publish_scene_obstacles: false
+    obstacle_voxel_m: 0.050
+
+painting_wrench_reference:
+  ros__parameters:
+    requested_wrench_topic: /painting_admittance/requested_wrench_reference
+    wrench_reference_topic: ""
+    base_frame: link0
+    tcp_frame: tcp
+    ft_frame: ft_link
+    surface_normal_tcp_axis: +y
+    target_wrench_axis: force_y
+    target_wrench_sign: -1.0
+    # Force-pipeline ramp/activation request. In the active real profile the
+    # admittance controller interprets this as the 20 N band floor, not as a
+    # single force setpoint.
+    desired_contact_force_n: 20.0
+    enable_force: false
+    dry_run: true
+    publish_rate_hz: 100.0
+    force_ramp_up_duration_s: 3.0
+    force_ramp_down_duration_s: 3.0
+    max_command_force_n: 45.0
+    # Keep the commissioned slew cap unchanged; the three-second ramp remains
+    # the authoritative band-entry timing.
+    max_force_slew_rate_nps: 10.0
+    publish_zero_wrench_when_not_in_contact_mode: true
+    zero_wrench_on_abort: true
+    dwell_contact_enabled: false
+    tf_lookup_timeout_s: 0.02
+
+# Non-real-time event recorder. Samples remain in memory during ordinary
+# motion; an interlock/motion-abort writes the preceding window and a short
+# post-trigger tail under ~/.ros/painting_interlock_records.
+interlock_flight_recorder:
+  ros__parameters:
+    enabled: true
+    pretrigger_seconds: 12.0
+    posttrigger_seconds: 3.0
+    # Empty selects ~/.ros/painting_interlock_records for the launching user.
+    output_directory: ""
+
+painting_wrench_guard:
+  ros__parameters:
+    requested_wrench_topic: /painting_admittance/requested_wrench_reference
+    controller_wrench_reference_topic: /admittance_controller/wrench_reference
+    compliance_enable_topic: /admittance_controller/compliance_enable
+    compliance_active_topic: /admittance_controller/compliance_active
+    normal_limit_reached_topic: /admittance_controller/normal_limit_reached
+    controller_fault_topic: /painting_admittance/controller_fault
+    ft_wrench_topic: /force_torque_sensor_broadcaster/wrench
+    ft_frame: ft_link
+    tcp_frame: tcp
+    real_painting_enabled: false
+    publish_rate_hz: 100.0
+
+    requested_wrench_timeout_s: 0.10
+    mode_timeout_s: 0.20
+    enable_timeout_s: 0.20
+    executor_heartbeat_timeout_s: 0.20
+    ft_timeout_s: 0.20
+    tf_timeout_s: 0.20
+    safety_status_timeout_s: 0.20
+    controller_status_timeout_s: 0.20
+    compliance_activation_timeout_s: 0.50
+    normal_limit_abort_duration_s: 0.25
+
+    max_command_force_n: 45.0
+    max_command_torque_nm: 0.0
+    tf_lookup_timeout_s: 0.01
+    shutdown_zero_publish_count: 5
+
+painting_force_monitor:
+  ros__parameters:
+    input_wrench_topic: /force_torque_sensor_broadcaster/wrench
+    raw_wrench_topic: /force_torque_sensor_broadcaster_raw/wrench
+    controller_fault_topic: /painting_admittance/controller_fault
+    normal_limit_reached_topic: /admittance_controller/normal_limit_reached
+    normal_limit_abort_duration_s: 0.25
+    roller_balance_limit_reached_topic: /admittance_controller/roller_balance/limit_reached
+    roller_balance_limit_abort_duration_s: 0.25
+    ft_frame: ft_link
+    tcp_frame: tcp
+
+    # Every millisecond here is contact-search overshoot: the search runs with
+    # compliance off, so detection lag converts directly into wall penetration
+    # at the search speed and into a force spike the robot cannot absorb.
+    force_filter_tau_s: 0.04
+    force_deadband_n: 0.5
+    torque_deadband_nm: 0.02
+    bias_sample_duration_s: 1.0
+    update_bias_in_noncontact: true
+    # Eligibility gate for forming the adaptive monitor bias.  It must sit
+    # ABOVE the worst-case post-hardware-tare residual plus eft drift,
+    # otherwise the executor's PRECONTACT_TARE deadlocks in
+    # WAIT_MONITOR_BIAS: the drift the bias exists to absorb blocks the bias
+    # from ever forming (observed 2026-08-14: 1.2-1.56 N steady against the
+    # old 1.0 N gate -> timeout).  Contact safety does not rest on this
+    # gate: bias formation additionally requires IDLE + force off +
+    # stationary + operator-confirmed free space + 2 s contact holdoff.
+    bias_max_force_norm_n: 2.5
+    bias_max_torque_norm_nm: 0.3
+    bias_contact_holdoff_s: 2.0
+
+    # Retained for legacy signed mode and diagnostics.  The real profile below
+    # uses |TCP Fy| so either measured sign confirms the same wall reaction.
+    contact_force_sign: 1.0
+    absolute_normal_force: true
+    # Confirm first touch around the operator-requested 3-4 N range, still well
+    # below the 30..40 N process band. The lower release threshold supplies enough
+    # hysteresis that ordinary roller vibration does not chatter contact state.
+    contact_detect_threshold_n: 3.5
+    contact_release_threshold_n: 2.0
+    contact_confirm_duration_s: 0.04
+    travel_collision_threshold_n: 8.0
+    # Log-only warning on |TCP Fy|; no latch. This sits above the 40 N band.
+    over_force_warn_n: 60.0
+    # Global ceiling applied as min(per-mode force_axis_n[1], this) across
+    # every mode - a backstop, not the active limit. The operator-selected
+    # 100 N is a global backstop; the 90 N force-active axis envelope remains
+    # the earlier binding limit. Both remain below the AFT200 200 N nominal
+    # single-axis rating and its 300 N limit rating.
+    over_force_abort_n: 100.0
+    sensor_force_saturation_n: 190.0
+    sensor_torque_saturation_nm: 14.0
+
+    stale_timeout_s: 0.20
+    raw_stale_timeout_s: 0.20
+    max_message_age_s: 0.20
+    tf_valid_timeout_s: 0.20
+    tf_lookup_timeout_s: 0.02
+    reset_max_force_norm_n: 1.0
+    reset_max_torque_norm_nm: 0.2
+    # Contact detection reaches the executor through this timer; at 50 Hz it
+    # added 20 ms of pure overshoot to the compliance-off search.
+    publish_rate_hz: 100.0
+
+    # Filtered and raw six-axis envelopes. Nested keys are flattened by the
+    # ROS parameter parser to limits.<mode>.<field>.
+    #
+    # The force-active modes use a 90 N normal-axis ceiling for the 30..40 N
+    # hold band. This is intentionally generous commissioning headroom;
+    # CONTACT_SEARCH and non-contact modes keep their tighter independent
+    # limits. Inspect every 9 N trace before increasing these values further.
+    limits:
+      paint:
+        # 30..40 N band with wide transient/tangential headroom.
+        force_axis_n: [35.0, 90.0, 35.0]
+        force_norm_n: 110.0
+        # With load fully shifted to one end of the 175 mm roller, 40 N can
+        # create about 3.5 Nm. Keep the torque envelope independent from the
+        # normal-force band so ordinary line-load imbalance is not mistaken
+        # for a jam while a larger tool moment still stops the process.
+        torque_axis_nm: [6.0, 6.0, 6.0]
+        torque_norm_nm: 8.0
+        force_derivative_nps: 500.0
+        torque_derivative_nmps: 40.0
+        # Raw data runs ahead of the filtered signal, so keep the existing
+        # commissioning window above the filtered envelope.
+        raw_force_axis_n: [60.0, 150.0, 60.0]
+        raw_force_norm_n: 170.0
+        raw_torque_axis_nm: [10.0, 10.0, 10.0]
+        raw_torque_norm_nm: 13.0
+        raw_force_derivative_nps: 3000.0
+        raw_torque_derivative_nmps: 200.0
+        unexpected_contact_n: 0.0
+        filtered_debounce_s: 0.02
+        raw_debounce_s: 0.02
+      ramp_up:
+        # Match PAINT so the 30 N band-entry ramp has the same envelope.
+        force_axis_n: [35.0, 90.0, 35.0]
+        force_norm_n: 110.0
+        # Match the PAINT line-load moment allowance during force ramp-up.
+        torque_axis_nm: [6.0, 6.0, 6.0]
+        torque_norm_nm: 8.0
+        force_derivative_nps: 500.0
+        torque_derivative_nmps: 40.0
+        raw_force_axis_n: [60.0, 150.0, 60.0]
+        raw_force_norm_n: 170.0
+        raw_torque_axis_nm: [10.0, 10.0, 10.0]
+        raw_torque_norm_nm: 13.0
+        raw_force_derivative_nps: 3000.0
+        raw_torque_derivative_nmps: 200.0
+        unexpected_contact_n: 0.0
+        filtered_debounce_s: 0.02
+        raw_debounce_s: 0.02
+      ramp_down:
+        # Match PAINT while the force command slews back to zero.
+        force_axis_n: [35.0, 90.0, 35.0]
+        force_norm_n: 110.0
+        # Match the PAINT line-load moment allowance while slewing to zero.
+        torque_axis_nm: [6.0, 6.0, 6.0]
+        torque_norm_nm: 8.0
+        force_derivative_nps: 500.0
+        torque_derivative_nmps: 40.0
+        raw_force_axis_n: [60.0, 150.0, 60.0]
+        raw_force_norm_n: 170.0
+        raw_torque_axis_nm: [10.0, 10.0, 10.0]
+        raw_torque_norm_nm: 13.0
+        raw_force_derivative_nps: 3000.0
+        raw_torque_derivative_nmps: 200.0
+        unexpected_contact_n: 0.0
+        filtered_debounce_s: 0.02
+        raw_debounce_s: 0.02
+
+      contact_search:
+        # Operator-selected policy: no software force, torque, derivative, or
+        # impact envelope during the bounded first-touch search. Zero means
+        # disabled and the global PAINT abort ceiling must not revive it.
+        # Contact detection (3.5 N), the 0.5 mm step/distance/time bounds,
+        # FT freshness/finite checks, sensor saturation checks, and the robot's
+        # own collision/emergency interlocks remain active.
+        force_axis_n: [0.0, 0.0, 0.0]
+        force_norm_n: 0.0
+        torque_axis_nm: [0.0, 0.0, 0.0]
+        torque_norm_nm: 0.0
+        force_derivative_nps: 0.0
+        torque_derivative_nmps: 0.0
+        raw_force_axis_n: [0.0, 0.0, 0.0]
+        raw_force_norm_n: 0.0
+        raw_torque_axis_nm: [0.0, 0.0, 0.0]
+        raw_torque_norm_nm: 0.0
+        raw_force_derivative_nps: 0.0
+        raw_torque_derivative_nmps: 0.0
+        contact_opposite_force_n: 0.0
+        contact_off_axis_force_n: 0.0
+        unexpected_contact_n: 0.0
+        filtered_debounce_s: 0.0
+        raw_debounce_s: 0.0
+
+      approach_precontact:
+        force_axis_n: [15.0, 15.0, 15.0]
+        force_norm_n: 20.0
+        torque_axis_nm: [2.0, 2.0, 2.0]
+        torque_norm_nm: 3.0
+        force_derivative_nps: 400.0
+        torque_derivative_nmps: 30.0
+        raw_force_axis_n: [25.0, 25.0, 25.0]
+        raw_force_norm_n: 30.0
+        raw_torque_axis_nm: [4.0, 4.0, 4.0]
+        raw_torque_norm_nm: 5.0
+        raw_force_derivative_nps: 2000.0
+        raw_torque_derivative_nmps: 120.0
+        unexpected_contact_n: 8.0
+        filtered_debounce_s: 0.05
+        # Never zero on a derivative-based trip: a single stick-slip sample
+        # during a wall-grazing TRAVEL must not be a full stop (2026-08-14).
+        raw_debounce_s: 0.02
+      retract:
+        force_axis_n: [15.0, 15.0, 15.0]
+        force_norm_n: 20.0
+        torque_axis_nm: [2.0, 2.0, 2.0]
+        torque_norm_nm: 3.0
+        force_derivative_nps: 400.0
+        torque_derivative_nmps: 30.0
+        raw_force_axis_n: [25.0, 25.0, 25.0]
+        raw_force_norm_n: 30.0
+        raw_torque_axis_nm: [4.0, 4.0, 4.0]
+        raw_torque_norm_nm: 5.0
+        raw_force_derivative_nps: 2000.0
+        raw_torque_derivative_nmps: 120.0
+        unexpected_contact_n: 8.0
+        filtered_debounce_s: 0.05
+        # Never zero on a derivative-based trip: a single stick-slip sample
+        # during a wall-grazing TRAVEL must not be a full stop (2026-08-14).
+        raw_debounce_s: 0.02
+      travel:
+        force_axis_n: [15.0, 15.0, 15.0]
+        force_norm_n: 20.0
+        torque_axis_nm: [2.0, 2.0, 2.0]
+        torque_norm_nm: 3.0
+        force_derivative_nps: 400.0
+        torque_derivative_nmps: 30.0
+        raw_force_axis_n: [25.0, 25.0, 25.0]
+        raw_force_norm_n: 30.0
+        raw_torque_axis_nm: [4.0, 4.0, 4.0]
+        raw_torque_norm_nm: 5.0
+        raw_force_derivative_nps: 2000.0
+        raw_torque_derivative_nmps: 120.0
+        unexpected_contact_n: 8.0
+        filtered_debounce_s: 0.05
+        # Never zero on a derivative-based trip: a single stick-slip sample
+        # during a wall-grazing TRAVEL must not be a full stop (2026-08-14).
+        raw_debounce_s: 0.02
+      idle:
+        force_axis_n: [15.0, 15.0, 15.0]
+        force_norm_n: 20.0
+        torque_axis_nm: [2.0, 2.0, 2.0]
+        torque_norm_nm: 3.0
+        force_derivative_nps: 400.0
+        torque_derivative_nmps: 30.0
+        raw_force_axis_n: [25.0, 25.0, 25.0]
+        raw_force_norm_n: 30.0
+        raw_torque_axis_nm: [4.0, 4.0, 4.0]
+        raw_torque_norm_nm: 5.0
+        raw_force_derivative_nps: 2000.0
+        raw_torque_derivative_nmps: 120.0
+        unexpected_contact_n: 8.0
+        filtered_debounce_s: 0.05
+        # Never zero on a derivative-based trip: a single stick-slip sample
+        # during a wall-grazing TRAVEL must not be a full stop (2026-08-14).
+        raw_debounce_s: 0.02
+      final_retract:
+        force_axis_n: [15.0, 15.0, 15.0]
+        force_norm_n: 20.0
+        torque_axis_nm: [2.0, 2.0, 2.0]
+        torque_norm_nm: 3.0
+        force_derivative_nps: 400.0
+        torque_derivative_nmps: 30.0
+        raw_force_axis_n: [25.0, 25.0, 25.0]
+        raw_force_norm_n: 30.0
+        raw_torque_axis_nm: [4.0, 4.0, 4.0]
+        raw_torque_norm_nm: 5.0
+        raw_force_derivative_nps: 2000.0
+        raw_torque_derivative_nmps: 120.0
+        unexpected_contact_n: 8.0
+        filtered_debounce_s: 0.05
+        # Never zero on a derivative-based trip: a single stick-slip sample
+        # during a wall-grazing TRAVEL must not be a full stop (2026-08-14).
+        raw_debounce_s: 0.02
+      abort:
+        force_axis_n: [15.0, 15.0, 15.0]
+        force_norm_n: 20.0
+        torque_axis_nm: [2.0, 2.0, 2.0]
+        torque_norm_nm: 3.0
+        force_derivative_nps: 400.0
+        torque_derivative_nmps: 30.0
+        raw_force_axis_n: [25.0, 25.0, 25.0]
+        raw_force_norm_n: 30.0
+        raw_torque_axis_nm: [4.0, 4.0, 4.0]
+        raw_torque_norm_nm: 5.0
+        raw_force_derivative_nps: 2000.0
+        raw_torque_derivative_nmps: 120.0
+        unexpected_contact_n: 8.0
+        filtered_debounce_s: 0.05
+        # Never zero on a derivative-based trip: a single stick-slip sample
+        # during a wall-grazing TRAVEL must not be a full stop (2026-08-14).
+        raw_debounce_s: 0.02

@@ -1,0 +1,20 @@
+# Admittance profile: mass_low
+#
+# Only override: admittance.mass.
+# Effect: lighter virtual inertia -> arm accelerates faster under a push.
+# With K = 0 and the inherited joint_damping, idle drift from residual F/T
+# also gets faster (steady-state vel scales with 1/M). Use when you want
+# a more responsive free-drive feel.
+#
+# Other parameters (damping_ratio, stiffness, joint_damping) inherit from
+# controllers_admittance.yaml + default profile.
+admittance_controller:
+  ros__parameters:
+    admittance:
+      mass:
+        - 9.0
+        - 9.0
+        - 9.0
+        - 0.9
+        - 0.9
+        - 0.9

@@ -1,0 +1,163 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 100  # Hz
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    force_torque_sensor_broadcaster:
+      type: force_torque_sensor_broadcaster/ForceTorqueSensorBroadcaster
+
+    force_torque_sensor_broadcaster_raw:
+      type: force_torque_sensor_broadcaster/ForceTorqueSensorBroadcaster
+
+    ft_sensor_command_controller:
+      type: forward_command_controller/MultiInterfaceForwardCommandController
+
+    joint_trajectory_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    admittance_controller:
+      type: admittance_controller/AdmittanceController
+
+
+force_torque_sensor_broadcaster:
+  ros__parameters:
+    sensor_name: ft_sensor
+    frame_id: ft_link
+
+# Pre-deadband, pre-clamp wrench. Data-collection only -- admittance still
+# consumes the filtered ft_sensor topic. Publishes to
+# /force_torque_sensor_broadcaster_raw/wrench.
+force_torque_sensor_broadcaster_raw:
+  ros__parameters:
+    sensor_name: ft_sensor_raw
+    frame_id: ft_link
+
+ft_sensor_command_controller:
+  ros__parameters:
+    joint: ft_sensor
+    interface_names:
+      - force.x
+      - force.y
+      - force.z
+      - torque.x
+      - torque.y
+      - torque.z
+
+admittance_controller:
+  ros__parameters:  
+    joints: [base, shoulder, elbow, wrist1, wrist2, wrist3]
+    command_interfaces: [position]
+    state_interfaces: [position]
+    chainable_command_interfaces: [position]
+
+    kinematics:
+      plugin_name: kinematics_interface_kdl/KinematicsInterfaceKDL
+      plugin_package: kinematics_interface
+      base: link0
+      tip: tcp
+      group_name: manipulator
+      alpha: 0.0005
+
+    ft_sensor:
+      name: ft_sensor
+      frame:
+        id: ft_link  # wrench measurements are reported in this frame
+        external: false # ft_link is defined in the URDF kinematic chain
+      # Exponential smoothing factor for the wrench input
+      # (wrench_filt = wrench_filt + alpha * (wrench_raw - wrench_filt)).
+      # 0.005 (~2 s time constant) was too slow under K=0: after the human
+      # releases, the filtered wrench took several seconds to fall back to
+      # zero, and admittance kept integrating that residual into joint
+      # drift. 0.05 gives ~0.2 s time constant - the filtered force tracks
+      # the deadbanded raw signal closely, so once raw F goes to 0 the
+      # admittance acceleration follows within a few cycles.
+      filter_coefficient: 0.05
+
+    control:
+      frame:
+        id: tcp # Admittance calcs (displacement etc) are done in this frame. Usually the tool or end-effector
+        external: false # control frame exists within URDF kinematic chain
+
+    fixed_world_frame:   # Gravity points down (neg. Z) in this frame (Usually: world or base_link)
+      frame:
+        id: link0 # Admittance calcs (displacement etc) are done in this frame. Usually the tool or end-effector
+        external: false # control frame exists within URDF kinematic chain
+
+    gravity_compensation:
+      frame: { id: tcp, external: false }
+      CoG:
+        pos: [0.0, 0.0, 0.0]
+        force: 0.0 # mass * 9.81
+
+    admittance:
+      selected_axes:
+        - true # x
+        - true # y
+        - true # z
+        - true # rx
+        - true # ry
+        - true # rz
+
+      # Having ".0" at the end is MUST, otherwise there is a loading error
+      # F = M*a + D*v + S*(x - x_d)
+      mass:
+        - 7.0
+        - 7.0
+        - 7.0
+        - 0.7
+        - 0.7
+        - 0.7
+
+      damping_ratio: # damping can be used instead: zeta = D / (2 * sqrt( M * S ))
+        - 2.828427 # x
+        - 2.828427 # y
+        - 2.828427 # z
+        - 2.828427 # rx
+        - 2.828427 # ry
+        - 2.828427 # rz
+
+      stiffness:
+        - 0.0
+        - 0.0
+        - 0.0
+        - 100.0
+        - 100.0
+        - 100.0
+
+      joint_damping: 7.0
+
+joint_trajectory_controller:
+  ros__parameters:
+    joints:
+      - base
+      - shoulder
+      - elbow
+      - wrist1
+      - wrist2
+      - wrist3
+
+    # In chained mode JTC tracks the real robot joints as state,
+    # but writes its commands into the admittance controller references.
+    command_joints:
+      - admittance_controller/base
+      - admittance_controller/shoulder
+      - admittance_controller/elbow
+      - admittance_controller/wrist1
+      - admittance_controller/wrist2
+      - admittance_controller/wrist3
+
+    command_interfaces:
+      - position
+
+    state_interfaces:
+      - position
+
+    action_monitor_rate: 20.0
+
+    allow_partial_joints_goal: false
+    open_loop_control: true
+    constraints:
+      stopped_velocity_tolerance: 0.01
+      goal_time: 0.0

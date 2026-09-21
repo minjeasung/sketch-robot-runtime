@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>sketch_robot — Sketch UI</title>
+  <link rel="stylesheet" href="style.css" />
+  <script src="js/roslib.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>sketch_robot — Sketch UI</h1>
+    <nav class="nav-links">
+      <a href="setup.html">Force Setup</a>
+    </nav>
+    <div id="status" class="status connecting">
+      <span class="dot"></span>
+      <span id="status-text">connecting…</span>
+    </div>
+  </header>
+
+  <section class="card">
+    <h2>connection</h2>
+    <div class="row">
+      <span class="label">URL</span>
+      <span id="ws-url" class="value">ws://localhost:9090</span>
+    </div>
+    <div class="row">
+      <span class="label">events</span>
+      <pre id="events" class="value events"></pre>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2 id="view-card-title">ZED LEFT CAMERA <span id="view-card-topic" class="muted">(/zed/zed_node/rgb/color/rect/image, sensor_msgs/Image)</span></h2>
+
+    <div class="sketch-controls">
+      <div class="mode-group" title="View Mode">
+        <label><input type="radio" name="view-mode" value="zed_raw" checked /> ZED Raw</label>
+        <label><input type="radio" name="view-mode" value="wall_front" /> Wall Front</label>
+      </div>
+      <div class="mode-group" title="Workflow Mode">
+        <label><input type="radio" name="workflow-mode" value="target" checked /> Target</label>
+        <label><input type="radio" name="workflow-mode" value="work_area" /> Work Area</label>
+        <label><input type="radio" name="workflow-mode" value="path" /> Path</label>
+      </div>
+    </div>
+
+    <div class="sketch-controls">
+      <label>작업 방식 <select id="process-mode"><option value="paint">롤러 도장</option><option value="spray">내화뿜칠 · 50 cm 이격</option></select></label>
+      <span id="process-mode-state" class="muted">롤러 도장</span>
+    </div>
+    <div class="plane-panel">
+      <p>대상을 둘러 그린 뒤 평면을 추출하고, 측정할 면을 선택하세요.</p>
+      <div id="plane-candidates"></div>
+      <button id="btn-refine-planes" disabled>선택한 면 D405 접근·측정</button>
+      <label>작업할 평면 <select id="active-plane" disabled><option value="">측정 후 선택</option></select></label>
+      <span id="planes-status" class="muted">평면 추출 대기</span>
+    </div>
+    <div id="zed-wrap" class="zed-wrap">
+      <canvas id="zed-canvas" width="1280" height="720"></canvas>
+      <canvas id="sketch-canvas" width="1280" height="720"></canvas>
+    </div>
+
+    <div class="sketch-controls">
+      <div class="mode-group" title="Sketch Mode">
+        <label><input type="radio" name="sketch-mode" value="freehand" checked /> Freehand</label>
+        <label><input type="radio" name="sketch-mode" value="line" /> Line</label>
+        <label><input type="radio" name="sketch-mode" value="rect" /> Rect</label>
+      </div>
+      <button id="btn-undo">Undo</button>
+      <button id="btn-clear">Clear</button>
+      <button id="btn-set-target" class="primary" disabled>평면 추출</button>
+      <button id="btn-set-work-area" class="primary" disabled>Set Work Area</button>
+      <button id="btn-fill-work-area" class="primary" disabled title="작업영역을 롤러로 세로 왕복 자동 채우기">Fill Work Area</button>
+      <button id="btn-execute" class="primary" disabled>Send Path</button>
+      <button id="btn-run-robot" class="danger" disabled title="RB10 실제 동작 (확인 후)">Run Robot</button>
+      <span class="muted" style="font-size:12px">Line 모드 중 ESC: 진행 중 line 취소</span>
+    </div>
+
+    <div class="row">
+      <span class="label">view</span>
+      <span id="view-mode-text" class="value">zed_raw</span>
+    </div>
+    <div class="row">
+      <span class="label">workflow</span>
+      <span id="workflow-mode-text" class="value">target</span>
+    </div>
+    <div class="row">
+      <span class="label">sketch mode</span>
+      <span id="sketch-mode-text" class="value">freehand</span>
+    </div>
+    <div class="row">
+      <span class="label">strokes</span>
+      <span id="sketch-strokes-count" class="value">0</span>
+    </div>
+    <div class="row">
+      <span class="label">points (total)</span>
+      <span id="sketch-points-count" class="value">0</span>
+    </div>
+    <div class="row">
+      <span class="label">roller footprint</span>
+      <span id="roller-footprint" class="value">—</span>
+    </div>
+
+    <div class="row">
+      <span class="label">resolution</span>
+      <span id="zed-res" class="value">—</span>
+    </div>
+    <div class="row">
+      <span class="label">encoding</span>
+      <span id="zed-encoding" class="value">—</span>
+    </div>
+    <div class="row">
+      <span class="label">frame count</span>
+      <span id="zed-frames" class="value">0</span>
+    </div>
+    <div class="row">
+      <span class="label">fps (last 1s)</span>
+      <span id="zed-fps" class="value">—</span>
+    </div>
+  </section>
+
+  <section class="card system-status-card" aria-labelledby="painting-status-title">
+    <h2 id="painting-status-title">Painting system status <span class="muted">(authoritative backend state)</span></h2>
+    <div class="status-grid">
+      <div class="status-item">
+        <span class="label">Target selected</span>
+        <span id="painting-target-selected" class="state-pill unknown">unknown</span>
+      </div>
+      <div class="status-item">
+        <span class="label">Work area selected</span>
+        <span id="painting-work-area-selected" class="state-pill unknown">unknown</span>
+      </div>
+      <div class="status-item">
+        <span class="label">D405 plane</span>
+        <span id="painting-d405-state" class="state-pill unknown">waiting</span>
+      </div>
+      <div class="status-item">
+        <span class="label">Path</span>
+        <span id="painting-path-state" class="state-pill unknown">none</span>
+      </div>
+      <div class="status-item">
+        <span class="label">Plan validation</span>
+        <span id="painting-plan-validation" class="state-pill unknown">waiting</span>
+      </div>
+      <div class="status-item">
+        <span class="label">Ready to run</span>
+        <span id="painting-ready" class="state-pill bad">no</span>
+      </div>
+      <div class="status-item">
+        <span class="label">Running</span>
+        <span id="painting-running" class="state-pill neutral">no</span>
+      </div>
+      <div class="status-item">
+        <span class="label">Pre-contact tare</span>
+        <span id="painting-tare-state" class="state-pill neutral">not started</span>
+      </div>
+    </div>
+    <div class="free-space-panel">
+      <label for="free-space-confirmed">
+        <input id="free-space-confirmed" type="checkbox" />
+        Authorize tare at nominal 10 mm pre-contact (measured clearance must be at least 7 mm)
+      </label>
+      <span id="free-space-state" class="state-pill bad">not confirmed</span>
+    </div>
+    <div class="row">
+      <span class="label">work-area ID</span>
+      <span id="painting-work-area-id" class="value">&mdash;</span>
+    </div>
+    <div class="row">
+      <span class="label">plane generation ID</span>
+      <span id="painting-plane-generation-id" class="value">&mdash;</span>
+    </div>
+    <div class="row">
+      <span class="label">path ID</span>
+      <span id="painting-path-id" class="value">&mdash;</span>
+    </div>
+    <div class="row">
+      <span class="label">plan hash</span>
+      <span id="painting-plan-hash" class="value">&mdash;</span>
+    </div>
+    <div class="row">
+      <span class="label">target force</span>
+      <span id="painting-target-force" class="value">&mdash;</span>
+    </div>
+    <div class="row">
+      <span class="label">system state</span>
+      <span id="painting-system-state" class="value">waiting for backend status</span>
+    </div>
+    <div class="row">
+      <span class="label">readiness blockers</span>
+      <span id="painting-blockers" class="value status-detail">backend status not received</span>
+    </div>
+    <div class="row abort-row">
+      <span class="label">abort reason</span>
+      <span id="painting-abort-reason" class="value">&mdash;</span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>/perception/work_area_plane <span class="muted">(geometry_msgs/PoseStamped)</span></h2>
+    <div class="row">
+      <span class="label">frame_id</span>
+      <span id="frame-id" class="value">—</span>
+    </div>
+    <div class="row">
+      <span class="label">stamp</span>
+      <span id="stamp" class="value">—</span>
+    </div>
+    <div class="row">
+      <span class="label">position (x, y, z)</span>
+      <span id="position" class="value">—</span>
+    </div>
+    <div class="row">
+      <span class="label">orientation (x, y, z, w)</span>
+      <span id="orientation" class="value">—</span>
+    </div>
+    <div class="row">
+      <span class="label">message count</span>
+      <span id="msg-count" class="value">0</span>
+    </div>
+  </section>
+
+  <script src="js/target_refine_gate.js"></script>
+  <script src="js/app.js"></script>
+  <script src="js/multi_surface.js"></script>
+</body>
+</html>

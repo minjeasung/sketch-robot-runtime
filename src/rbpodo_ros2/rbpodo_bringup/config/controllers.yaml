@@ -1,0 +1,99 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 100  # Hz
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    # force_torque_sensor_broadcaster:
+    #   type: force_torque_sensor_broadcaster/ForceTorqueSensorBroadcaster
+
+    joint_trajectory_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    position_controllers:
+      type: position_controllers/JointGroupPositionController
+
+    # admittance_controller:
+    #   type: admittance_controller/AdmittanceController
+
+
+position_controllers:
+  ros__parameters:
+    joints:
+      - base
+      - shoulder
+      - elbow
+      - wrist1
+      - wrist2
+      - wrist3
+
+
+# admittance_controller:
+#   ros__parameters:
+#     joints: [base, shoulder, elbow, wrist1, wrist2, wrist3]
+#     command_interfaces: [position]
+#     state_interfaces: [position]
+#     chainable_command_interfaces: [position]
+#
+#     kinematics:
+#       plugin_name: kinematics_interface_kdl/KinematicsInterfaceKDL
+#       plugin_package: kinematics_interface
+#       base: link0
+#       tip: tcp
+#       group_name: maniuplator
+#       alpha: 0.0005
+#
+#     ft_sensor:
+#       name: ft_sensor_name
+#       frame: { id: tcp, external: false } # ft_link
+#       filter_coefficient: 0.01
+#
+#     control:
+#       frame: { id: tcp, external: false }
+#     fixed_world_frame:
+#       frame: { id: link0, external: false }
+#
+#     gravity_compensation:
+#       frame: { id: tcp, external: false }
+#       CoG:
+#         pos: [0.0, 0.0, 0.05]
+#         force: 9.81
+#
+#     admittance:
+#       selected_axes: [true, true, true, true, true, true]
+#       mass:          [5.0, 5.0, 5.0, 0.5, 0.5, 0.5]
+#       damping_ratio: [2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+#       stiffness:     [150.0, 150.0, 200.0, 5.0, 5.0, 5.0]
+#       joint_damping: 5.0
+
+
+joint_trajectory_controller:
+  ros__parameters:
+    joints:
+      - base
+      - shoulder
+      - elbow
+      - wrist1
+      - wrist2
+      - wrist3
+
+    command_interfaces:
+      - position
+
+    state_interfaces:
+      - position
+
+    action_monitor_rate: 20.0
+
+    allow_partial_joints_goal: false
+    open_loop_control: true
+    constraints:
+      stopped_velocity_tolerance: 0.01
+      goal_time: 0.0
+
+
+# force_torque_sensor_broadcaster:
+#   ros__parameters:
+#     sensor_name: ft_sensor_name
+#     frame_id: tcp # ft_link

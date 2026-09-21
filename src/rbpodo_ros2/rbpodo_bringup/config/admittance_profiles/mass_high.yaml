@@ -1,0 +1,20 @@
+# Admittance profile: mass_high
+#
+# Only override: admittance.mass.
+# Effect: heavier virtual inertia -> arm accelerates more slowly under a
+# push and resists drift more strongly in idle (steady-state vel scales
+# with 1/M). Use when you want a "stay put" feel and only respond to
+# deliberate, firm pushes.
+#
+# Other parameters (damping_ratio, stiffness, joint_damping) inherit from
+# controllers_admittance.yaml + default profile.
+admittance_controller:
+  ros__parameters:
+    admittance:
+      mass:
+        - 15.0
+        - 15.0
+        - 15.0
+        - 1.5
+        - 1.5
+        - 1.5

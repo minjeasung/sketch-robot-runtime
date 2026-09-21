@@ -1,0 +1,141 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="780" viewBox="0 0 1200 780">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#222"/>
+    </marker>
+    <marker id="arrow-red" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#c62828"/>
+    </marker>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1565c0"/>
+    </marker>
+    <style>
+      text { font-family: Arial, Helvetica, sans-serif; fill: #202124; }
+      .title { font-size: 24px; font-weight: 700; }
+      .subtitle { font-size: 15px; fill: #4b5563; }
+      .label { font-size: 14px; }
+      .small { font-size: 12px; fill: #4b5563; }
+      .box-label { font-size: 13px; font-weight: 700; }
+      .axis { stroke: #222; stroke-width: 2; marker-end: url(#arrow); }
+      .dim { stroke: #555; stroke-width: 1.5; stroke-dasharray: 5 4; marker-end: url(#arrow); }
+      .depth { stroke: #c62828; stroke-width: 3; marker-end: url(#arrow-red); }
+      .imgaxis { stroke: #1565c0; stroke-width: 2; marker-end: url(#arrow-blue); }
+      .eoat { fill: #f9c46b; stroke: #a16207; stroke-width: 2; }
+      .aft { fill: #d8d8d8; stroke: #555; stroke-width: 2; }
+      .d405 { fill: #79b7ff; stroke: #0f4c81; stroke-width: 2; }
+      .tcp { fill: #111827; }
+      .optic { fill: #dc2626; stroke: #7f1d1d; stroke-width: 2; }
+      .panel { fill: #fff; stroke: #d1d5db; stroke-width: 1.5; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1200" height="780" fill="#f8fafc"/>
+  <text x="40" y="42" class="title">Nominal TCP - EOAT - D405 transform</text>
+  <text x="40" y="68" class="subtitle">Based on EOAT CAD + D405 URDF + static mount offset currently in the repo. Units are meters unless noted.</text>
+
+  <rect x="35" y="95" width="540" height="560" rx="8" class="panel"/>
+  <text x="55" y="128" class="title" style="font-size:20px">Top view: TCP X / Y</text>
+  <text x="55" y="151" class="subtitle">Screen down is TCP -Y, the D405 depth direction.</text>
+
+  <!-- Top view coordinate map: x_screen = 300 + tcp_x*1000, y_screen = 230 - tcp_y*1000 -->
+  <!-- TCP axes -->
+  <line x1="300" y1="230" x2="430" y2="230" class="axis"/>
+  <line x1="300" y1="230" x2="300" y2="115" class="axis"/>
+  <text x="435" y="235" class="label">TCP +X</text>
+  <text x="312" y="118" class="label">TCP +Y</text>
+  <circle cx="300" cy="230" r="6" class="tcp"/>
+  <text x="312" y="225" class="box-label">TCP origin</text>
+
+  <!-- AFT200 top rectangle: center (0,-0.0261), size x=0.104, y=0.0522 -->
+  <rect x="248" y="230" width="104" height="52.2" class="aft"/>
+  <text x="255" y="263" class="box-label">AFT200</text>
+
+  <!-- EOAT top rectangle: center (0,-0.16745), size x=0.220, y=0.2305 -->
+  <rect x="190" y="282.2" width="220" height="230.5" class="eoat"/>
+  <text x="242" y="402" class="box-label">RR-00A_B EOAT</text>
+  <text x="220" y="421" class="small">center y=-167.45 mm</text>
+
+  <!-- D405 body top rectangle: center (0,-0.06870), approx size x=0.042, y=0.023 -->
+  <rect x="279" y="287.2" width="42" height="23" class="d405"/>
+  <text x="327" y="303" class="box-label">D405 body</text>
+
+  <!-- D405 optical origin top: (0.00905, -0.07640) -->
+  <circle cx="309.05" cy="306.4" r="7" class="optic"/>
+  <text x="322" y="326" class="label">D405 color optical</text>
+  <text x="322" y="344" class="small">tcp xyz = (+9.05, -76.40, +43.75) mm</text>
+
+  <!-- D405 optical axes in TCP: optical +Z depth = TCP -Y, optical +X = TCP -X -->
+  <line x1="309.05" y1="306.4" x2="309.05" y2="390" class="depth"/>
+  <text x="319" y="388" class="label" fill="#c62828">optical +Z / depth = TCP -Y</text>
+  <line x1="309.05" y1="306.4" x2="242" y2="306.4" class="imgaxis"/>
+  <text x="180" y="301" class="label" fill="#1565c0">optical +X = TCP -X</text>
+
+  <!-- Dimension y TCP to optical -->
+  <line x1="455" y1="230" x2="455" y2="306.4" class="dim"/>
+  <line x1="446" y1="230" x2="464" y2="230" stroke="#555" stroke-width="1"/>
+  <line x1="446" y1="306.4" x2="464" y2="306.4" stroke="#555" stroke-width="1"/>
+  <text x="465" y="272" class="label">-76.40 mm in TCP Y</text>
+
+  <!-- Dimension x optical offset -->
+  <line x1="300" y1="205" x2="309.05" y2="205" class="dim"/>
+  <line x1="300" y1="198" x2="300" y2="212" stroke="#555" stroke-width="1"/>
+  <line x1="309.05" y1="198" x2="309.05" y2="212" stroke="#555" stroke-width="1"/>
+  <text x="318" y="209" class="label">+9.05 mm in TCP X</text>
+
+  <rect x="625" y="95" width="540" height="560" rx="8" class="panel"/>
+  <text x="645" y="128" class="title" style="font-size:20px">Side view: TCP -Y / Z</text>
+  <text x="645" y="151" class="subtitle">Screen right is TCP -Y. Screen up is TCP +Z.</text>
+
+  <!-- Side view coordinate map: x_screen = 710 + (-tcp_y)*1000, y_screen = 500 - tcp_z*1000 -->
+  <!-- TCP axes -->
+  <line x1="710" y1="500" x2="835" y2="500" class="axis"/>
+  <line x1="710" y1="500" x2="710" y2="365" class="axis"/>
+  <text x="839" y="505" class="label">TCP -Y</text>
+  <text x="722" y="370" class="label">TCP +Z</text>
+  <circle cx="710" cy="500" r="6" class="tcp"/>
+  <text x="722" y="495" class="box-label">TCP origin</text>
+
+  <!-- AFT200 side rectangle: y 0..-0.0522, z approx +/-0.041 -->
+  <rect x="710" y="459" width="52.2" height="82" class="aft"/>
+  <text x="714" y="555" class="box-label">AFT200</text>
+
+  <!-- EOAT side rectangle: y -0.0522..-0.2827, z approx +/-0.0565 -->
+  <rect x="762.2" y="443.5" width="230.5" height="113" class="eoat"/>
+  <text x="827" y="575" class="box-label">RR-00A_B EOAT</text>
+  <text x="826" y="594" class="small">extends along TCP -Y</text>
+
+  <!-- D405 side body: center y=-0.06870,z=0.04375 approx size y=0.023,z=0.042 -->
+  <rect x="767.2" y="435.25" width="23" height="42" class="d405"/>
+  <text x="799" y="456" class="box-label">D405 body</text>
+
+  <!-- D405 optical side origin: y=-0.07640,z=0.04375 -->
+  <circle cx="786.4" cy="456.25" r="7" class="optic"/>
+  <text x="799" y="475" class="label">D405 color optical</text>
+
+  <!-- Depth arrow -->
+  <line x1="786.4" y1="456.25" x2="875" y2="456.25" class="depth"/>
+  <text x="879" y="461" class="label" fill="#c62828">optical +Z / depth</text>
+  <!-- Optical +Y = TCP -Z -->
+  <line x1="786.4" y1="456.25" x2="786.4" y2="520" class="imgaxis"/>
+  <text x="796" y="522" class="label" fill="#1565c0">optical +Y = TCP -Z</text>
+
+  <!-- Z dimension -->
+  <line x1="670" y1="500" x2="670" y2="456.25" class="dim"/>
+  <line x1="661" y1="500" x2="679" y2="500" stroke="#555" stroke-width="1"/>
+  <line x1="661" y1="456.25" x2="679" y2="456.25" stroke="#555" stroke-width="1"/>
+  <text x="640" y="478" class="label">+43.75 mm Z</text>
+
+  <!-- Y dimension -->
+  <line x1="710" y1="620" x2="786.4" y2="620" class="dim"/>
+  <line x1="710" y1="611" x2="710" y2="629" stroke="#555" stroke-width="1"/>
+  <line x1="786.4" y1="611" x2="786.4" y2="629" stroke="#555" stroke-width="1"/>
+  <text x="722" y="643" class="label">76.40 mm along TCP -Y</text>
+
+  <rect x="35" y="675" width="1130" height="70" rx="8" class="panel"/>
+  <text x="55" y="704" class="label">
+    Important: this is nominal geometry, not a measured calibration. The static TF uses tcp -> d405_link = (0.00905, -0.07640, 0.04375), yaw=-90 deg.
+  </text>
+  <text x="55" y="727" class="label">
+    RealSense then provides d405_link -> d405_color_optical_frame. Result: optical +Z(depth)=TCP -Y, +X=TCP -X, +Y=TCP -Z.
+  </text>
+</svg>

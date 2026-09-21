@@ -1,0 +1,14 @@
+# Admittance profile: damping_low
+#
+# Only override: admittance.joint_damping.
+# Effect: weaker joint-space brake. After the human releases, the residual
+# admittance joint_vel decays more slowly and a tiny F/T residual produces
+# larger steady-state drift velocity. Push itself feels lighter (less
+# internal friction) but the arm coasts more after release.
+#
+# Other parameters (mass, damping_ratio, stiffness) inherit from
+# controllers_admittance.yaml + default profile.
+admittance_controller:
+  ros__parameters:
+    admittance:
+      joint_damping: 9.0

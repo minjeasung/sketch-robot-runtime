@@ -1,0 +1,60 @@
+# ROS2 build artifacts
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local env
+.env
+
+# Claude Code local settings
+.claude/
+
+# Backup files
+*.bak
+*.bak_*
+
+# Other logs
+logs/
+
+# Claude Code local settings
+.claude/
+
+# Backup files
+*.bak
+*.bak_*
+
+# Other logs
+logs/
+
+# Isaac Sim 산출물 (scripts/setup_isaac_assets.sh 로 재생성)
+isaac_assets/
+zed-isaac-sim/
+
+# Local sketch API runtime
+.venv-api/
+config/sketch_runtime.env
+
+# Portable build and distributable archives
+.runtime/
+dist/
+
+# Machine-specific calibration and force baseline (transfer separately)
+/zed_d405_apriltag_calibration.json
+/d405_eyeinhand_charuco_calibration.json
+/zed_eyetohand_charuco_calibration.json
+/aft200_force_threshold.json
+/CALIBRATION_MANIFEST.json

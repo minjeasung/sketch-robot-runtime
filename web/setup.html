@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>sketch_robot — Force Setup</title>
+  <link rel="stylesheet" href="style.css" />
+  <script src="js/roslib.min.js"></script>
+</head>
+<body class="setup-page">
+  <header>
+    <h1>sketch_robot — Force Setup</h1>
+    <nav class="nav-links">
+      <a href="index.html">Sketch UI</a>
+    </nav>
+    <div id="status" class="status connecting">
+      <span class="dot"></span>
+      <span id="status-text">connecting...</span>
+    </div>
+  </header>
+
+  <main class="setup-layout">
+    <section class="card setup-camera-card">
+      <h2 id="view-card-title">ZED LEFT CAMERA <span id="view-card-topic" class="muted">(/zed/zed_node/rgb/color/rect/image, sensor_msgs/Image)</span></h2>
+
+      <div class="sketch-controls">
+        <div class="mode-group" title="View Mode">
+          <label><input type="radio" name="view-mode" value="zed_raw" checked /> ZED Raw</label>
+          <label><input type="radio" name="view-mode" value="wall_front" /> Wall Front</label>
+        </div>
+        <div class="mode-group" title="Setup Step">
+          <label><input type="radio" name="workflow-mode" value="target" checked /> Target</label>
+          <label><input type="radio" name="workflow-mode" value="work_area" /> Work Area</label>
+        </div>
+        <div class="mode-group" title="Sketch Mode">
+          <label><input type="radio" name="sketch-mode" value="freehand" checked /> Freehand</label>
+          <label><input type="radio" name="sketch-mode" value="rect" /> Rect</label>
+        </div>
+      </div>
+
+      <div id="zed-wrap" class="zed-wrap setup-camera-wrap">
+        <canvas id="zed-canvas" width="1280" height="720"></canvas>
+        <canvas id="sketch-canvas" width="1280" height="720"></canvas>
+      </div>
+
+      <div class="sketch-controls">
+        <button id="btn-undo">Undo</button>
+        <button id="btn-clear">Clear</button>
+        <button id="btn-set-target" class="primary" disabled>1 Set Target</button>
+        <button id="btn-set-work-area" class="primary" disabled>2 Set Work Area</button>
+        <button id="btn-d405-refine-from-camera" class="primary" disabled>3 D405 Refine</button>
+      </div>
+
+      <div class="row">
+        <span class="label">view / step</span>
+        <span id="view-workflow-text" class="value">zed_raw / target</span>
+      </div>
+      <div class="row">
+        <span class="label">strokes / points</span>
+        <span id="sketch-counts" class="value">0 / 0</span>
+      </div>
+      <div class="row">
+        <span class="label">image</span>
+        <span id="image-status" class="value">-</span>
+      </div>
+    </section>
+
+    <div class="setup-side">
+    <section class="card setup-card" id="surface-setup-card">
+      <h2>Surface Setup <span class="muted">(ZED + D405)</span></h2>
+      <div class="row">
+        <span class="label">target surface</span>
+        <span id="target-surface" class="value">-</span>
+      </div>
+      <div class="row">
+        <span class="label">ZED planes</span>
+        <span id="zed-scan-state" class="value">waiting</span>
+      </div>
+      <div class="row">
+        <span class="label">auto plane</span>
+        <span id="selected-plane" class="value">-</span>
+      </div>
+      <div class="row">
+        <span class="label">auto normal</span>
+        <span id="selected-normal" class="value">-</span>
+      </div>
+      <div class="row">
+        <span class="label">work area plane</span>
+        <span id="work-area-plane" class="value">-</span>
+      </div>
+      <div class="row">
+        <span class="label">D405 refine</span>
+        <span id="d405-refine-state" class="value">waiting</span>
+      </div>
+      <div class="row">
+        <span class="label">refined plane</span>
+        <span id="refined-plane" class="value">-</span>
+      </div>
+    </section>
+
+    <section class="card setup-card" id="force-setup-card">
+      <h2>Force Target <span class="muted">(/ft/status)</span></h2>
+      <div class="row">
+        <span class="label">state</span>
+        <span id="ft-state" class="value">-</span>
+      </div>
+      <div class="row">
+        <span class="label">surface source</span>
+        <span id="ft-surface" class="value">-</span>
+      </div>
+      <div class="row">
+        <span class="label">active normal</span>
+        <span id="ft-active-normal" class="value">-</span>
+      </div>
+      <div class="row">
+        <span class="label">normal force</span>
+        <span id="ft-normal-force" class="value">-</span>
+      </div>
+      <div class="row">
+        <span class="label">target / abort</span>
+        <span id="ft-target-summary" class="value">-</span>
+      </div>
+      <div class="row">
+        <span class="label">correction</span>
+        <span id="ft-correction" class="value">-</span>
+      </div>
+      <div class="row">
+        <span class="label">balance torque</span>
+        <span id="ft-balance-torque" class="value">-</span>
+      </div>
+      <div class="row">
+        <span class="label">orientation correction</span>
+        <span id="ft-orientation-correction" class="value">-</span>
+      </div>
+      <div class="row">
+        <span class="label">setup</span>
+        <span id="ft-setup-state" class="value">not captured</span>
+      </div>
+
+      <div class="sketch-controls force-controls">
+        <button id="btn-ft-zero">4 Zero F/T</button>
+        <button id="btn-ft-flip-sign">Flip Sign</button>
+        <button id="btn-ft-capture-target" class="primary">5 Capture Target</button>
+        <button id="btn-ft-apply-target">Apply Target</button>
+      </div>
+
+      <div class="sketch-controls force-controls">
+        <label class="number-field">
+          target N
+          <input id="ft-target-input" type="number" min="0" max="200" step="0.1" value="1.6" />
+        </label>
+        <label class="number-field">
+          abort N
+          <input id="ft-abort-input" type="number" min="0" max="300" step="0.1" value="3.6" />
+        </label>
+        <label class="number-field">
+          torque abort Nm
+          <input id="ft-torque-abort-input" type="number" min="0" max="20" step="0.01" value="0.25" />
+        </label>
+      </div>
+    </section>
+    </div>
+
+    <section class="card events-card">
+      <h2>connection</h2>
+      <div class="row">
+        <span class="label">URL</span>
+        <span id="ws-url" class="value">ws://localhost:9090</span>
+      </div>
+      <div class="row">
+        <span class="label">events</span>
+        <pre id="events" class="value events"></pre>
+      </div>
+    </section>
+  </main>
+
+  <script src="js/force_setup.js"></script>
+</body>
+</html>

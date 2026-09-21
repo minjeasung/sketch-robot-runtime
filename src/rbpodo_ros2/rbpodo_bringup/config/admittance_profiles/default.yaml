@@ -1,0 +1,45 @@
+# Default admittance profile.
+# Matches the values in controllers_admittance.yaml so that loading this profile
+# is a no-op relative to the base config.
+admittance_controller:
+  ros__parameters:
+    admittance:
+      mass:
+        - 12.0
+        - 12.0
+        - 12.0
+        - 1.2
+        - 1.2
+        - 1.2
+      # Cartesian damping_ratio gives D_cartesian = ratio * 2 * sqrt(M * K).
+      # With xyz K = 0 this collapses to D_cartesian = 0, so the values
+      # below are effectively unused on xyz. They still apply on rotation
+      # axes where K > 0. Damping for translation is supplied directly via
+      # joint_damping (see below) instead.
+      damping_ratio:
+        - 2.828427
+        - 2.828427
+        - 2.828427
+        - 2.828427
+        - 2.828427
+        - 2.828427
+      # xyz K = 0 so that after the human pushes the arm it stays put (no
+      # spring back to the JTC reference). Rotational K kept small but
+      # non-zero to avoid orientation drift.
+      stiffness:
+        - 0.0
+        - 0.0
+        - 0.0
+        - 100.0
+        - 100.0
+        - 100.0
+      # Joint-space damping is applied IN ADDITION to the cartesian one and
+      # is independent of stiffness (see admittance_rule_impl.hpp:
+      #     joint_acc -= joint_damping * joint_vel
+      # ). With xyz K = 0 the cartesian damping path contributes nothing on
+      # translation, so this term is the only damping the system has
+      # against residual F/T noise integrating through admittance. 50 is
+      # high enough to bring the arm to rest promptly once the push is
+      # released, without making the push itself feel heavy. Tune up
+      # (e.g. 100) if residual drift is still observed.
+      joint_damping: 12.0

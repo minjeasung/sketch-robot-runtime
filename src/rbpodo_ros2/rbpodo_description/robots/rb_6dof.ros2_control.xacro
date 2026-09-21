@@ -1,0 +1,69 @@
+<?xml version='1.0' encoding='utf-8'?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:macro name="rb_6dof_ros2_control" params="prefix robot_ip cb_simulation:=true use_fake_hardware:=^|false fake_sensor_commands:=^|false human_collab:=^|false torque_constants:=${[1, 1, 1, 1, 1, 1]}">
+    <ros2_control name="RBPodoHardwareInterface" type="system">
+      <hardware>
+        <!-- Always load the rbpodo plugin so the FT tare path is in the loop
+             in every configuration.
+             fake_mode (= use_fake_hardware): when true, joint writes are
+               skipped and joint states mirror commands.
+             fake_sensor_commands: when true, FT comes from the ~/inject_ft
+               topic; when false, FT comes from the real cobot's eft_*. The
+               plugin still connects to the cobot for FT telemetry even in
+               fake_mode if fake_sensor_commands is false.
+             human_collab: clamps the published wrench to a safe interaction
+               magnitude per axis, so admittance reacts to a bounded force
+               even when the raw signal exceeds it. -->
+        <plugin>rbpodo_hardware/RBPodoHardwareInterface</plugin>
+        <param name="cb_simulation">${cb_simulation}</param>
+        <param name="robot_ip">${robot_ip}</param>
+        <param name="fake_mode">${use_fake_hardware}</param>
+        <param name="fake_sensor_commands">${fake_sensor_commands}</param>
+        <param name="human_collab">${human_collab}</param>
+      </hardware>
+
+      <xacro:macro name="configure_joint" params="joint_name torque_constant:=1">
+        <joint name="${joint_name}">
+          <param name="initial_position">0.0</param>
+          <param name="torque_constant">${torque_constant}</param>
+          <command_interface name="effort"/>
+          <command_interface name="velocity"/>
+          <command_interface name="position"/>
+          <state_interface name="position"/>
+          <state_interface name="effort"/>
+        </joint>
+      </xacro:macro>
+
+      <xacro:configure_joint joint_name="${prefix}base" torque_constant="${torque_constants[0]}" />
+      <xacro:configure_joint joint_name="${prefix}shoulder" torque_constant="${torque_constants[1]}" />
+      <xacro:configure_joint joint_name="${prefix}elbow" torque_constant="${torque_constants[2]}" />
+      <xacro:configure_joint joint_name="${prefix}wrist1" torque_constant="${torque_constants[3]}" />
+      <xacro:configure_joint joint_name="${prefix}wrist2" torque_constant="${torque_constants[4]}" />
+      <xacro:configure_joint joint_name="${prefix}wrist3" torque_constant="${torque_constants[5]}" />
+
+      <sensor name="${prefix}ft_sensor">
+        <state_interface name="force.x"/>
+        <state_interface name="force.y"/>
+        <state_interface name="force.z"/>
+        <state_interface name="torque.x"/>
+        <state_interface name="torque.y"/>
+        <state_interface name="torque.z"/>
+      </sensor>
+
+      <!-- Pre-deadband, pre-clamp wrench exposed for data collection only.
+           Same tare bias subtraction as ft_sensor; deadband/clamp NOT applied.
+           Admittance still consumes ft_sensor (filtered); experiments analyse
+           ft_sensor_raw (unfiltered). -->
+      <sensor name="${prefix}ft_sensor_raw">
+        <state_interface name="force.x"/>
+        <state_interface name="force.y"/>
+        <state_interface name="force.z"/>
+        <state_interface name="torque.x"/>
+        <state_interface name="torque.y"/>
+        <state_interface name="torque.z"/>
+      </sensor>
+
+    </ros2_control>
+  </xacro:macro>
+</robot>

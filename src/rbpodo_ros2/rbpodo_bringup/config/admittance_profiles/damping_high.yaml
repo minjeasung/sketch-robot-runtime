@@ -1,0 +1,14 @@
+# Admittance profile: damping_high
+#
+# Only override: admittance.joint_damping.
+# Effect: stronger joint-space brake. After release the arm decays to rest
+# faster, and a given F/T residual produces a smaller steady-state drift
+# velocity, so idle drift is suppressed. The push itself feels slightly
+# heavier because the brake force scales with joint_vel.
+#
+# Other parameters (mass, damping_ratio, stiffness) inherit from
+# controllers_admittance.yaml + default profile.
+admittance_controller:
+  ros__parameters:
+    admittance:
+      joint_damping: 15.0

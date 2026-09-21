@@ -1,0 +1,74 @@
+# Painting/contact admittance profile for the roller EOAT.
+#
+# Coordinate convention:
+#   Surface +X -> TCP +X
+#   Surface +Y -> TCP -Z
+#   Surface +Z -> TCP +Y
+#
+# Therefore the only compliant normal-force axis is TCP Y
+# (selected_axes[1]), not TCP Z. MoveIt/JTC remains responsible for the
+# nominal path, TCP X/Z tangential motion, and orientation.
+admittance_controller:
+  ros__parameters:
+    # Workspace overlay safety contract. A fresh guarded wrench and explicit
+    # compliance heartbeat are both mandatory; stale data returns to zero.
+    wrench_reference_timeout_s: 0.10
+    compliance_enable_timeout_s: 0.10
+    compliance_enabled_by_default: false
+    normal_axis_index: 1
+    max_normal_trim_m: 0.005
+    max_normal_velocity_mps: 0.010
+    max_normal_acceleration_mps2: 0.050
+
+    ft_sensor:
+      # More filtering than the free-push profile. Tune on the real robot.
+      filter_coefficient: 0.02
+
+    gravity_compensation:
+      # Fill in the roller EOAT CoG/weight before relying on this profile for
+      # curved-surface or orientation-changing contact work.
+      frame: { id: tcp, external: false }
+      CoG:
+        pos: [0.0, 0.0, 0.0]
+        force: 0.0
+
+    admittance:
+      selected_axes:
+        - false # TCP X = Surface X tangent/reference; keep JTC-controlled
+        - true  # TCP Y = Surface Z normal/contact axis
+        - false # TCP Z = -Surface Y tangent/lateral; keep JTC-controlled
+        - false # rx; orientation commanded by MoveIt/path
+        - false # ry
+        - false # rz
+
+      # Arrays are x, y, z, rx, ry, rz. Only Y is selected, but all values
+      # must stay finite and valid for parameter validation.
+      mass:
+        - 10.0
+        - 8.0
+        - 10.0
+        - 1.0
+        - 1.0
+        - 1.0
+
+      # Overdamped starting point for noisy force signals.
+      damping_ratio:
+        - 2.828427
+        - 4.0
+        - 2.828427
+        - 2.828427
+        - 2.828427
+        - 2.828427
+
+      # Use finite stiffness for controlled-contact painting. Do not set
+      # translation stiffness to zero here; K=0 is for free-push behavior and
+      # can drift under residual F/T noise.
+      stiffness:
+        - 1000.0
+        - 1000.0
+        - 1000.0
+        - 100.0
+        - 100.0
+        - 100.0
+
+      joint_damping: 12.0

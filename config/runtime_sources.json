@@ -1,0 +1,10 @@
+{
+  "rbpodo": {
+    "repository": "https://github.com/RainbowRobotics/rbpodo.git",
+    "revision": "7b9deb9ab1350ddb1c88519c3504676715bbe659"
+  },
+  "zed-ros2-wrapper": {
+    "repository": "https://github.com/stereolabs/zed-ros2-wrapper.git",
+    "revision": "87187baf2185401bc2d252003d58fbeafe7d005d"
+  }
+}
