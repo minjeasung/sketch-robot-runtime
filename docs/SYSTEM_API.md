@@ -36,10 +36,10 @@ prepare 실패 시 이번 요청에서 시작한 항목만 정리, 역순 shutdo
 
 | 현재 프로세스 ID | 기존 터미널 역할 | 선행 프로세스 |
 |---|---|---|
-| `robot_stack` | RB10·MoveIt·controller·RViz | 없음 |
-| `perception` | ZED·D405·TF·평면 인식·스케치 변환 | robot_stack |
-| `force_pipeline` | 목표 wrench·F/T monitor | robot_stack |
-| `executor` | 경로 실행기·flight recorder | robot_stack, perception, force_pipeline |
+| `robot_control` (화면: robot control) | RB10·MoveIt·controller·RViz | 없음 |
+| `perception` | ZED·D405·TF·평면 인식·스케치 변환 | robot_control |
+| `force_pipeline` | 목표 wrench·F/T monitor | robot_control |
+| `executor` | 경로 실행기·flight recorder | robot_control, perception, force_pipeline |
 | `rosbridge` | 기존 웹 UI의 ROS WebSocket, 9090 | 없음 |
 | API 서버 자체 | 웹 화면과 실행 관리, 8080 | 위 스크립트로 한 번 기동 |
 

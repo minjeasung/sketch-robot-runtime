@@ -143,7 +143,7 @@ def generate_launch_description():
         DeclareLaunchArgument("launch_rviz", default_value="true"),
         # The HTTP supervisor starts these existing groups independently.
         # Defaults retain the original integrated launch behavior.
-        DeclareLaunchArgument("launch_robot_stack", default_value="true"),
+        DeclareLaunchArgument("launch_robot_control", default_value="true"),
         DeclareLaunchArgument("launch_perception", default_value="true"),
         DeclareLaunchArgument("launch_force_pipeline", default_value="true"),
         DeclareLaunchArgument("launch_executor", default_value="true"),
@@ -197,7 +197,7 @@ def generate_launch_description():
     ]
 
     moveit = IncludeLaunchDescription(
-        condition=IfCondition(LaunchConfiguration("launch_robot_stack")),
+        condition=IfCondition(LaunchConfiguration("launch_robot_control")),
         launch_description_source=PythonLaunchDescriptionSource(
             PathJoinSubstitution([
                 FindPackageShare("sketch_control"),

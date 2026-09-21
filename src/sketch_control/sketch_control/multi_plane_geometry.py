@@ -69,8 +69,13 @@ def extract_planes(points, pixels, *, max_planes=8, min_points=80,
         lo, hi = uv.min(axis=0), uv.max(axis=0)
         corners = [center + u*right + v*up for u, v in
                    [(lo[0], hi[1]), (hi[0], hi[1]), (hi[0], lo[1]), (lo[0], lo[1])]]
+        support_hull = np.asarray(convex_hull(uv))
+        if len(support_hull) > 64:
+            # Inscribed simplification keeps ROI payloads bounded without expanding support.
+            support_hull = support_hull[np.linspace(0,len(support_hull)-1,64,dtype=int)]
         planes.append(dict(center=center.tolist(), normal=normal.tolist(),
                            corners=np.asarray(corners).tolist(),
+                           support_polygon=(center + support_hull @ np.column_stack((right, up)).T).tolist(),
                            polygon_px=convex_hull(pixels[remaining[indices]]),
                            inlier_count=len(indices),
                            rms_m=float(np.sqrt(np.mean(((cloud-center) @ normal)**2)))))

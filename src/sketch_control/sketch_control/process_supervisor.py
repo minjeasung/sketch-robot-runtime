@@ -52,17 +52,17 @@ def build_specs(workspace, options=None):
                   real_painting_enabled=profile == "work", dry_run=profile != "work",
                   painting_force_enabled=profile == "work")
     groups = (
-        ("robot_stack", "RB10 · MoveIt · controllers · RViz", (), ("controller_manager", "move_group")),
-        ("perception", "ZED · D405 · calibration · sketch perception", ("robot_stack",), ("target_selector", "d405_surface_refiner")),
-        ("force_pipeline", "Wrench reference · force monitor", ("robot_stack",), ("painting_force_monitor",)),
-        ("executor", "Sketch path executor · flight recorder", ("robot_stack", "perception", "force_pipeline"), ("moveit_executor",)),
+        ("robot_control", "RB10 · MoveIt · controllers · RViz", (), ("controller_manager", "move_group")),
+        ("perception", "ZED · D405 · calibration · sketch perception", ("robot_control",), ("target_selector", "d405_surface_refiner")),
+        ("force_pipeline", "Wrench reference · force monitor", ("robot_control",), ("painting_force_monitor",)),
+        ("executor", "Sketch path executor · flight recorder", ("robot_control", "perception", "force_pipeline"), ("moveit_executor",)),
         ("rosbridge", "Browser ROS WebSocket (9090)", (), ("painting_rosbridge_websocket", "rosbridge_websocket")),
     )
     specs = []
     for name, description, dependencies, nodes in groups:
         flags = dict(common)
         flags.update({f"launch_{key}": key == name for key in
-                      ("robot_stack", "perception", "force_pipeline", "executor", "rosbridge")})
+                      ("robot_control", "perception", "force_pipeline", "executor", "rosbridge")})
         flags["enable_interlock_flight_recorder"] = name == "executor"
         command = ("ros2", "launch", "sketch_control", "rb10_painting_system.launch.py") + tuple(
             f"{key}:={str(value).lower() if type(value) is bool else value}" for key, value in flags.items())

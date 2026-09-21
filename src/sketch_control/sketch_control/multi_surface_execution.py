@@ -10,9 +10,11 @@ from shape_msgs.msg import SolidPrimitive
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from sketch_control.rotation_utils import quat_apply, quat_from_matrix
 from sketch_control.target_selector_node import _normal_to_quaternion
+from sketch_control.d405_view_geometry import support_coordinates
+from sketch_control.d405_scan_selection import D405ScanSelectionMixin
 
 
-class MultiSurfaceMixin:
+class MultiSurfaceMixin(D405ScanSelectionMixin):
     def _init_multi_surface(self):
         self._multi_catalog = dict(generation='', planes=[])
         self._multi_queue = []
@@ -24,11 +26,14 @@ class MultiSurfaceMixin:
         self._multi_scene_ids = set()
         self._multi_state = 'empty'
         self._multi_activation_only = False
+        self._multi_last_measured_id = ''
+        self._multi_order_context = None
+        self._multi_order_timer = None
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self._multi_status_pub = self.create_publisher(String, '/painting_system/planes', latched)
         self._multi_target_pub = self.create_publisher(PoseStamped, '/perception/target_surface', latched)
         self._multi_refined_pub = self.create_publisher(PoseStamped, '/perception/target_surface_refined', latched)
-        self._multi_target_capture_pub = self.create_publisher(Bool, '/d405/refine_target_capture', 10)
+        self._multi_target_capture_pub = self.create_publisher(String, '/d405/refine_target_request', 10)
         self.create_subscription(String, '/perception/target_planes', self._multi_on_catalog, latched)
         self.create_subscription(String, '/painting_system/select_planes', self._multi_on_select, 10)
         self.create_subscription(String, '/painting_system/activate_plane', self._multi_on_activate, 10)
@@ -64,6 +69,7 @@ class MultiSurfaceMixin:
                     arr = np.asarray(plane[key], float)
                     if arr.shape != shape or not np.isfinite(arr).all():
                         raise ValueError('invalid plane geometry')
+                support_coordinates(plane.get('support_polygon',plane['corners']),plane['normal'])
                 if abs(np.linalg.norm(plane['normal'])-1) > .001:
                     raise ValueError('invalid plane normal')
         except (ValueError, TypeError, KeyError):
@@ -116,16 +122,23 @@ class MultiSurfaceMixin:
         msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z, msg.pose.orientation.w = q
         return msg
 
-    def _multi_start_next(self):
+    def _multi_start_next(self, ordered_id=None):
         if self._motion_abort_requested:
             self._multi_cancel('ABORT')
             return
         if not self._multi_queue:
             self._multi_current = None
             self._multi_status('measured')
-            self._multi_apply_active(self._multi_selected[-1])
+            self._multi_apply_active(self._multi_last_measured_id)
             return
-        plane = self._multi_queue.pop(0)
+        if len(self._multi_queue) > 1 and ordered_id is None:
+            self._begin_multi_order()
+            return
+        if ordered_id is not None and not any(p['id'] == ordered_id for p in self._multi_queue):
+            self._multi_cancel('ORDER_STALE_SELECTION')
+            return
+        index = next((i for i,p in enumerate(self._multi_queue) if p['id'] == ordered_id),0)
+        plane = self._multi_queue.pop(index)
         self._multi_current = plane
         self._multi_refined_result = None
         self._multi_capture_started = 0.
@@ -158,6 +171,22 @@ class MultiSurfaceMixin:
         if not self._begin_d405_prescan(mode='multi_target'):
             self._multi_cancel('D405_APPROACH_UNAVAILABLE')
 
+    def _multi_request_local_capture(self, sample_in_base):
+        """One message binds measurement ROI and trigger to the selected face."""
+        transform = self._lookup_transform_to_base(self._multi_catalog['frame_id'], timeout_s=.2)
+        if transform is None:
+            return False
+        t,q = transform.transform.translation,transform.transform.rotation
+        inverse = [-q.x,-q.y,-q.z,q.w]
+        point = quat_apply(inverse,np.asarray(sample_in_base)-[t.x,t.y,t.z])
+        stamp = self._multi_target_pose.header.stamp
+        self._multi_target_capture_pub.publish(String(data=json.dumps(dict(
+            target_stamp=dict(sec=stamp.sec,nanosec=stamp.nanosec),
+            frame_id=self._multi_target_pose.header.frame_id,
+            sample=point.tolist(),
+            support_polygon=self._multi_current.get('support_polygon',self._multi_current['corners'])))))
+        return True
+
     def _multi_on_refined(self, msg):
         if self._multi_current is None or self._multi_capture_started <= 0:
             return
@@ -184,6 +213,7 @@ class MultiSurfaceMixin:
             return
         plane_id = self._multi_current['id']
         self._multi_refined[plane_id] = copy.deepcopy(self._multi_refined_result)
+        self._multi_last_measured_id = plane_id
         self._multi_current = None
         if self._multi_activation_only:
             self._multi_activation_only = False
@@ -193,6 +223,7 @@ class MultiSurfaceMixin:
         self._schedule_process_once(.1, self._multi_start_next)
 
     def _multi_cancel(self, reason):
+        self._cancel_multi_order()
         self._multi_queue = []
         self._multi_current = None
         self._multi_status('failed', reason)

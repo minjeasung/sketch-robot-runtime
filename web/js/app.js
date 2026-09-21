@@ -4,9 +4,9 @@
 let processMode = "paint";
 let processModePending = false;
 let multiPlaneBusy = false;
+let stopRequested = false;
 
 const WS_URL = `ws://${window.location.hostname || "localhost"}:9090`;
-const WORK_AREA_TOPIC = "/perception/work_area_plane";
 const WORK_AREA_CORNERS_TOPIC = "/perception/work_area_corners";
 const ZED_LEFT_IMAGE_TOPIC = "/zed/zed_node/rgb/color/rect/image";
 const D405_REFINEMENT_STATUS_TOPIC = "/perception/d405_surface_refinement_status";
@@ -25,13 +25,13 @@ function setStatus(state, text) {
   const node = $("status");
   node.classList.remove("connecting", "connected", "disconnected", "error");
   node.classList.add(state);
-  $("status-text").textContent = text;
+  $("status-text").textContent = ({connecting: "연결 중", connected: "연결됨", disconnected: "연결 끊김", error: "연결 오류"})[state] || text;
 }
 
 function logEvent(line) {
   const node = $("events");
   const ts = new Date().toISOString().slice(11, 23); // HH:MM:SS.sss
-  node.textContent += `[${ts}] ${line}\n`;
+  node.textContent = (node.textContent + `[${ts}] ${line}\n`).split("\n").slice(-150).join("\n");
   node.scrollTop = node.scrollHeight;
 }
 
@@ -70,19 +70,13 @@ ros.on("close", () => {
 setStatus("connecting", "connecting…");
 logEvent(`connecting to ${WS_URL}`);
 
-// ---- /perception/work_area_plane 구독 ----
-const workAreaPlane = new ROSLIB.Topic({
-  ros: ros,
-  name: WORK_AREA_TOPIC,
-  messageType: "geometry_msgs/PoseStamped",
-});
+// ---- 작업영역 크기: 경로의 롤러 폭 미리보기에 사용 ----
 const workAreaCorners = new ROSLIB.Topic({
   ros: ros,
   name: WORK_AREA_CORNERS_TOPIC,
   messageType: "geometry_msgs/PoseArray",
 });
 
-let msgCount = 0;
 let latestWorkAreaSizeM = null;
 
 function dist3(a, b) {
@@ -106,27 +100,6 @@ function updateWorkAreaSizeFromCorners(msg) {
   redrawSketch();
 }
 
-workAreaPlane.subscribe((msg) => {
-  msgCount += 1;
-  const stamp = msg.header.stamp;
-  const stampStr = `${stamp.sec}.${String(stamp.nanosec).padStart(9, "0")}`;
-  const p = msg.pose.position;
-  const o = msg.pose.orientation;
-
-  $("frame-id").textContent = msg.header.frame_id || "—";
-  $("stamp").textContent = stampStr;
-  $("position").textContent =
-    `(${p.x.toFixed(4)}, ${p.y.toFixed(4)}, ${p.z.toFixed(4)})`;
-  $("orientation").textContent =
-    `(${o.x.toFixed(4)}, ${o.y.toFixed(4)}, ${o.z.toFixed(4)}, ${o.w.toFixed(4)})`;
-  $("msg-count").textContent = String(msgCount);
-
-  if (msgCount === 1) {
-    logEvent(`first ${WORK_AREA_TOPIC} message received`);
-  }
-});
-
-logEvent(`subscribed to ${WORK_AREA_TOPIC}`);
 workAreaCorners.subscribe(updateWorkAreaSizeFromCorners);
 logEvent(`subscribed to ${WORK_AREA_CORNERS_TOPIC}`);
 
@@ -181,14 +154,6 @@ function setFreeSpaceConfirmed(value, publish = true, reason = "") {
   freeSpaceConfirmed = next;
   const checkbox = $("free-space-confirmed");
   if (checkbox) checkbox.checked = next;
-  const stateNode = $("free-space-state");
-  if (stateNode) {
-    const backendConfirmed = readinessCheck("free_space_confirmed") === true;
-    stateNode.textContent = next
-      ? (backendConfirmed ? "confirmed" : "awaiting backend")
-      : "not confirmed";
-    stateNode.className = `state-pill ${next ? (backendConfirmed ? "good" : "pending") : "bad"}`;
-  }
   if (publish && rosConnected) {
     freeSpaceConfirmedPub.publish(new ROSLIB.Message({ data: next }));
     logEvent(`published ${FREE_SPACE_CONFIRMED_TOPIC}=${next}${reason ? ` (${reason})` : ""}`);
@@ -774,6 +739,7 @@ function buttonBlockReason(derived, kind) {
     if (!derived.d405Accepted) reasons.push("current D405 plane not accepted");
   }
   if (kind === "run") {
+    if (stopRequested) reasons.push("operator stop requested");
     if (!derived.planValidated) reasons.push("current plan not validated");
     if (processMode !== "spray" && (!Number.isFinite(Number(derived.targetForce)) || Number(derived.targetForce) <= 0.0)) {
       reasons.push("target force missing/invalid");
@@ -789,91 +755,23 @@ function buttonBlockReason(derived, kind) {
 function refreshPaintingUI() {
   const derived = paintingDerivedState();
   const local = paintingState.local;
-  const targetText = paintingState.targetSelectionState === "pending"
-    ? "refining"
-    : (derived.targetSelected === true ? "yes" : derived.targetSelected === false ? "no" : "unknown");
-  setPill(
-    "painting-target-selected",
-    targetText,
-    targetText === "yes" ? "good" : targetText === "refining" ? "pending" : targetText === "no" ? "bad" : "unknown",
-  );
-  setPill(
-    "painting-work-area-selected",
-    derived.workAreaSelected === true ? "yes" : derived.workAreaSelected === false ? "no" : "unknown",
-    derived.workAreaSelected === true ? "good" : derived.workAreaSelected === false ? "bad" : "unknown",
-  );
-
-  let d405Text = derived.d405State;
-  if (local.awaitingD405) d405Text = "refining";
-  else if (local.planeInvalidated && derived.d405State === "accepted") d405Text = "invalidated";
-  const d405Class = derived.d405Accepted
-    ? "good"
-    : [
-      "refining", "requested", "capturing", "waiting", "capture_armed",
-      "capture_waiting", "capture_requested", "armed",
-    ].includes(d405Text) ? "pending" : "bad";
-  setPill("painting-d405-state", d405Text || "waiting", d405Class);
-
-  let pathText = derived.planState;
-  if (local.awaitingPlan) pathText = "generating";
-  else if (local.planInvalidated) pathText = "invalidated";
-  const pathClass = ["generated", "validated"].includes(pathText)
-    ? "good"
-    : ["generating", "requested", "planning"].includes(pathText) ? "pending" : pathText === "none" ? "unknown" : "bad";
-  setPill("painting-path-state", pathText, pathClass);
-  setPill(
-    "painting-plan-validation",
-    derived.planValidated ? "validated" : (["rejected", "failed"].includes(derived.planState) ? "rejected" : "not validated"),
-    derived.planValidated ? "good" : ["rejected", "failed"].includes(derived.planState) ? "bad" : "pending",
-  );
-  setPill("painting-ready", derived.ready ? "yes" : "no", derived.ready ? "good" : "bad");
-  setPill("painting-running", derived.running ? "yes" : "no", derived.running ? "info" : "neutral");
-  const executionState = normalizedState(paintingState.execution.state);
-  const tarePhase = textId(firstPresent(
-    paintingState.execution.tare_phase,
-    paintingState.readiness.precontact_tare_phase,
-  )).toLowerCase();
-  const tareComplete = executionState === "precontact_tare_complete" || tarePhase === "complete";
-  const tareFailed = executionState === "precontact_tare_failed" || tarePhase === "failed";
-  const tarePending = paintingState.readiness.precontact_tare_pending === true;
-  const tareText = tareComplete
-    ? "complete"
-    : tareFailed ? "failed" : tarePhase && tarePhase !== "idle"
-      ? tarePhase.replaceAll("_", " ")
-      : tarePending ? "pending at nominal 10 mm (measured ≥7 mm)" : "not required";
-  setPill(
-    "painting-tare-state",
-    tareText,
-    tareComplete ? "good" : tareFailed ? "bad" : tarePending ? "pending" : "neutral",
-  );
-  const backendFreeSpaceConfirmed = readinessCheck("free_space_confirmed") === true;
-  setPill(
-    "free-space-state",
-    freeSpaceConfirmed
-      ? (backendFreeSpaceConfirmed ? "confirmed" : "awaiting backend")
-      : "not confirmed",
-    freeSpaceConfirmed ? (backendFreeSpaceConfirmed ? "good" : "pending") : "bad",
-  );
-
-  $("painting-work-area-id").textContent = derived.workAreaId || "—";
-  $("painting-plane-generation-id").textContent = derived.planeGenerationId || "—";
-  $("painting-path-id").textContent = derived.pathId || "—";
-  $("painting-plan-hash").textContent = derived.planHash
-    ? `${derived.planHash}${local.planInvalidated ? " (stale)" : ""}`
-    : "—";
-  const forceNumber = Number(derived.targetForce);
-  $("painting-target-force").textContent = Number.isFinite(forceNumber) ? `${forceNumber.toFixed(2)} N` : "—";
-  $("painting-system-state").textContent = textId(firstPresent(
-    paintingState.execution.state,
-    paintingState.readiness.state,
-  )) || "waiting for backend status";
+  const measuring = local.awaitingD405 || multiPlaneBusy;
+  const d405Failed = ["failed", "rejected"].includes(derived.d405State);
+  setPill("painting-d405-state", derived.d405Accepted ? "완료" : measuring ? "측정 중" : d405Failed ? "확인 필요" : "대기",
+    derived.d405Accepted ? "good" : measuring ? "pending" : d405Failed ? "bad" : "unknown");
+  const planFailed = ["rejected", "failed"].includes(derived.planState);
+  setPill("painting-plan-validation", derived.planValidated ? "완료" : local.awaitingPlan ? "검증 중" : planFailed ? "확인 필요" : "대기",
+    derived.planValidated ? "good" : local.awaitingPlan ? "pending" : planFailed ? "bad" : "unknown");
+  const backendConfirmed = readinessCheck("free_space_confirmed") === true;
+  setPill("free-space-state", freeSpaceConfirmed ? (backendConfirmed ? "승인됨" : "확인 중") : "미승인",
+    freeSpaceConfirmed ? (backendConfirmed ? "good" : "pending") : "bad");
 
   const blockers = backendBlockers();
   if (local.planeInvalidated) blockers.unshift(local.awaitingD405 ? "D405 refinement pending" : "D405 plane invalidated");
   if (local.planInvalidated) blockers.unshift(local.invalidationReason || "plan invalidated by local edit");
-  $("painting-blockers").textContent = [...new Set(blockers)].join("\n") || "none";
-  $("painting-abort-reason").textContent = derived.abortReason || "—";
-  $("painting-abort-reason").parentElement.classList.toggle("has-abort", Boolean(derived.abortReason));
+  $("painting-blockers").textContent = [...new Set(blockers)].join("\n") || "진단 항목 없음";
+  $("painting-abort-reason").textContent = derived.abortReason ? `작업 중단: ${derived.abortReason}` : "";
+  $("painting-abort-reason").hidden = !derived.abortReason;
 
   const cs = typeof currentStrokes === "function" ? currentStrokes() : [];
   const pathContext = workflowMode === "path" && currentView === "wall_front";
@@ -886,16 +784,51 @@ function refreshPaintingUI() {
     workflowMode !== "work_area" || currentView !== "wall_front" || derived.targetSelected !== true;
   $("btn-execute").disabled = !pathGate || cs.length === 0;
   $("btn-fill-work-area").disabled = !pathGate;
-  $("btn-run-robot").disabled = !rosConnected || !derived.ready;
-  $("btn-clear").disabled = derived.running;
-  $("btn-undo").disabled = derived.running;
+  $("btn-run-robot").disabled = !rosConnected || !derived.ready || stopRequested;
+  $("btn-clear").disabled = derived.running || cs.length === 0;
+  $("btn-undo").disabled = derived.running || cs.length === 0;
   $("free-space-confirmed").disabled = !rosConnected || derived.running || Boolean(derived.abortReason);
+  $("btn-stop-robot").disabled = !rosConnected;
+  document.querySelectorAll('input[name="workflow-mode"], input[name="sketch-mode"]').forEach(input => { input.disabled = derived.running; });
+
+  $("target-actions").hidden = workflowMode !== "target";
+  $("work-area-actions").hidden = workflowMode !== "work_area";
+  $("path-actions").hidden = workflowMode !== "path";
+  $("tare-confirmation").hidden = processMode === "spray" || workflowMode !== "path";
+  const hints = {
+    target: "작업할 대상을 둘러 그린 뒤 평면을 추출하세요.",
+    work_area: "측정한 평면 위에 칠할 영역을 그리세요.",
+    path: "영역을 자동으로 채우거나, 원하는 경로를 직접 그리세요.",
+  };
+  $("workflow-hint").textContent = derived.running ? "로봇 작업 중에는 스케치를 수정할 수 없습니다." : hints[workflowMode];
+  $("sketch-canvas").setAttribute("aria-label", hints[workflowMode]);
+
+  let summary = "실행 조건을 확인 중입니다. 연결·진단에서 상세 내용을 확인하세요.";
+  if (!rosConnected) summary = "로봇 연결을 기다리고 있습니다.";
+  else if (derived.abortReason) summary = "작업이 중단되었습니다. 원인을 확인하세요.";
+  else if (stopRequested) summary = "중단 요청을 보냈습니다. 로봇의 응답을 기다립니다.";
+  else if (multiPlaneBusy) summary = "선택한 평면에 접근하여 측정 중입니다.";
+  else if (derived.running) summary = "로봇이 작업 중입니다.";
+  else if (processModePending) summary = "작업 방식 변경을 확인 중입니다.";
+  else if (derived.ready) summary = "준비 완료. 작업을 시작할 수 있습니다.";
+  else if (paintingState.readinessSeq === 0) summary = "로봇 상태를 확인하고 있습니다.";
+  else if (measuring) summary = "평면 측정 결과를 기다리고 있습니다.";
+  else if (derived.targetSelected !== true) summary = "대상을 선택하고 평면을 측정하세요.";
+  else if (derived.workAreaSelected !== true) summary = "칠할 작업영역을 확정하세요.";
+  else if (!derived.d405Accepted) summary = "평면 측정 상태를 확인하세요.";
+  else if (local.awaitingPlan) summary = "작업 경로를 생성·검증하고 있습니다.";
+  else if (!derived.planValidated) summary = planFailed ? "경로 검증에 실패했습니다. 영역이나 경로를 확인하세요." : "작업 경로를 생성하세요.";
+  else if (processMode !== "spray" && !freeSpaceConfirmed) summary = "접촉 전 F/T 영점 조정을 승인하세요.";
+  else if (processMode !== "spray" && !backendConfirmed) summary = "영점 조정 승인을 확인 중입니다.";
+  $("execution-summary").textContent = summary;
+  $("execution-summary").classList.toggle("is-running", derived.running);
+  $("btn-run-robot").textContent = derived.running ? "작업 진행 중" : "작업 시작";
 
   const pathReasons = buttonBlockReason(derived, "path");
-  $("btn-execute").title = pathReasons.length ? pathReasons.join("; ") : "Generate a free-sketch path from the current D405 plane";
-  $("btn-fill-work-area").title = pathReasons.length ? pathReasons.join("; ") : "Generate the backend work-area fill path";
+  $("btn-execute").title = pathReasons.length ? pathReasons.join("; ") : "그린 경로를 생성하고 검증합니다";
+  $("btn-fill-work-area").title = pathReasons.length ? pathReasons.join("; ") : "선택한 작업영역을 채우는 경로를 생성합니다";
   const runReasons = buttonBlockReason(derived, "run");
-  $("btn-run-robot").title = runReasons.length ? runReasons.join("; ") : "Validated backend plan is ready; confirmation required";
+  $("btn-run-robot").title = runReasons.length ? runReasons.join("; ") : "확인 후 로봇이 움직입니다";
   return derived;
 }
 
@@ -906,8 +839,8 @@ const VIEW_TOPICS = {
   wall_front: "/perception/wall_front_view",
 };
 const VIEW_TITLES = {
-  zed_raw:    "ZED LEFT CAMERA",
-  wall_front: "WALL FRONT VIEW (벽 정면)",
+  zed_raw:    "ZED 카메라",
+  wall_front: "작업면 정면",
 };
 
 let currentView = "zed_raw";
@@ -916,8 +849,6 @@ let currentImageSub = null;
 const zedCanvas = $("zed-canvas");
 const zedCtx = zedCanvas.getContext("2d");
 let zedFrameCount = 0;
-let zedFpsFrames = 0;
-let zedFpsTimerStart = performance.now();
 
 function decodeImageData(msg) {
   // sensor_msgs/Image, encoding=rgb8 → roslibjs 가 base64 string 으로 data 전달.
@@ -984,19 +915,7 @@ function handleImageMsg(msg) {
   }
 
   zedFrameCount += 1;
-  zedFpsFrames += 1;
-  const now = performance.now();
-  const elapsed = now - zedFpsTimerStart;
-  if (elapsed >= 1000) {
-    const fps = (zedFpsFrames * 1000 / elapsed).toFixed(1);
-    $("zed-fps").textContent = `${fps} Hz`;
-    zedFpsFrames = 0;
-    zedFpsTimerStart = now;
-  }
-
-  $("zed-res").textContent = `${msg.width} × ${msg.height}`;
-  $("zed-encoding").textContent = msg.encoding;
-  $("zed-frames").textContent = String(zedFrameCount);
+  $("camera-empty").hidden = true;
 
   if (zedFrameCount === 1) {
     logEvent(`first image on ${VIEW_TOPICS[currentView]} (${msg.width}×${msg.height}, ${msg.encoding})`);
@@ -1023,12 +942,8 @@ function subscribeView(viewName) {
   currentImageSub = sub;
   // 새 view 의 첫 frame 도착 전 — stats reset 으로 fps 계산 정확하게.
   zedFrameCount = 0;
-  zedFpsFrames = 0;
-  zedFpsTimerStart = performance.now();
-  $("zed-frames").textContent = "0";
-  $("zed-fps").textContent = "—";
-  $("zed-res").textContent = "—";
-  $("zed-encoding").textContent = "—";
+  zedCtx.clearRect(0, 0, zedCanvas.width, zedCanvas.height);
+  $("camera-empty").hidden = false;
   logEvent(`subscribed to ${topic}`);
 }
 
@@ -1040,24 +955,12 @@ function switchView(viewName) {
   pendingLine = null;
   currentMouse = null;
   currentView = viewName;
-  // 헤더 갱신 — 첫 text node 만 교체, span#view-card-topic 보존
-  const titleEl = $("view-card-title");
-  titleEl.firstChild.nodeValue = VIEW_TITLES[viewName] + " ";
-  $("view-card-topic").textContent =
-    `(${VIEW_TOPICS[viewName]}, sensor_msgs/Image)`;
-  $("view-mode-text").textContent = viewName;
+  $("view-card-title").textContent = VIEW_TITLES[viewName];
   // sketch 즉시 redraw (새 view 의 strokes 로)
   redrawSketch();
   // 새 topic subscribe
   subscribeView(viewName);
 }
-
-document.querySelectorAll('input[name="view-mode"]').forEach((r) => {
-  r.addEventListener("change", () => {
-    const v = document.querySelector('input[name="view-mode"]:checked').value;
-    switchView(v);
-  });
-});
 
 // 초기 구독
 subscribeView(currentView);
@@ -1095,21 +998,7 @@ function getNativeCoords(ev) {
 }
 
 function updateSketchStats() {
-  const cs = currentStrokes();
-  $("sketch-strokes-count").textContent = String(cs.length);
-  const total = cs.reduce((acc, s) => acc + s.points.length, 0);
-  $("sketch-points-count").textContent = String(total);
-  const roller = rollerFootprintScale();
-  const rollerNode = $("roller-footprint");
-  if (rollerNode) {
-    if (currentView === "wall_front" && workflowMode === "path" && roller) {
-      const source = roller.estimated ? "fallback" : "work_area";
-      rollerNode.textContent =
-        `${Math.round(ROLLER_LENGTH_M * 1000)} mm = ${roller.widthPx.toFixed(0)} px (${source})`;
-    } else {
-      rollerNode.textContent = "—";
-    }
-  }
+  $("sketch-strokes-count").textContent = `${currentStrokes().length}개 스케치`;
   refreshPaintingUI();
 }
 
@@ -1389,7 +1278,6 @@ document.addEventListener("keydown", (ev) => {
 document.querySelectorAll('input[name="sketch-mode"]').forEach((r) => {
   r.addEventListener("change", () => {
     sketchMode = document.querySelector('input[name="sketch-mode"]:checked').value;
-    $("sketch-mode-text").textContent = sketchMode;
     // 모드 전환 시 진행 중 stroke 정리
     if (sketchMode !== "line" && pendingLine) {
       pendingLine = null;
@@ -1411,11 +1299,8 @@ function switchWorkflow(mode) {
   pendingRect = null;
   currentMouse = null;
   workflowMode = mode;
-  $("workflow-mode-text").textContent = mode;
   // target 은 ZED 전체 scene 에서, work_area/path 는 D405 정면(wall_front) 에서.
   const targetView = mode === "target" ? "zed_raw" : "wall_front";
-  const radio = document.querySelector(`input[name="view-mode"][value="${targetView}"]`);
-  if (radio) radio.checked = true;
   switchView(targetView);
   redrawSketch();
 }
@@ -1745,11 +1630,8 @@ $("btn-run-robot").addEventListener("click", () => {
   const forceText = Number.isFinite(forceNumber) ? `${forceNumber.toFixed(2)} N` : "missing";
   const ok = window.confirm(
     "RB10 실제 실행을 승인합니까?\n\n" +
-    `Plan hash: ${hash8}\n` +
-    `Target force: ${forceText}\n` +
-    `Work-area ID: ${derived.workAreaId}\n` +
-    `Plane generation ID: ${derived.planeGenerationId}\n` +
-    `Path ID: ${derived.pathId}\n\n` +
+    `작업 방식: ${processMode === "spray" ? "내화뿜칠" : "롤러 도장"}\n` +
+    (processMode === "paint" ? `목표 접촉력: ${forceText}\n\n` : "\n") +
     (processMode === "spray"
       ? "로봇이 작업면에서 50 cm 이격하여 이동합니다. 도포 경로에서만 뿜칠건이 켜집니다."
       : "로봇이 즉시 움직입니다. 10 mm pre-contact에서 정지한 후 간격을 확인하고 F/T tare를 수행합니다."),
@@ -1760,6 +1642,18 @@ $("btn-run-robot").addEventListener("click", () => {
   }
   sketchExecutePub.publish(new ROSLIB.Message({ data: true }));
   logEvent(`published ${SKETCH_EXECUTE_TOPIC} for plan ${hash8}`);
+});
+
+// Uses the executor's existing abort interface; this is a stop request, not a
+// claim that the robot has stopped. Backend abort status remains authoritative.
+const motionAbortPub = new ROSLIB.Topic({ros, name: "/motion_abort", messageType: "std_msgs/Bool"});
+$("btn-stop-robot").addEventListener("click", () => {
+  if (!rosConnected) return;
+  stopRequested = true;
+  motionAbortPub.publish(new ROSLIB.Message({data: true}));
+  resetFreeSpaceConfirmation("operator requested stop", true);
+  logEvent("작업 중단 요청 전송 (/motion_abort)");
+  refreshPaintingUI();
 });
 
 updateSketchStats();

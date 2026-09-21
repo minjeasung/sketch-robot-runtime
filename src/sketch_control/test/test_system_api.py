@@ -53,7 +53,7 @@ def test_group_commands_preserve_interlocks(tmp_path, profile, fake, dry, force)
         assert f'use_fake_hardware:={fake}' in spec.command
         assert f'dry_run:={dry}' in spec.command
         assert f'painting_force_enabled:={force}' in spec.command
-        for name in ('robot_stack', 'perception', 'force_pipeline', 'executor', 'rosbridge'):
+        for name in ('robot_control', 'perception', 'force_pipeline', 'executor', 'rosbridge'):
             assert f'launch_{name}:={str(name == spec.name).lower()}' in spec.command
         assert f'enable_interlock_flight_recorder:={str(spec.name == "executor").lower()}' in spec.command
 
@@ -68,11 +68,11 @@ def test_reject_arbitrary_configuration(tmp_path, options):
 def test_preflight_duplicate_and_discovery(supervisor):
     supervisor.monitor.nodes = ['/move_group']
     with pytest.raises(SupervisorError, match='Already running'):
-        supervisor.preflight('robot_stack')
+        supervisor.preflight('robot_control')
     supervisor.monitor.nodes = []
     supervisor.monitor.fresh = False
     with pytest.raises(SupervisorError, match='discovery'):
-        supervisor.preflight('robot_stack')
+        supervisor.preflight('robot_control')
 
 
 def test_allow_external_camera_only_when_disabled(supervisor):
@@ -90,11 +90,11 @@ def test_api_dependency_order_cascade_and_logs(client, supervisor):
     assert result.json()['started'] == list(supervisor.records)
     state = client.get('/status').json()
     assert state['system_prepared'] and state['ros']['readiness'] is None
-    assert client.post('/processes/robot_stack/start').json()['start_count'] == 1
-    assert client.post('/processes/robot_stack/stop').status_code == 409
+    assert client.post('/processes/robot_control/start').json()['start_count'] == 1
+    assert client.post('/processes/robot_control/stop').status_code == 409
     assert client.post('/configuration', json={'profile': 'work'}).status_code == 409
     assert 'TEST_PROCESS' in client.get('/processes/executor/logs').json()['lines']
-    assert client.post('/processes/robot_stack/stop?cascade=true').status_code == 200
+    assert client.post('/processes/robot_control/stop?cascade=true').status_code == 200
     assert supervisor.monitor.aborts == 3
     assert client.get('/processes/executor').json()['state'] == 'STOPPED'
     assert client.get('/processes/rosbridge').json()['state'] == 'RUNNING'
@@ -105,10 +105,10 @@ def test_api_dependency_order_cascade_and_logs(client, supervisor):
 def test_failed_prepare_rolls_back_only_new_processes(tmp_path):
     supervisor = make_supervisor(tmp_path, {'force_pipeline': (sys.executable, '-c', 'raise SystemExit(2)')})
     with TestClient(create_app(supervisor), base_url='http://localhost') as client:
-        assert client.post('/processes/robot_stack/start').status_code == 200
+        assert client.post('/processes/robot_control/start').status_code == 200
         response = client.post('/prepare-system')
         assert response.status_code == 409
-        assert client.get('/processes/robot_stack').json()['state'] == 'RUNNING'
+        assert client.get('/processes/robot_control').json()['state'] == 'RUNNING'
         assert client.get('/processes/perception').json()['state'] == 'STOPPED'
         assert client.get('/processes/force_pipeline').json()['state'] == 'FAILED'
         assert client.get('/processes/force_pipeline').json()['pid'] is None
@@ -116,25 +116,25 @@ def test_failed_prepare_rolls_back_only_new_processes(tmp_path):
 
 def test_restart_stops_dependents_without_restarting_them(client):
     assert client.post('/prepare-system').status_code == 200
-    assert client.post('/processes/robot_stack/restart').status_code == 409
-    assert client.post('/processes/robot_stack/restart?cascade=true').status_code == 200
-    assert client.get('/processes/robot_stack').json()['start_count'] == 2
+    assert client.post('/processes/robot_control/restart').status_code == 409
+    assert client.post('/processes/robot_control/restart?cascade=true').status_code == 200
+    assert client.get('/processes/robot_control').json()['start_count'] == 2
     assert client.get('/processes/executor').json()['state'] == 'STOPPED'
 
 
 def test_dependency_crash_stops_executor(client, supervisor):
     assert client.post('/prepare-system').status_code == 200
-    supervisor.records['robot_stack']['process'].send_signal(signal.SIGTERM)
+    supervisor.records['robot_control']['process'].send_signal(signal.SIGTERM)
     until = time.monotonic() + 5
     while time.monotonic() < until:
         state = client.get('/status').json()
         by_name = {p['name']: p for p in state['processes']}
-        if by_name['robot_stack']['state'] == 'FAILED' and by_name['executor']['state'] == 'STOPPED':
+        if by_name['robot_control']['state'] == 'FAILED' and by_name['executor']['state'] == 'STOPPED':
             break
         time.sleep(.05)
     assert client.get('/processes/executor').json()['state'] == 'STOPPED'
     assert supervisor.monitor.aborts == 3
-    assert client.get('/processes/robot_stack').json()['state'] == 'FAILED'
+    assert client.get('/processes/robot_control').json()['state'] == 'FAILED'
 
 
 def test_lifespan_closes_owned_processes(supervisor):

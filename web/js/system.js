@@ -2,6 +2,8 @@
 const byId = id => document.getElementById(id);
 let pending = false, latest = null, settingsLoaded = false, token = "";
 const labels = {STOPPED: "종료", STARTING: "기동 중", RUNNING: "실행 중", STOPPING: "종료 중", FAILED: "오류", EXITED: "종료됨"};
+const processLabels = {robot_control: "robot control"};
+const processLabel = name => processLabels[name] || name;
 function options() {
   return {profile: byId("profile").value, robot_ip: byId("robot-ip").value.trim(),
     launch_zed_driver: byId("zed").checked, launch_d405_driver: byId("d405").checked,
@@ -34,7 +36,7 @@ function renderProcesses(state) {
   for (const p of state.processes) {
     const row = document.createElement("div"); row.className = "process-row";
     const text = document.createElement("span");
-    text.textContent = `${p.name} · ${labels[p.state] || p.state}${p.pid ? ` · PID ${p.pid}` : ""}${p.error ? ` · ${p.error}` : ""}`;
+    text.textContent = `${processLabel(p.name)} · ${labels[p.state] || p.state}${p.pid ? ` · PID ${p.pid}` : ""}${p.error ? ` · ${p.error}` : ""}`;
     row.append(text);
     for (const [action, title] of [["start", "시작"], ["stop", "종료"], ["restart", "재시작"]]) {
       const button = document.createElement("button"); button.textContent = title;
@@ -47,7 +49,7 @@ function renderProcesses(state) {
     box.append(row);
   }
   const select = byId("log-process");
-  if (!select.options.length) for (const p of state.processes) select.add(new Option(p.name, p.name));
+  if (!select.options.length) for (const p of state.processes) select.add(new Option(processLabel(p.name), p.name));
 }
 async function refresh() {
   try {

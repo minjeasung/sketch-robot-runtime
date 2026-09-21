@@ -6,14 +6,20 @@ const planeColors = ['#38bdf8','#f59e0b','#a78bfa','#4ade80','#fb7185','#22d3ee'
 const selectPlanesPub = new ROSLIB.Topic({ros, name:'/painting_system/select_planes', messageType:'std_msgs/String'});
 const activatePlanePub = new ROSLIB.Topic({ros, name:'/painting_system/activate_plane', messageType:'std_msgs/String'});
 const processModePub = new ROSLIB.Topic({ros, name:'/painting_system/set_process_mode', messageType:'std_msgs/String'});
+let lastPlaneRender = "";
 function renderPlaneList() {
+  // Keep select menus and checkbox focus intact between unchanged status ticks.
+  const signature = JSON.stringify([planeCatalog, planeState, [...selectedPlaneIds], rosConnected, paintingDerivedState().running, processModePending]);
+  if (signature === lastPlaneRender) return;
+  lastPlaneRender = signature;
   const list = $('plane-candidates'); list.replaceChildren();
   planeCatalog.planes.forEach((plane,index) => {
-    const label = document.createElement('label'); label.style.color=planeColors[index%planeColors.length];
+    const label = document.createElement('label');
+    const swatch = document.createElement('span'); swatch.className='plane-swatch'; swatch.style.background=planeColors[index%planeColors.length]; swatch.setAttribute('aria-hidden','true');
     const checkbox=document.createElement('input'); checkbox.type='checkbox'; checkbox.checked=selectedPlaneIds.has(plane.id);
     checkbox.disabled=paintingDerivedState().running;
     checkbox.addEventListener('change',()=>{ if(checkbox.checked) selectedPlaneIds.add(plane.id); else selectedPlaneIds.delete(plane.id); renderPlaneList(); redrawSketch(); });
-    label.append(checkbox,document.createTextNode(` 면 ${index+1} · ${plane.inlier_count}점 `)); list.append(label);
+    label.append(checkbox,swatch,document.createTextNode(`면 ${index+1}`)); list.append(label);
   });
   $('btn-refine-planes').disabled=!rosConnected || paintingDerivedState().running || !selectedPlaneIds.size;
   const select=$('active-plane'); select.replaceChildren();
@@ -22,8 +28,9 @@ function renderPlaneList() {
     const option=document.createElement('option'); option.value=p.id;
     option.textContent=`면 ${planeCatalog.planes.indexOf(p)+1}`; select.append(option);
   });
-  select.value=planeState.active_id||''; select.disabled=paintingDerivedState().running || !(planeState.measured||[]).length;
-  $('process-mode').disabled=paintingDerivedState().running || processModePending;
+  select.value=planeState.active_id||''; select.disabled=!rosConnected || paintingDerivedState().running || !(planeState.measured||[]).length;
+  $('active-plane-field').hidden=!(planeState.measured||[]).length;
+  $('process-mode').disabled=!rosConnected || paintingDerivedState().running || processModePending;
 }
 function drawPlaneCandidates() {
   if(currentView!=='zed_raw') return;
@@ -59,7 +66,7 @@ new ROSLIB.Topic({ros,name:'/painting_system/planes',messageType:'std_msgs/Strin
   if(payload.generation!==planeCatalog.generation)return;
   const changed=payload.active_id!==planeState.active_id || planeState.state!=="ready";
   planeState=payload; multiPlaneBusy=payload.running===true;
-  $('planes-status').textContent=payload.error||({measuring:'D405 접근·측정 중',ready:'측정 완료 — 평면별 작업영역을 그리세요',failed:'측정 실패',candidates:'측정할 면 선택'}[payload.state]||payload.state);
+  $('planes-status').textContent=payload.error||({ordering:'이동이 적은 측정 순서 계산 중',measuring:'D405 접근·측정 중',ready:'측정 완료 — 평면별 작업영역을 그리세요',failed:'측정 실패',candidates:'측정할 면 선택'}[payload.state]||payload.state);
   if(payload.state==='ready'){
     paintingState.targetSelectionState='selected';
     if(changed){strokesMap.work_area=[];strokesMap.path=[];beginD405Refresh('active plane changed');switchToWorkAreaMode();}
@@ -84,10 +91,10 @@ new ROSLIB.Topic({ros,name:'/painting_system/process_mode',messageType:'std_msgs
   if(!['paint','spray'].includes(payload.mode))return;
   const changed=processMode!==payload.mode; processMode=payload.mode; processModePending=false;
   $('process-mode').value=processMode;
-  $('process-mode-state').textContent=payload.error||(processMode==='spray'?'50 cm 이격 · 도포 중 ON · 이동 중 OFF · 힘 보정 없음':'접촉 도장 · 20–30 N');
-  document.querySelector('.free-space-panel').hidden=processMode==='spray';
+  $('process-mode-state').textContent=payload.error||(processMode==='spray'?'작업면에서 50 cm 이격 · 칠할 때만 분사':'작업면에 접촉하여 도장합니다.');
   if(changed)invalidatePlanLocally('process mode acknowledged',false);
   refreshPaintingUI(); renderPlaneList();
 });
 ros.on('close',()=>{multiPlaneBusy=false;processModePending=true;renderPlaneList();});
+renderPlaneList();
 setInterval(renderPlaneList,1000);

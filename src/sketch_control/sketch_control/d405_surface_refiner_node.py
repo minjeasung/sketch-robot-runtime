@@ -8,6 +8,7 @@ invalidation event.
 """
 
 import json
+import copy
 import math
 import time
 from dataclasses import dataclass
@@ -39,6 +40,7 @@ from sketch_control.plane_lifecycle import (
     validate_single_plane_result,
 )
 from sketch_control.rotation_utils import quat_apply, quat_from_matrix
+from sketch_control.d405_view_geometry import support_mask, support_coordinates
 
 
 TARGET_SURFACE_TOPIC = "/perception/target_surface"
@@ -307,6 +309,7 @@ class D405SurfaceRefinerNode(Node):
             self._on_cloud,
             qos_profile_sensor_data,
         )
+        self.create_subscription(String, "/d405/refine_target_request", self._on_target_capture_request, 10)
         self.create_subscription(Bool, CAPTURE_TOPIC, self._on_capture, 10)
         self.create_subscription(
             Bool, TARGET_CAPTURE_TOPIC, self._on_target_capture, 10
@@ -608,6 +611,31 @@ class D405SurfaceRefinerNode(Node):
         if msg.data:
             self._start_capture("work_area")
 
+    def _on_target_capture_request(self, msg):
+        # Validate the complete request before changing the capture lifecycle.
+        try:
+            data = json.loads(msg.data)
+            reference = self.latest_target_surface
+            if reference is None or data['target_stamp'] != self._target_stamp or data['frame_id'] != reference.header.frame_id:
+                raise ValueError('stale_target_capture_request')
+            polygon = np.asarray(data['support_polygon'],float)
+            sample = np.asarray(data['sample'],float)
+            normal = _pose_normal(reference.pose)
+            center = np.array([reference.pose.position.x,reference.pose.position.y,reference.pose.position.z])
+            if sample.shape != (3,) or not np.isfinite(sample).all() or len(polygon) > 256:
+                raise ValueError('invalid_capture_roi')
+            support_coordinates(polygon,normal)
+            if abs((sample-center)@normal) > .005 or np.max(np.abs((polygon-center)@normal)) > .005:
+                raise ValueError('capture_roi_off_target_plane')
+            if not support_mask([sample],polygon,normal,margin=.075)[0]:
+                raise ValueError('capture_sample_outside_safe_support')
+            reference = copy.deepcopy(reference)
+            reference.pose.position.x,reference.pose.position.y,reference.pose.position.z = map(float,sample)
+        except (ValueError,TypeError,KeyError,IndexError) as exc:
+            self._publish_status(False,'capture_rejected',mode='target',rejection_reason=str(exc))
+            return
+        self._start_capture('target',reference_plane=reference,roi_polygon=polygon.tolist())
+
     def _on_target_capture(self, msg):
         if msg.data:
             self._start_capture("target")
@@ -624,7 +652,7 @@ class D405SurfaceRefinerNode(Node):
         self._publish_target_status("requested")
         self._start_capture("target")
 
-    def _start_capture(self, mode):
+    def _start_capture(self, mode, *, reference_plane=None, roi_polygon=None):
         if self._active_capture_mode is not None:
             self._publish_status(
                 False,
@@ -634,7 +662,8 @@ class D405SurfaceRefinerNode(Node):
             )
             return False
         self._supersede_pending_cloud()
-        reference_plane = self._reference_plane_for_mode(mode)
+        if reference_plane is None:
+            reference_plane = self._reference_plane_for_mode(mode)
         if reference_plane is None:
             reason = (
                 "waiting_for_target_surface"
@@ -671,6 +700,7 @@ class D405SurfaceRefinerNode(Node):
             return False
         self._active_capture_mode = mode
         self._active_capture_reference = reference_plane
+        self._active_capture_roi = copy.deepcopy(roi_polygon)
         self._publish_status(
             False,
             "capture_armed",
@@ -708,6 +738,8 @@ class D405SurfaceRefinerNode(Node):
             return
         lifecycle = self._lifecycles[mode]
         plane_msg = self._active_capture_reference
+        roi_polygon = getattr(self,"_active_capture_roi",None)
+        self._active_capture_roi = None
         capture_deadline = float(lifecycle.capture_deadline)
 
         # Consume/disarm before parsing, TF, ROI, or RANSAC.  If exact-time TF
@@ -727,6 +759,8 @@ class D405SurfaceRefinerNode(Node):
             return
 
         metadata = self._capture_metadata(msg)
+        if roi_polygon is not None:
+            metadata["capture_roi_polygon"] = roi_polygon
         if not self._stamp_is_valid(msg.header.stamp):
             self._reject_capture(mode, "capture_stamp_invalid", metadata=metadata)
             return
@@ -906,6 +940,12 @@ class D405SurfaceRefinerNode(Node):
             dtype=float,
         )
         n0 = _pose_normal(plane_msg.pose)
+        if mode == "target" and metadata.get("capture_roi_polygon") is not None:
+            try:
+                points = points[support_mask(points,metadata["capture_roi_polygon"],n0)]
+            except ValueError:
+                self._reject_capture(mode,"invalid_capture_support",metadata=metadata)
+                return
         roi = self._select_surface_roi(
             points,
             p0,

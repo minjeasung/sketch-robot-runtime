@@ -499,6 +499,7 @@ def _load_eoat_no_camera_mesh():
 
 from sketch_control.spray_execution import SprayExecutionMixin
 from sketch_control.multi_surface_execution import MultiSurfaceMixin
+from sketch_control.d405_view_geometry import measurement_samples, camera_view
 
 
 class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
@@ -4057,32 +4058,42 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         return True
 
     def _build_d405_prescan_poses(self):
+        self._d405_scan_candidates = []
         try:
-            target = get_target(self.cfg, self.active_target_name)
-        except Exception:
-            target = None
-
-        if self.current_waypoints:
-            normal = self._infer_surface_normal_from_waypoints(
-                self.current_waypoints, target or get_target(self.cfg, "wall"))
-        else:
-            _point, normal = self._active_surface_plane(
-                target or get_target(self.cfg, "wall"))
-        normal = np.asarray(normal, dtype=float)
-        normal /= np.linalg.norm(normal) + 1e-12
-
-        q = self._tcp_quat_for_surface_normal_near_current(normal)
-        samples = self._d405_prescan_surface_samples(normal)
-        poses = []
-        accepted_samples = []
-        for sample in samples:
-            pose = self._make_d405_scan_tcp_pose(sample, normal, q)
-            if pose is not None:
-                poses.append(pose)
-                accepted_samples.append(np.asarray(sample, dtype=float).copy())
-        self._d405_prescan_surface_points = accepted_samples
-        self._d405_prescan_surface_normal = normal.copy()
-        return poses
+            mount = self._d405_mount_transform()
+            current = self._current_tcp_pose_np()
+            if current is None:
+                raise ValueError("current TCP TF unavailable")
+            if getattr(self,"_multi_current",None) is not None:
+                polygon,normal = self._d405_support_in_base(self._multi_current)
+            else:
+                basis = self._dynamic_work_area_basis()
+                if basis is None:
+                    raise ValueError("finite work-area support unavailable")
+                center,u,v,hu,hv = basis
+                _point,normal = self._active_surface_plane(get_target(self.cfg,self.active_target_name))
+                polygon = np.array([center+su*hu*u+sv*hv*v for su,sv in [(-1,1),(1,1),(1,-1),(-1,-1)]])
+                polygon = np.array([self._project_point_to_active_surface(point,normal) for point in polygon])
+            normal = np.asarray(normal,float)
+            normal /= np.linalg.norm(normal)
+            camera = current[0]+quat_apply(current[1],mount[0])
+            points = measurement_samples(camera,polygon,normal,margin=D405_PREFLIGHT_SCAN_INSET_M)
+            self._d405_scan_mount = mount
+            self._d405_prescan_surface_normal = normal
+            self._d405_prescan_surface_points = points
+            for index,point in enumerate(points):
+                ordered = [point]+[p for i,p in enumerate(points) if i != index]
+                for flipped in (False,True):
+                    _position,q = camera_view(point,normal,current,mount,D405_PREFLIGHT_SCAN_STANDOFF,flipped)
+                    poses = tuple(self._make_d405_scan_tcp_pose(p,normal,q) for p in ordered)
+                    self._d405_scan_candidates.append(dict(
+                        name=f"d405_sample_{index}_{'roll180' if flipped else 'near_current'}",
+                        candidate_index=len(self._d405_scan_candidates),poses=poses,surface_points=ordered))
+            self.get_logger().info(f"[D405 VIEW] {len(points)} interior samples, {len(self._d405_scan_candidates)} calibrated optical poses")
+            return list(self._d405_scan_candidates[0]['poses'])
+        except Exception as exc:
+            self.get_logger().error(f"[D405 VIEW] cannot build calibrated measurement poses: {exc}")
+            return []
 
     def _current_tcp_pose_np(self):
         try:
@@ -4316,7 +4327,8 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             np.asarray(surface_point, dtype=float)
             + normal * D405_PREFLIGHT_SCAN_STANDOFF
         )
-        camera_offset_world = quat_apply(q, D405_COLLISION_CENTER)
+        mount = getattr(self,"_d405_scan_mount",None)
+        camera_offset_world = quat_apply(q, mount[0] if mount is not None else D405_COLLISION_CENTER)
         tcp_pos = desired_camera - camera_offset_world
         pose = Pose()
         pose.position.x = float(tcp_pos[0])
@@ -4374,7 +4386,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
     def _request_d405_orientation_candidate_iks(
         self, label, pose, finalize_cb
     ):
-        """Collision-check both exact local-+Y 180-degree D405 poses."""
+        """Collision-check all calibrated sample/roll candidates from one seed."""
 
         del pose  # Branch poses are rebuilt from the captured camera centers.
         token = getattr(self, "_d405_prescan_token", None)
@@ -4418,17 +4430,17 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             finalize_cb(False)
             return
 
-        branches = (
-            self._d405_scan_pose_branch(flipped=False),
-            self._d405_scan_pose_branch(flipped=True),
-        )
-        if any(not branch for branch in branches):
-            self.get_logger().error(
-                "[D405 PRESCAN SYMMETRY] camera-center-preserving pose "
-                "branches could not be built"
-            )
-            finalize_cb(False)
-            return
+        candidates = list(getattr(self,"_d405_scan_candidates",()))
+        compare_views = bool(candidates)
+        if not candidates:
+            # Legacy callers without a view pool retain the existing two poses.
+            branches = (self._d405_scan_pose_branch(flipped=False),self._d405_scan_pose_branch(flipped=True))
+            if any(not branch for branch in branches):
+                finalize_cb(False)
+                return
+            candidates = [dict(name=name,poses=branch,candidate_index=index)
+                          for index,(name,branch) in enumerate(zip(
+                              ("d405_near_current","d405_flipped_local_y_180"),branches))]
 
         self._cancel_d405_orientation_timer()
         self._d405_orientation_generation += 1
@@ -4441,18 +4453,9 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             "label": str(label),
             "finalize_cb": finalize_cb,
             "seed_state": seed_state,
-            "candidates": (
-                {
-                    "name": "d405_near_current",
-                    "poses": branches[0],
-                    "candidate_index": 0,
-                },
-                {
-                    "name": "d405_flipped_local_y_180",
-                    "poses": branches[1],
-                    "candidate_index": 1,
-                },
-            ),
+            "candidates": tuple(candidates),
+            "compare_views": compare_views,
+            "planned_views": [],
             "results": {},
             "ranked": [],
             "rank_index": -1,
@@ -4495,7 +4498,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
                 self._d405_orientation_candidate_ik_done(done, c, i)
             )
 
-        if len(context["results"]) == 2:
+        if len(context["results"]) == len(context["candidates"]):
             self._finish_d405_orientation_candidate_iks(context)
             return
 
@@ -4519,12 +4522,12 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             self._finish_d405_orientation_candidate_iks(context)
 
         self._d405_orientation_timer = self.create_timer(
-            STAGE1_DUAL_IK_RESPONSE_TIMEOUT_S,
+            max(STAGE1_DUAL_IK_RESPONSE_TIMEOUT_S, len(candidates)*STAGE1_IK_TIMEOUT_S+1.0),
             timeout_candidates,
         )
         self.get_logger().info(
-            "[D405 PRESCAN SYMMETRY] collision-aware IK requested for both "
-            "camera-center-preserving local-Y orientation branches"
+            "[D405 PRESCAN SYMMETRY] collision-aware IK requested for "
+            "calibrated measurement candidates"
         )
 
     def _d405_orientation_candidate_ik_done(self, future, context, index):
@@ -4597,7 +4600,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
                 f"[D405 PRESCAN SYMMETRY] {candidate['name']} rejected: "
                 f"{record['reason']}"
             )
-        if len(context["results"]) == 2:
+        if len(context["results"]) == len(context["candidates"]):
             self._finish_d405_orientation_candidate_iks(context)
 
     def _finish_d405_orientation_candidate_iks(self, context):
@@ -4606,14 +4609,14 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             or context["generation"] != self._d405_orientation_generation
             or not self._d405_prescan_callback_valid(context["token"])
             or context["finalized"]
-            or len(context["results"]) != 2
+            or len(context["results"]) != len(context["candidates"])
         ):
             return
         context["finalized"] = True
         self._cancel_d405_orientation_timer()
         if not self._d405_scene_revision_confirmed(context["scene_revision"]):
             self.get_logger().error(
-                "[D405 PRESCAN SYMMETRY] planning scene changed during dual IK"
+                "[D405 PRESCAN SYMMETRY] planning scene changed during view IK"
             )
             context["finalize_cb"](False)
             return
@@ -4631,7 +4634,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         ]
         if incomplete:
             self.get_logger().error(
-                "[D405 PRESCAN SYMMETRY] both endpoint collision checks did "
+                "[D405 PRESCAN SYMMETRY] all endpoint collision checks did "
                 "not complete: " + ";".join(incomplete)
             )
             context["finalize_cb"](False)
@@ -4654,7 +4657,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         if not ranked:
             reasons = ";".join(
                 str(context["results"][index].get("reason", ""))
-                for index in range(2)
+                for index in range(len(context["candidates"]))
             )
             self.get_logger().error(
                 "[D405 PRESCAN SYMMETRY] no collision-free orientation: "
@@ -4664,7 +4667,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             return
         self._activate_d405_orientation_rank(context, 0)
 
-    def _activate_d405_orientation_rank(self, context, rank_index):
+    def _activate_d405_orientation_rank(self, context, rank_index, trajectory=None):
         if (
             context is not getattr(self, "_d405_orientation_context", None)
             or not self._d405_prescan_callback_valid(context["token"])
@@ -4680,6 +4683,8 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         branch_poses = tuple(record["candidate"]["poses"])
         self._d405_prescan_queue = [copy.deepcopy(pose) for pose in branch_poses]
         self._d405_selected_orientation_branch = record["candidate"]["name"]
+        if "surface_points" in record["candidate"]:
+            self._d405_prescan_surface_points = list(record["candidate"]["surface_points"])
         self.get_logger().info(
             "[D405 PRESCAN SYMMETRY] planning exact IK branch %s (%d/%d)"
             % (
@@ -4688,7 +4693,10 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
                 len(context["ranked"]),
             )
         )
-        self._send_d405_orientation_plan(context, record)
+        if trajectory is None:
+            self._send_d405_orientation_plan(context, record)
+        else:
+            self._dispatch_d405_orientation_trajectory(context, record, trajectory)
         return True
 
     def _try_next_d405_orientation_rank(self, context, reason):
@@ -4697,6 +4705,8 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
                 "D405_PRESCAN_FAILURE_AFTER_DISPATCH:" + str(reason)
             )
             return False
+        if context.get("compare_views"):
+            return self._advance_d405_view_plans(context)
         next_index = int(context.get("rank_index", -1)) + 1
         if next_index < len(context.get("ranked", ())):
             self.get_logger().warn(
@@ -5035,6 +5045,50 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             context["finalize_cb"](False)
             return
 
+        if context.get("compare_views"):
+            metrics = self._trajectory_joint_metrics(trajectory.joint_trajectory)
+            positions = np.array([point.positions for point in trajectory.joint_trajectory.points],float)
+            travel = np.abs(np.diff(positions,axis=0)).sum(axis=0)
+            cost = (float(travel.sum()),float(travel.max()),float(metrics["joint_path"]),int(rank_index))
+            context["planned_views"].append((cost,int(rank_index),copy.deepcopy(trajectory)))
+            self._advance_d405_view_plans(context)
+            return
+        self._dispatch_d405_orientation_trajectory(context,record,trajectory)
+
+    def _advance_d405_view_plans(self, context):
+        next_index = int(context.get("rank_index",-1))+1
+        if next_index < len(context["ranked"]) and len(context["planned_views"]) < 3:
+            return self._activate_d405_orientation_rank(context,next_index)
+        if not context["planned_views"]:
+            context["finalize_cb"](False)
+            return False
+        cost,index,trajectory = min(context["planned_views"],key=lambda item:item[0])
+        self.get_logger().info(f"[D405 VIEW] selected sample path: summed joint travel={cost[0]:.3f}rad, compared={len(context['planned_views'])}")
+        return self._activate_d405_orientation_rank(context,index,trajectory=trajectory)
+
+    def _dispatch_d405_orientation_trajectory(self, context, record, trajectory):
+        # Recheck at dispatch: comparing plans must never reuse a moved seed or scene.
+        inhibit = MoveItExecutor._motion_dispatch_inhibited_reason(self)
+        if inhibit:
+            self.get_logger().error(f"[D405 VIEW] dispatch/capture inhibited: {inhibit}")
+            context["finalize_cb"](False)
+            return
+        if not self._d405_prescan_callback_valid(context["token"]) or not self._d405_scene_revision_confirmed(context["scene_revision"]):
+            context["finalize_cb"](False)
+            return
+        start_ok,reason = self._d405_plan_start_matches_measured(trajectory,context["seed_state"])
+        if not start_ok:
+            self.get_logger().error(f"[D405 VIEW] dispatch rejected: {reason}")
+            context["finalize_cb"](False)
+            return
+        current = self._current_tcp_pose_np()
+        goal = record["candidate"]["poses"][0]
+        target_p = np.array([goal.position.x,goal.position.y,goal.position.z])
+        target_q = np.array([goal.orientation.x,goal.orientation.y,goal.orientation.z,goal.orientation.w])
+        if current is not None and np.linalg.norm(current[0]-target_p) <= .002 and abs(np.dot(current[1],target_q)) >= math.cos(math.radians(1.)/2) and not self._d405_post_fjt_arrival_reason(trajectory):
+            self.get_logger().info("[D405 VIEW] already stationary at valid measurement pose; no motion dispatched")
+            self._start_d405_post_fjt_verification(context,trajectory)
+            return
         trajectory = self._rescale_trajectory(trajectory, scale=1.0)
         context["fjt_dispatched"] = True
 
@@ -5141,6 +5195,13 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         wait_start = float(self._d405_prescan_wait_start or now)
         if now - wait_start < D405_PREFLIGHT_SCAN_SETTLE_SEC:
             return
+        if not self._d405_prescan_capture_sent and (
+            not self._robot_stationary_for_bias()
+            or not 0 <= now-float(self.current_joint_state_time) <= D405_PREFLIGHT_JOINT_STATE_MAX_AGE_S
+        ):
+            if now-wait_start > D405_PREFLIGHT_SCAN_SETTLE_SEC+D405_PREFLIGHT_SCAN_TIMEOUT_SEC:
+                self._finish_d405_prescan(success=False)
+            return
         if not self._d405_prescan_capture_sent:
             self._d405_prescan_capture_sent = True
             self._d405_prescan_capture_time = now
@@ -5148,7 +5209,10 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             msg.data = True
             if self._d405_prescan_mode == "multi_target":
                 self._multi_capture_started = now
-                self._multi_target_capture_pub.publish(msg)
+                sample = self._d405_capture_sample_in_base()
+                if sample is None or not self._multi_request_local_capture(sample):
+                    self._finish_d405_prescan(success=False)
+                    return
             else:
                 self.d405_capture_pub.publish(msg)
             self.get_logger().info(
@@ -5186,6 +5250,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         self._d405_prescan_surface_normal = None
         self._d405_prescan_index = 0
         self._d405_selected_orientation_branch = ""
+        self._d405_scan_candidates = []
         if mode == "multi_target":
             self.executing = False
             self._multi_scan_done(success)

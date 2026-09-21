@@ -171,12 +171,14 @@ def test_multi_selected_faces_are_measured_sequentially_and_preserved():
     approaches=[];node._begin_d405_prescan=lambda mode:approaches.append(node._multi_current['id']) or True
     node._schedule_process_once=lambda _,cb:cb()
     activated=[];node._multi_apply_active=activated.append
+    # Ordering may choose the second selected face first; records must stay keyed by face.
+    node._begin_multi_order=lambda:node._multi_start_next(ordered_id='g:2')
     node._multi_on_select(String(data=json.dumps({'generation':'g','ids':['g:1','g:2']})))
-    assert approaches==['g:1']
+    assert approaches==['g:2']
     node._multi_refined_result=copy.deepcopy(node._multi_target_pose);node._multi_scan_done(True)
-    assert approaches==['g:1','g:2'] and list(node._multi_refined)==['g:1']
+    assert approaches==['g:2','g:1'] and list(node._multi_refined)==['g:2']
     node._multi_refined_result=copy.deepcopy(node._multi_target_pose);node._multi_scan_done(True)
-    assert set(node._multi_refined)=={'g:1','g:2'} and activated==['g:2']
+    assert set(node._multi_refined)=={'g:1','g:2'} and activated==['g:1']
 
 
 def test_old_work_area_invalidation_cannot_abort_owned_multi_target_scan():
