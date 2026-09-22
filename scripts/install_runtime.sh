@@ -26,7 +26,7 @@ if [[ "$SKETCH_INSTALL_APT" == true ]]; then
     sudo apt-get update
     sudo apt-get install -y build-essential cmake git python3-dev python3-venv \
       python3-colcon-common-extensions python3-rosdep python3-opencv python3-scipy \
-      python3-numpy python3-pil python3-pil.imagetk libeigen3-dev libboost-all-dev \
+      python3-numpy python3-zmq python3-pil python3-pil.imagetk libeigen3-dev libboost-all-dev \
       ros-jazzy-moveit ros-jazzy-ros2-control ros-jazzy-ros2-controllers \
       ros-jazzy-kinematics-interface-kdl ros-jazzy-realsense2-camera ros-jazzy-cv-bridge \
       ros-jazzy-rosbridge-server ros-jazzy-tf-transformations

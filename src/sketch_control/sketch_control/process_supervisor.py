@@ -10,6 +10,9 @@ from pathlib import Path
 import signal
 import socket
 import time
+from .robot_models import (DEFAULT_MODEL, MODEL_LABELS, validate_model,
+                           model_calibration_files, validate_calibration_files)
+from .outpost_camera import validate_origin, camera_status
 
 
 class SupervisorError(Exception):
@@ -29,30 +32,54 @@ class ProcessSpec:
 
 def build_specs(workspace, options=None):
     options = dict(options or {})
-    allowed = {"profile", "robot_ip", "launch_rviz", "launch_zed_driver", "launch_d405_driver"}
+    allowed = {"profile", "robot_ip", "model_id", "launch_rviz", "launch_zed_driver", "launch_d405_driver",
+               "camera_backend", "outpost_http", "outpost_zed_hw_id", "outpost_zed_serial",
+               "outpost_d405_hw_id", "outpost_d405_serial"}
     if set(options) - allowed:
         raise SupervisorError("Unknown configuration options", 400)
     profile = options.setdefault("profile", "dry_run")
-    if profile not in ("dry_run", "work", "fake"):
-        raise SupervisorError("profile must be dry_run, work or fake", 400)
+    if profile not in ("dry_run", "work", "fake", "spray_motion_test"):
+        raise SupervisorError("profile must be dry_run, work, fake or spray_motion_test", 400)
     robot_ip = options.setdefault("robot_ip", "10.0.2.7")
+    try:
+        validate_model(options.setdefault("model_id", DEFAULT_MODEL))
+    except ValueError as exc:
+        raise SupervisorError(str(exc), 400) from None
     try:
         if not isinstance(robot_ip, str):
             raise ValueError()
         ipaddress.IPv4Address(robot_ip)
     except ValueError:
         raise SupervisorError("robot_ip must be an IPv4 address", 400) from None
+    backend = options.setdefault('camera_backend', 'outpost')
+    if backend not in ('outpost', 'native'):
+        raise SupervisorError('camera_backend must be outpost or native', 400)
+    try:
+        options['outpost_http'] = validate_origin(options.get('outpost_http', 'http://127.0.0.1:8100'))
+    except (ValueError, TypeError) as exc:
+        raise SupervisorError(str(exc), 400) from None
+    for key in ('outpost_zed_hw_id', 'outpost_zed_serial', 'outpost_d405_hw_id', 'outpost_d405_serial'):
+        value = options.setdefault(key, '')
+        if not isinstance(value, str) or len(value) > 128 or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in value):
+            raise SupervisorError(key + ' must be a camera identifier', 400)
     for key in ("launch_rviz", "launch_zed_driver", "launch_d405_driver"):
-        options.setdefault(key, profile != "fake")
+        options.setdefault(key, profile != "fake" and (key == 'launch_rviz' or backend == 'native'))
         if type(options[key]) is not bool:
             raise SupervisorError(f"{key} must be a JSON boolean", 400)
+    if backend == 'outpost' and (options['launch_zed_driver'] or options['launch_d405_driver']):
+        raise SupervisorError('Outpost owns cameras; native camera drivers must be disabled', 400)
     common = dict(options)
     common.pop("profile")
+    if profile == 'fake':
+        common['camera_backend'] = 'native'
+    common.update(model_calibration_files(workspace, options['model_id']))
     common.update(use_fake_hardware=profile == "fake", use_isaac_sim=False, use_sim_time=False,
-                  real_painting_enabled=profile == "work", dry_run=profile != "work",
-                  painting_force_enabled=profile == "work")
+                  real_painting_enabled=profile in ("work", "spray_motion_test"),
+                  dry_run=profile not in ("work", "spray_motion_test"),
+                  painting_force_enabled=profile == "work",
+                  spray_motion_test=profile == "spray_motion_test")
     groups = (
-        ("robot_control", "RB10 · MoveIt · controllers · RViz", (), ("controller_manager", "move_group")),
+        ("robot_control", MODEL_LABELS[options['model_id']] + " · MoveIt · controllers · RViz", (), ("controller_manager", "move_group")),
         ("perception", "ZED · D405 · calibration · sketch perception", ("robot_control",), ("target_selector", "d405_surface_refiner")),
         ("force_pipeline", "Wrench reference · force monitor", ("robot_control",), ("painting_force_monitor",)),
         ("executor", "Sketch path executor · flight recorder", ("robot_control", "perception", "force_pipeline"), ("moveit_executor",)),
@@ -139,13 +166,36 @@ class Supervisor:
             self._set_specs(specs)
             return options
 
+    def _validate_model_calibration(self):
+        if (self.options['model_id'] != DEFAULT_MODEL
+                and self.options['profile'] != 'fake'):
+            try:
+                validate_calibration_files(model_calibration_files(self.workspace, self.options['model_id']))
+            except ValueError as exc:
+                raise SupervisorError(str(exc)) from None
+
+    def _validate_cameras(self):
+        if self.options['camera_backend'] != 'outpost' or self.options['profile'] == 'fake':
+            return
+        for camera, kind in (('zed', 'zed'), ('d405', 'realsense')):
+            try:
+                camera_status(self.options['outpost_http'], self.options[f'outpost_{camera}_hw_id'],
+                              self.options[f'outpost_{camera}_serial'], kind)
+            except (ValueError, OSError, KeyError, TypeError) as exc:
+                raise SupervisorError('Outpost: ' + str(exc)) from None
+
     def preflight(self, name):
         r = self._record(name)
+        if name == 'perception':
+            self._validate_model_calibration()
+            self._validate_cameras()
         graph = self.monitor.snapshot()
         if not graph["graph_fresh"]:
             raise SupervisorError("ROS discovery is not ready; retry shortly")
         conflicts = set(r["spec"].nodes)
         if name == "perception":
+            if self.options['camera_backend'] == 'outpost':
+                conflicts.add('sketch_outpost_bridge')
             if self.options["launch_zed_driver"]:
                 conflicts.add("zed_node")
             if self.options["launch_d405_driver"]:
@@ -266,6 +316,8 @@ class Supervisor:
 
     async def prepare(self):
         async with self.lock:
+            self._validate_model_calibration()
+            self._validate_cameras()
             started = []
             try:
                 for name in self.records:

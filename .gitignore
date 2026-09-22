@@ -58,3 +58,4 @@ dist/
 /zed_eyetohand_charuco_calibration.json
 /aft200_force_threshold.json
 /CALIBRATION_MANIFEST.json
+/calibration/

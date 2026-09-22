@@ -9,7 +9,7 @@ const processModePub = new ROSLIB.Topic({ros, name:'/painting_system/set_process
 let lastPlaneRender = "";
 function renderPlaneList() {
   // Keep select menus and checkbox focus intact between unchanged status ticks.
-  const signature = JSON.stringify([planeCatalog, planeState, [...selectedPlaneIds], rosConnected, paintingDerivedState().running, processModePending]);
+  const signature = JSON.stringify([planeCatalog, planeState, [...selectedPlaneIds], rosConnected, paintingDerivedState().running, processModePending, sprayMotionTest]);
   if (signature === lastPlaneRender) return;
   lastPlaneRender = signature;
   const list = $('plane-candidates'); list.replaceChildren();
@@ -30,7 +30,7 @@ function renderPlaneList() {
   });
   select.value=planeState.active_id||''; select.disabled=!rosConnected || paintingDerivedState().running || !(planeState.measured||[]).length;
   $('active-plane-field').hidden=!(planeState.measured||[]).length;
-  $('process-mode').disabled=!rosConnected || paintingDerivedState().running || processModePending;
+  $('process-mode').disabled=!rosConnected || paintingDerivedState().running || processModePending || sprayMotionTest;
 }
 function drawPlaneCandidates() {
   if(currentView!=='zed_raw') return;
@@ -89,9 +89,12 @@ $('process-mode').addEventListener('change',ev=>{
 new ROSLIB.Topic({ros,name:'/painting_system/process_mode',messageType:'std_msgs/String'}).subscribe(msg=>{
   let payload;try{payload=JSON.parse(msg.data);}catch{return;}
   if(!['paint','spray'].includes(payload.mode))return;
-  const changed=processMode!==payload.mode; processMode=payload.mode; processModePending=false;
+  const changed=processMode!==payload.mode || sprayMotionTest!==(payload.spray_motion_test===true);
+  processMode=payload.mode; sprayMotionTest=payload.spray_motion_test===true; processModePending=false;
   $('process-mode').value=processMode;
-  $('process-mode-state').textContent=payload.error||(processMode==='spray'?'작업면에서 50 cm 이격 · 칠할 때만 분사':'작업면에 접촉하여 도장합니다.');
+  $('process-mode-state').textContent=payload.error||(sprayMotionTest
+    ? 'EOAT 이동 검증 · 실제 로봇 이동 · 50 cm 이격 · 분사 항상 OFF'
+    : processMode==='spray'?'작업면에서 50 cm 이격 · 칠할 때만 분사':'작업면에 접촉하여 도장합니다.');
   if(changed)invalidatePlanLocally('process mode acknowledged',false);
   refreshPaintingUI(); renderPlaneList();
 });

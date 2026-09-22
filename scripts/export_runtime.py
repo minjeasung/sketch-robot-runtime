@@ -33,6 +33,8 @@ def export(root, output, include_calibration=False):
     files = list(source_files(root))
     if include_calibration:
         files = [root / name for name in CALIBRATION_FILES if (root / name).is_file()]
+        model_dir = root / 'calibration' / 'rb20_1900es'
+        files += [model_dir / name for name in CALIBRATION_FILES if (model_dir / name).is_file()]
         if not files:
             raise ValueError("No calibration files found")
     manifest = {"created_at": datetime.now(timezone.utc).isoformat(),

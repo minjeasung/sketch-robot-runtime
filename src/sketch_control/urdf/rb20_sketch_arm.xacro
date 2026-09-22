@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <!-- Arm geometry comes from the bundled RB20-1900ES model. The common
+       EOAT points along TCP -Y; the RB20 native flange points along link6 +Z.
+       Nominal mount: TCP R = Rx(-pi/2), native flange translation = +0.13 Z.
+       Verify clocking/hand-eye calibration on the physical replacement arm. -->
+  <xacro:include filename="$(find rbpodo_description)/robots/rb_6dof.xacro"/>
+  <xacro:include filename="$(find rbpodo_description)/robots/rb_6dof.ros2_control.xacro"/>
+  <xacro:link name="link0" model_id="rb20_1900es" has_inertial="false"/>
+  <xacro:link name="link1" model_id="rb20_1900es"/>
+  <xacro:link name="link2" model_id="rb20_1900es"/>
+  <xacro:link name="link3" model_id="rb20_1900es"/>
+  <xacro:link name="link4" model_id="rb20_1900es"/>
+  <xacro:link name="link5" model_id="rb20_1900es"/>
+  <xacro:link name="link6" model_id="rb20_1900es"/>
+  <xacro:joint name="base" model_id="rb20_1900es"/>
+  <xacro:joint name="shoulder" model_id="rb20_1900es"/>
+  <xacro:joint name="elbow" model_id="rb20_1900es"/>
+  <xacro:joint name="wrist1" model_id="rb20_1900es"/>
+  <xacro:joint name="wrist2" model_id="rb20_1900es"/>
+  <xacro:joint name="wrist3" model_id="rb20_1900es"/>
+  <link name="arm_flange"/>
+  <joint name="arm_flange_joint" type="fixed">
+    <parent link="link6"/><child link="arm_flange"/>
+    <origin xyz="0 0 0.13" rpy="0 0 0"/>
+  </joint>
+  <link name="ft_link"/>
+  <joint name="ft_sensor_joint" type="fixed">
+    <parent link="link6"/><child link="ft_link"/>
+    <origin xyz="0 0 0" rpy="${pi} 0 ${-pi/2}"/>
+  </joint>
+  <link name="tcp"/>
+  <joint name="tcp_joint" type="fixed">
+    <parent link="ft_link"/><child link="tcp"/>
+    <origin xyz="0 0 -0.13" rpy="${pi/2} 0 ${-pi/2}"/>
+  </joint>
+  <xacro:rb_6dof_ros2_control
+    prefix="" robot_ip="$(arg robot_ip)" cb_simulation="$(arg cb_simulation)"
+    use_fake_hardware="$(arg use_fake_hardware)" fake_sensor_commands="$(arg fake_sensor_commands)"
+    human_collab="$(arg human_collab)"/>
+</robot>

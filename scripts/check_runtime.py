@@ -12,6 +12,10 @@ import sys
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--real", action="store_true", help="also require camera packages and calibration files")
+    parser.add_argument('--camera-backend', choices=('native', 'outpost'),
+                        default=os.environ.get('SKETCH_CAMERA_BACKEND', 'outpost'))
+    parser.add_argument("--model-id", default=os.environ.get("SKETCH_MODEL_ID", "rb10_1300e_u"),
+                        choices=("rb10_1300e_u", "rb20_1900es"))
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     checks = []
@@ -24,8 +28,10 @@ def main():
     from ament_index_python.packages import get_package_prefix, PackageNotFoundError
     packages = ["sketch_control", "rbpodo_painting_control", "admittance_controller", "rbpodo_hardware",
                 "rbpodo_description", "eoat_description", "realsense2_description", "rosbridge_server"]
-    if args.real:
+    if args.real and args.camera_backend == 'native':
         packages += ["zed_wrapper", "realsense2_camera"]
+    if args.camera_backend == 'outpost':
+        check('Outpost raw IPC Python dependency', importlib.util.find_spec('zmq') is not None)
     layout = os.environ.get("SKETCH_RUNTIME_LAYOUT", "unknown")
     for package in packages:
         try:
@@ -35,12 +41,28 @@ def main():
         except PackageNotFoundError:
             check("package " + package, False, "not installed")
     if args.real:
-        for name in ("zed_d405_apriltag_calibration.json", "d405_eyeinhand_charuco_calibration.json"):
+        from sketch_control.robot_models import model_calibration_files, validate_calibration_files
+        paths = model_calibration_files(root, args.model_id)
+        for name, filename in paths.items():
             try:
-                value = json.loads((root / name).read_text())
-                check("calibration " + name, isinstance(value, dict) and bool(value), root / name)
+                value = json.loads(Path(filename).read_text())
+                check("calibration " + name, isinstance(value, dict) and bool(value), filename)
             except (OSError, ValueError) as exc:
                 check("calibration " + name, False, str(exc))
+        if args.model_id != "rb10_1300e_u":
+            try:
+                validate_calibration_files(paths)
+                check("robot-specific camera transforms", True)
+            except ValueError as exc:
+                check("robot-specific camera transforms", False, exc)
+    try:
+        share = Path(get_package_prefix('rbpodo_description'))/'share/rbpodo_description'
+        files = [share/'robots'/f'{args.model_id}.urdf.xacro']
+        files += [share/'meshes'/args.model_id/kind/f'link{i}.{ext}'
+                  for kind,ext in [('visual','dae'),('collision','stl')] for i in range(7)]
+        check('arm model '+args.model_id, all(p.is_file() for p in files), 'URDF + 14 meshes')
+    except PackageNotFoundError:
+        check('arm model '+args.model_id, False, 'rbpodo_description not installed')
     print("Runtime layout:", layout)
     if layout != "portable":
         print("NOTE: existing-PC environment; other home workspaces may still be required.")

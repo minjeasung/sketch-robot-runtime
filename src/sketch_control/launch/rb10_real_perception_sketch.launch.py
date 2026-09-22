@@ -4,12 +4,30 @@ import math
 from pathlib import Path
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, RegisterEventHandler, EmitEvent
+from launch.event_handlers import OnProcessExit
+from launch.events import Shutdown
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
+from launch_ros.parameter_descriptions import ParameterValue
+from sketch_control.outpost_camera import camera_status
+
+
+def _validate_camera_backend(context):
+    backend = LaunchConfiguration('camera_backend').perform(context)
+    if backend not in ('native', 'outpost'):
+        raise ValueError('camera_backend must be native or outpost')
+    if backend == 'outpost':
+        for name, kind in (('zed', 'zed'), ('d405', 'realsense')):
+            if LaunchConfiguration(f'launch_{name}_driver').perform(context).lower() == 'true':
+                raise ValueError('Outpost must be the sole camera owner; disable native drivers')
+            camera_status(LaunchConfiguration('outpost_http').perform(context),
+                          LaunchConfiguration(f'outpost_{name}_hw_id').perform(context),
+                          LaunchConfiguration(f'outpost_{name}_serial').perform(context), kind)
+    return []
 
 
 DEFAULT_FT_CONFIG_PATH = str(Path(os.environ.get("SKETCH_WORKSPACE", "~/sketch_robot_ws")) / "aft200_force_threshold.json")
@@ -83,6 +101,11 @@ def _load_ft_defaults():
 
 def generate_launch_description():
     ft_defaults = _load_ft_defaults()
+    is_outpost = PythonExpression(["'", LaunchConfiguration('camera_backend'), "' == 'outpost'"])
+    outpost_bridge = Node(package='sketch_control', executable='outpost_bridge',
+        name='sketch_outpost_bridge', output='screen', condition=IfCondition(is_outpost),
+        parameters=[{key: ParameterValue(LaunchConfiguration(key), value_type=str) for key in
+            ('outpost_http', 'outpost_zed_hw_id', 'outpost_zed_serial', 'outpost_d405_hw_id', 'outpost_d405_serial')}])
 
     painting_config_file = LaunchConfiguration("painting_config_file")
     real_painting_enabled = LaunchConfiguration("real_painting_enabled")
@@ -249,8 +272,8 @@ def generate_launch_description():
             "use_d405_refinement": "true",
             "use_ft_normal_controller": use_ft_normal_controller,
             "use_d405_mount_tf": "true",
-            "use_d405_optical_tf": "false",
-            "d405_mount_child_frame": "d405_d405_link",
+            "use_d405_optical_tf": PythonExpression(["'true' if '", LaunchConfiguration('camera_backend'), "' == 'outpost' else 'false'"]),
+            "d405_mount_child_frame": PythonExpression(["'d405_link' if '", LaunchConfiguration('camera_backend'), "' == 'outpost' else 'd405_d405_link'"]),
             "ft_wrench_topic": ft_wrench_topic,
             "ft_force_sign": ft_force_sign,
             "ft_target_force_n": ft_target_force_n,
@@ -285,6 +308,10 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument('camera_backend', default_value='outpost'),
+        DeclareLaunchArgument('outpost_http', default_value='http://127.0.0.1:8100'),
+        *[DeclareLaunchArgument(key, default_value='') for key in
+          ('outpost_zed_hw_id', 'outpost_zed_serial', 'outpost_d405_hw_id', 'outpost_d405_serial')],
         DeclareLaunchArgument(
             "painting_config_file",
             default_value=PathJoinSubstitution([
@@ -314,12 +341,12 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "launch_zed_driver",
-            default_value="true",
+            default_value="false",
             description="Launch Stereolabs zed_wrapper for the real ZED camera",
         ),
         DeclareLaunchArgument(
             "launch_d405_driver",
-            default_value="true",
+            default_value="false",
             description="Launch realsense2_camera for the wrist D405",
         ),
         DeclareLaunchArgument(
@@ -589,6 +616,10 @@ def generate_launch_description():
             default_value="0.7144592759634508",
             description="Fallback calibrated tcp->d405_link qw for perception TF",
         ),
+        OpaqueFunction(function=_validate_camera_backend),
+        RegisterEventHandler(OnProcessExit(target_action=outpost_bridge,
+            on_exit=[EmitEvent(event=Shutdown(reason='Outpost bridge stopped; perception invalid'))])),
+        outpost_bridge,
         zed_driver,
         d405_driver,
         aft_driver,

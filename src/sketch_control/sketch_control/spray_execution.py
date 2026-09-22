@@ -8,11 +8,21 @@ import time
 import uuid
 from std_msgs.msg import Bool, String
 from rclpy.qos import QoSProfile, DurabilityPolicy
+from rcl_interfaces.msg import ParameterDescriptor
 
 
 class SprayExecutionMixin:
     def _init_spray(self):
-        self.process_mode = "paint"
+        # Startup-only commissioning mode: real motion, no gun attached and no
+        # ON command possible. Never substitute a simulated hardware ACK.
+        self.spray_motion_test = self.declare_parameter(
+            'spray_motion_test', False, ParameterDescriptor(read_only=True)
+        ).value
+        if type(self.spray_motion_test) is not bool:
+            raise ValueError('spray_motion_test must be a boolean')
+        if self.spray_motion_test and self.painting_force_enabled:
+            raise ValueError('spray_motion_test requires painting_force_enabled=false')
+        self.process_mode = "spray" if self.spray_motion_test else "paint"
         self._paint_force_configured = self.painting_force_enabled
         self._spray_session = str(uuid.uuid4())
         self._spray_seq = 0
@@ -36,13 +46,21 @@ class SprayExecutionMixin:
     def _is_spray(self):
         return getattr(self, 'process_mode', 'paint') == 'spray'
 
+    def _is_spray_motion_test(self):
+        return getattr(self, 'spray_motion_test', False) is True
+
     def _publish_process_mode(self, error=''):
-        self.process_mode_pub.publish(String(data=json.dumps(dict(mode=self.process_mode, error=error))))
+        self.process_mode_pub.publish(String(data=json.dumps(dict(
+            mode=self.process_mode, error=error,
+            spray_motion_test=self._is_spray_motion_test()))))
 
     def _set_process_mode(self, msg):
         mode = str(msg.data).strip()
         if mode not in {'paint', 'spray'}:
             self._publish_process_mode('INVALID_MODE')
+            return
+        if self._is_spray_motion_test() and mode != 'spray':
+            self._publish_process_mode('MOTION_TEST_REQUIRES_SPRAY_MODE')
             return
         if self.executing or self._active_trajectory_goal_token is not None or self._d405_prescan_active or getattr(self, "_multi_queue", []) or getattr(self, "_multi_current", None) is not None:
             self._publish_process_mode('BUSY')
@@ -87,6 +105,10 @@ class SprayExecutionMixin:
     def _spray_io_blockers(self):
         if self.dry_run:
             return ()
+        if self._is_spray_motion_test():
+            # No hardware ACK is claimed. The only supported equipment for
+            # this mode is the current EOAT without a spray gun.
+            return ('SPRAY_TEST_OUTPUT_NOT_OFF',) if self._spray_on else ()
         s = self._spray_status
         blockers = []
         if time.monotonic()-self._spray_status_time > .3:
@@ -109,7 +131,8 @@ class SprayExecutionMixin:
         return tuple(blockers)
 
     def _spray_set_output(self, enabled):
-        enabled = bool(enabled and not self.dry_run and self._is_spray())
+        enabled = bool(enabled and not self.dry_run and self._is_spray()
+                       and not self._is_spray_motion_test())
         if enabled != self._spray_on:
             self._spray_on = enabled
             self._spray_seq += 1
@@ -118,7 +141,8 @@ class SprayExecutionMixin:
             session_id=self._spray_session, command_id=self._spray_seq,
             on=self._spray_on, lease_ms=250,
             path_id=getattr(getattr(self, '_active_segment_path', None), 'path_id', ''),
-            process_mode=self.process_mode))))
+            process_mode=self.process_mode,
+            spray_motion_test=self._is_spray_motion_test()))))
 
     def _spray_off(self):
         if not hasattr(self, '_spray_session'):

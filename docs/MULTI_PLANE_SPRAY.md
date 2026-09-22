@@ -57,6 +57,12 @@ TCP +Y는 면 법선, TCP +X는 면과 평행하고 획의 대표 진행 방향�
 
 아직 실제 밸브/PLC/디지털 출력 어댑터는 연결하지 않았다. 실제 실행은 장치의 최신 OFF 확인과 compliance OFF 상태가 없으면 거부한다. dry-run은 실제 로봇 궤적과 gun ON을 내보내지 않는다.
 
+뿜칠건이 없는 현재 EOAT로 실제 경로 이동만 검증할 때는 별도 `spray_motion_test`
+프로필을 사용한다. 시작 시 고정되는 이 모드에서는 건 응답을 요구하지 않으며,
+출력 명령은 항상 OFF이고 도장 모드 전환도 거부한다. 실제 건의 상태를 확인했다고
+간주하거나 모의 ACK를 발행하지 않는다. 최신 compliance OFF, 힘 명령 OFF,
+충돌·계획·로봇 인터록은 유지한다. [검증 절차](SPRAY_MOTION_TEST.md).
+
 `/spray_gun/command` (`std_msgs/String`, JSON, 20 Hz):
 
 ```json

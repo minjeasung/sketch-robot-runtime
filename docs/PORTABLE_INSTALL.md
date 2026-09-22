@@ -1,10 +1,16 @@
 # 두 PC 설치와 다운로드
 
+기본 카메라 입력은 **Michelo Outpost**입니다. 먼저 [Michelo 연동 안내](MICHELO_INTEGRATION.md)를
+읽고 데몬 실행 계정·카메라 ID·시리얼을 설정하세요. Outpost를 사용하면 스케치 측 설치에는
+`--without-zed`를 사용할 수 있습니다. SDK는 카메라를 여는 Outpost 환경에 필요합니다.
+통합 실행은 `bash scripts/run_michelo_sketch.sh`, 버튼 추가 콘솔은 `8101`, 스케치 API는 `8081`입니다.
+
 ## 구성
 
 ```text
 원격 스케치 PC (Windows/macOS/Linux, 브라우저만 필요)
-    ├─ HTTP 8080: 실행 관리·스케치 화면
+    ├─ HTTP 8101: Michelo 콘솔 + 스케치 작업 버튼
+    ├─ HTTP 8081: 실행 관리·스케치 화면
     └─ WebSocket 9090: 스케치 명령·ROS 상태·카메라 영상
                  ↓ 같은 내부 네트워크
 로봇 제어 PC (Ubuntu 24.04 x86_64)
@@ -117,7 +123,7 @@ API 토큰과 IP 환경파일은 이 압축에 포함되지 않습니다.
 
 ```bash
 SKETCH_SUPERVISOR_HOST=0.0.0.0
-SKETCH_SUPERVISOR_PORT=8080
+SKETCH_SUPERVISOR_PORT=8081
 SKETCH_SUPERVISOR_API_TOKEN=직접_생성한_비밀_토큰
 SKETCH_ROBOT_IP=10.0.2.7
 SKETCH_PROFILE=dry_run
@@ -140,15 +146,15 @@ bash scripts/run_system_api.sh
 원격 PC와 통신할 수 있는 LAN 주소를 선택합니다.
 예를 들어 로봇 PC의 LAN 주소가 `192.168.0.20`이면 원격 PC 브라우저에서:
 
-- 관리: `http://192.168.0.20:8080/`
-- 스케치: `http://192.168.0.20:8080/sketch/`
-- API 문서: `http://192.168.0.20:8080/docs`
+- 관리: `http://192.168.0.20:8081/`
+- 스케치: `http://192.168.0.20:8081/sketch/`
+- API 문서: `http://192.168.0.20:8081/docs`
 
 관리 화면에 토큰 입력 → 연결 확인 → 전체 시작 → 스케치 화면 열기 순서입니다.
 브라우저 즐겨찾기로 등록하면 다음부터 설치·다운로드 없이 접속할 수 있습니다.
 로봇 PC의 LAN 주소가 바뀌지 않도록 공유기의 DHCP 예약을 사용하는 편이 편리합니다.
 
-방화벽을 사용한다면 **신뢰하는 원격 PC에서 로봇 PC의 TCP 8080과 9090에 접근**하도록 설정합니다.
+방화벽을 사용한다면 **신뢰하는 원격 PC에서 로봇 PC의 TCP 8081과 9090에 접근**하도록 설정합니다.
 자동으로 방화벽을 변경하지 않습니다. rosbridge 9090은 기존 ROS 인터페이스이며 API Bearer 토큰으로
 보호되지 않으므로 외부 인터넷 포트포워딩 대상으로 공개하지 않습니다.
 스케치의 로봇 실행은 기존 실행기와 인터록을 그대로 사용합니다.

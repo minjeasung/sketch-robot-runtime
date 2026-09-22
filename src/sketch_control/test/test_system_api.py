@@ -46,13 +46,17 @@ def client(supervisor):
 
 
 @pytest.mark.parametrize('profile,fake,dry,force', [
-    ('dry_run', 'false', 'true', 'false'), ('work', 'false', 'false', 'true'), ('fake', 'true', 'true', 'false')])
+    ('dry_run', 'false', 'true', 'false'), ('work', 'false', 'false', 'true'),
+    ('fake', 'true', 'true', 'false'), ('spray_motion_test', 'false', 'false', 'false')])
 def test_group_commands_preserve_interlocks(tmp_path, profile, fake, dry, force):
     options, specs = build_specs(tmp_path, {'profile': profile})
     for spec in specs:
+        assert 'model_id:=rb10_1300e_u' in spec.command
         assert f'use_fake_hardware:={fake}' in spec.command
         assert f'dry_run:={dry}' in spec.command
         assert f'painting_force_enabled:={force}' in spec.command
+        assert f'spray_motion_test:={str(profile == "spray_motion_test").lower()}' in spec.command
+        assert f'real_painting_enabled:={str(profile in ("work", "spray_motion_test")).lower()}' in spec.command
         for name in ('robot_control', 'perception', 'force_pipeline', 'executor', 'rosbridge'):
             assert f'launch_{name}:={str(name == spec.name).lower()}' in spec.command
         assert f'enable_interlock_flight_recorder:={str(spec.name == "executor").lower()}' in spec.command
@@ -63,6 +67,27 @@ def test_group_commands_preserve_interlocks(tmp_path, profile, fake, dry, force)
 def test_reject_arbitrary_configuration(tmp_path, options):
     with pytest.raises(SupervisorError):
         build_specs(tmp_path, options)
+
+
+def test_api_model_selection_is_explicit_and_locked_while_running(client, supervisor):
+    assert client.post('/configuration',json={'profile':'fake','model_id':'rb20_1900es'}).status_code==200
+    assert client.get('/status').json()['configuration']['model_id']=='rb20_1900es'
+    assert all('model_id:=rb20_1900es' in r['spec'].command for r in supervisor.records.values())
+    # Represent a process already owned by the supervisor, without launching hardware.
+    supervisor.records['robot_control']['process']=object()
+    try:
+        assert client.post('/configuration',json={'profile':'fake','model_id':'rb10_1300e_u'}).status_code==409
+    finally:
+        supervisor.records['robot_control']['process']=None
+    assert client.post('/configuration',json={'model_id':'unknown'}).status_code==400
+
+
+def test_rb20_missing_calibration_rejects_prepare_before_any_process_starts(client, supervisor):
+    assert client.post('/configuration',json={'profile':'spray_motion_test','model_id':'rb20_1900es'}).status_code==200
+    response=client.post('/prepare-system')
+    assert response.status_code==409
+    assert 'calibration required' in response.json()['detail']
+    assert all(r['process'] is None for r in supervisor.records.values())
 
 
 def test_preflight_duplicate_and_discovery(supervisor):

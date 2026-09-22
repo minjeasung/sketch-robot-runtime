@@ -8,7 +8,13 @@
   <xacro:arg name="cb_simulation" default="false"/>
   <xacro:arg name="model_id" default="rb10_1300e_u"/>
 
-  <xacro:include filename="$(find rbpodo_moveit_config)/config/rbpodo.urdf.xacro"/>
+  <xacro:property name="sketch_model_id" value="$(arg model_id)"/>
+  <xacro:if value="${sketch_model_id == 'rb20_1900es'}">
+    <xacro:include filename="rb20_sketch_arm.xacro"/>
+  </xacro:if>
+  <xacro:unless value="${sketch_model_id == 'rb20_1900es'}">
+    <xacro:include filename="$(find rbpodo_moveit_config)/config/rbpodo.urdf.xacro"/>
+  </xacro:unless>
   <xacro:include filename="$(find eoat_description)/urdf/rr_00a_b_eoat_no_camera_d405.urdf.xacro"/>
 
   <xacro:property name="aft200_connector_radius" value="0.005"/>

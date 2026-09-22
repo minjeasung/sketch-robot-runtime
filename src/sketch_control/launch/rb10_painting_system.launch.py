@@ -1,10 +1,12 @@
-"""Top-level, fail-closed launch for the RB10 roller-painting system."""
+"""Top-level, fail-closed launch for the RB10/RB20 sketch system."""
+import os
 
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
     OpaqueFunction,
+    SetLaunchConfiguration,
 )
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -16,6 +18,9 @@ from launch.substitutions import (
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
+from sketch_control.robot_models import (DEFAULT_MODEL, validate_model,
+                                         model_calibration_files, validate_calibration_files)
+from sketch_control.outpost_camera import camera_status
 
 
 def _validate_interlock_values(
@@ -25,10 +30,13 @@ def _validate_interlock_values(
     real_painting_enabled,
     dry_run,
     painting_force_enabled,
+    spray_motion_test=False,
 ):
     """Reject launch combinations that could bypass the real-motion gate."""
 
     real_hardware = not bool(use_fake_hardware) and not bool(use_isaac_sim)
+    if bool(spray_motion_test) and bool(painting_force_enabled):
+        raise RuntimeError("spray_motion_test requires painting_force_enabled=false")
     if real_hardware and not bool(dry_run) and not bool(real_painting_enabled):
         raise RuntimeError(
             "real hardware with dry_run=false requires "
@@ -45,6 +53,7 @@ def _validate_interlock_values(
 
 def _validate_launch_interlocks(context, *args, **kwargs):
     del args, kwargs
+    model = validate_model(LaunchConfiguration("model_id").perform(context))
 
     def enabled(name):
         return LaunchConfiguration(name).perform(context).strip().lower() in {
@@ -60,8 +69,27 @@ def _validate_launch_interlocks(context, *args, **kwargs):
         real_painting_enabled=enabled("real_painting_enabled"),
         dry_run=enabled("dry_run"),
         painting_force_enabled=enabled("painting_force_enabled"),
+        spray_motion_test=enabled("spray_motion_test"),
     )
-    return []
+    paths = model_calibration_files(os.environ.get("SKETCH_WORKSPACE", "~/sketch_robot_ws"), model)
+    for key in paths:
+        paths[key] = LaunchConfiguration(key).perform(context).strip() or paths[key]
+    if (model != DEFAULT_MODEL and enabled("launch_perception")
+            and not enabled("use_fake_hardware") and not enabled("use_isaac_sim")):
+        validate_calibration_files(paths)
+    backend = LaunchConfiguration('camera_backend').perform(context)
+    if backend not in ('outpost', 'native'):
+        raise ValueError('camera_backend must be outpost or native')
+    if enabled('use_fake_hardware') or enabled('use_isaac_sim'):
+        paths['camera_backend'] = 'native'
+    elif enabled('launch_perception') and backend == 'outpost':
+        for camera, kind in (('zed', 'zed'), ('d405', 'realsense')):
+            if enabled(f'launch_{camera}_driver'):
+                raise ValueError('Outpost requires native camera drivers disabled')
+            camera_status(LaunchConfiguration('outpost_http').perform(context),
+                LaunchConfiguration(f'outpost_{camera}_hw_id').perform(context),
+                LaunchConfiguration(f'outpost_{camera}_serial').perform(context), kind)
+    return [SetLaunchConfiguration(key, value) for key, value in paths.items()]
 
 
 def generate_launch_description():
@@ -80,6 +108,12 @@ def generate_launch_description():
     ])
 
     arguments = [
+        DeclareLaunchArgument("zed_calibration_file", default_value=""),
+        DeclareLaunchArgument("d405_calibration_file", default_value=""),
+        DeclareLaunchArgument(
+            "spray_motion_test", default_value="false",
+            description="Current EOAT without gun: spray path motion only; gun output always OFF",
+        ),
         DeclareLaunchArgument(
             "painting_config_file",
             default_value=PathJoinSubstitution([
@@ -161,8 +195,12 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument("model_id", default_value="rb10_1300e_u"),
-        DeclareLaunchArgument("launch_zed_driver", default_value="true"),
-        DeclareLaunchArgument("launch_d405_driver", default_value="true"),
+        DeclareLaunchArgument("launch_zed_driver", default_value="false"),
+        DeclareLaunchArgument("launch_d405_driver", default_value="false"),
+        DeclareLaunchArgument('camera_backend', default_value='outpost'),
+        DeclareLaunchArgument('outpost_http', default_value='http://127.0.0.1:8100'),
+        *[DeclareLaunchArgument(key, default_value='') for key in
+          ('outpost_zed_hw_id', 'outpost_zed_serial', 'outpost_d405_hw_id', 'outpost_d405_serial')],
         DeclareLaunchArgument(
             "launch_wall_detector",
             default_value="false",
@@ -235,6 +273,9 @@ def generate_launch_description():
         ),
         launch_arguments={
             "painting_config_file": config_file,
+            **{key: LaunchConfiguration(key) for key in
+               ('camera_backend', 'outpost_http', 'outpost_zed_hw_id', 'outpost_zed_serial',
+                'outpost_d405_hw_id', 'outpost_d405_serial')},
             "real_painting_enabled": real_painting_enabled,
             "dry_run": dry_run,
             "launch_zed_driver": LaunchConfiguration("launch_zed_driver"),
@@ -246,6 +287,8 @@ def generate_launch_description():
             "zed_param_overrides": LaunchConfiguration("zed_param_overrides"),
             "d405_depth_profile": LaunchConfiguration("d405_depth_profile"),
             "d405_color_profile": LaunchConfiguration("d405_color_profile"),
+            "zed_calibration_file": LaunchConfiguration("zed_calibration_file"),
+            "d405_calibration_file": LaunchConfiguration("d405_calibration_file"),
             "launch_rbpodo_eft_bridge": LaunchConfiguration(
                 "launch_rbpodo_eft_bridge"
             ),
@@ -294,6 +337,10 @@ def generate_launch_description():
                     real_painting_enabled, value_type=bool
                 ),
                 "dry_run": ParameterValue(dry_run, value_type=bool),
+                "model_id": LaunchConfiguration("model_id"),
+                "spray_motion_test": ParameterValue(
+                    LaunchConfiguration("spray_motion_test"), value_type=bool
+                ),
                 "painting_force_enabled": ParameterValue(
                     force_enabled, value_type=bool
                 ),

@@ -1,7 +1,7 @@
 """
 MoveIt Executor - 4-stage 용접 모션 (Plan + FollowJointTrajectory 실행)
 
-대상 로봇: Rainbow Robotics RB10-1300 (rb10_1300e_u, rbpodo_ros2 driver)
+대상 로봇: Rainbow Robotics RB10-1300E / RB20-1900ES (rbpodo_ros2 driver)
 EE link: tcp / Base frame: link0 / Planning group: manipulator
 
 4-stage 파이프라인:
@@ -37,6 +37,7 @@ from action_msgs.msg import GoalStatus
 from controller_manager_msgs.srv import ListControllers
 from geometry_msgs.msg import Point, PoseArray, Pose, PoseStamped
 from rcl_interfaces.msg import ParameterDescriptor
+from sketch_control.robot_models import DEFAULT_MODEL, validate_model, model_joint_limits, model_srdf
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Float64, String
 from std_srvs.srv import Trigger
@@ -505,6 +506,10 @@ from sketch_control.d405_view_geometry import measurement_samples, camera_view
 class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
     def __init__(self):
         super().__init__("moveit_executor")
+        self.model_id = validate_model(self.declare_parameter(
+            "model_id", DEFAULT_MODEL, ParameterDescriptor(read_only=True)
+        ).value)
+        self._robot_joint_limits = model_joint_limits(self.model_id)
 
         self.execution_backend = str(
             self.declare_parameter(
@@ -1142,7 +1147,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         self._acm_health_query_timer = None
         self._latest_allowed_collision_matrix = None
         self._required_acm_allowed_pairs = (
-            MoveItExecutor._load_srdf_allowed_collision_pairs()
+            MoveItExecutor._load_srdf_allowed_collision_pairs(self.model_id)
         )
         if not self._required_acm_allowed_pairs:
             self.get_logger().error(
@@ -2718,6 +2723,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         payload = {
             "ready": bool(ready),
             "process_mode": getattr(self, "process_mode", "paint"),
+            "model_id": getattr(self, "model_id", DEFAULT_MODEL),
             "real_painting_enabled": bool(self.real_painting_enabled),
             "dry_run": bool(self.dry_run),
             "running": bool(self.executing),
@@ -3762,7 +3768,9 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
 
         # 첫 Submit 안전성: READY_POSE 가 아니면 먼저 collision-aware joint plan 으로
         # READY_POSE 로 복귀한 뒤 같은 sketch execute 를 다시 시작한다.
-        if START_FROM_READY_BEFORE_SKETCH and not self._is_at_ready_pose():
+        if (START_FROM_READY_BEFORE_SKETCH
+                and getattr(self, "model_id", DEFAULT_MODEL) == DEFAULT_MODEL
+                and not self._is_at_ready_pose()):
             self.get_logger().warn(
                 "현재 자세가 READY_POSE 와 다름 -> READY_POSE 먼저 이동 후 "
                 "스케치 제어를 시작합니다.")
@@ -6087,7 +6095,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         self._process_timer = timer
 
     @staticmethod
-    def _load_srdf_allowed_collision_pairs():
+    def _load_srdf_allowed_collision_pairs(model_id=DEFAULT_MODEL):
         """Load the semantic collision baseline used by the active MoveIt config."""
 
         candidates = []
@@ -6107,7 +6115,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         )
         for path in candidates:
             try:
-                root = ET.parse(path).getroot()
+                root = ET.fromstring(model_srdf(model_id, path))
             except (OSError, ET.ParseError):
                 continue
             pairs = []
@@ -9541,6 +9549,9 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         self._start_preset_motion(name)
 
     def _start_preset_motion(self, name):
+        if getattr(self, "model_id", DEFAULT_MODEL) != DEFAULT_MODEL:
+            self.get_logger().warn("This arm has no commissioned joint presets; use a planned sketch target")
+            return
         if name not in PRESET_POSES:
             self.get_logger().warn(
                 f"알 수 없는 pose preset '{name}'. "
@@ -10072,14 +10083,14 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             return False
         if not set(READY_POSE_JOINTS).issubset(set(joint_state.name)):
             self.get_logger().error(
-                f"[JOINT LIMIT] {label}: required RB10 joint missing"
+                f"[JOINT LIMIT] {label}: required arm joint missing"
             )
             return False
         ok = True
         for name, pos in zip(joint_state.name, positions):
-            if name not in JOINT_LIMITS:
+            if name not in getattr(self, "_robot_joint_limits", JOINT_LIMITS):
                 continue
-            lower, upper = JOINT_LIMITS[name]
+            lower, upper = getattr(self, "_robot_joint_limits", JOINT_LIMITS)[name]
             value = float(pos)
             if (
                 not math.isfinite(value)
@@ -10108,7 +10119,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             return False
         if not set(READY_POSE_JOINTS).issubset(set(jt.joint_names)):
             self.get_logger().error(
-                f"[JOINT LIMIT] {label}: required RB10 joint missing"
+                f"[JOINT LIMIT] {label}: required arm joint missing"
             )
             return False
         expected_size = len(jt.joint_names)
@@ -10159,9 +10170,9 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         violations = []
         for point_idx, point in enumerate(jt.points):
             for joint_idx, name in enumerate(jt.joint_names):
-                if name not in JOINT_LIMITS or joint_idx >= len(point.positions):
+                if name not in getattr(self, "_robot_joint_limits", JOINT_LIMITS) or joint_idx >= len(point.positions):
                     continue
-                lower, upper = JOINT_LIMITS[name]
+                lower, upper = getattr(self, "_robot_joint_limits", JOINT_LIMITS)[name]
                 value = float(point.positions[joint_idx])
                 if value < lower - JOINT_LIMIT_MARGIN or value > upper + JOINT_LIMIT_MARGIN:
                     violations.append((point_idx, name, value, lower, upper))
@@ -11957,7 +11968,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             if not math.isfinite(raw_goal) or not math.isfinite(current):
                 return None, f"IK_NONFINITE:{name}"
             goal = self._nearest_joint_equivalent(name, raw_goal, current)
-            lower, upper = JOINT_LIMITS[name]
+            lower, upper = getattr(self, "_robot_joint_limits", JOINT_LIMITS)[name]
             if (
                 not math.isfinite(goal)
                 or goal < lower - JOINT_LIMIT_MARGIN
@@ -13070,6 +13081,8 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
     # ---- Stage 5: return to READY_POSE (joint goal via OMPL) ----------------
     def _is_at_ready_pose(self, tol_rad=0.05):
         """현재 joint state 가 READY_POSE 와 가까운지 (joint 당 tol_rad 이내)."""
+        if getattr(self, "model_id", DEFAULT_MODEL) != DEFAULT_MODEL:
+            return False
         if self.current_joint_state is None:
             return False
         cs = dict(zip(
@@ -13084,6 +13097,10 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         return True
 
     def stage5_return_to_ready(self):
+        if getattr(self, "model_id", DEFAULT_MODEL) != DEFAULT_MODEL:
+            self.get_logger().warn("No commissioned ready pose for this arm; no return motion issued")
+            self.executing = False
+            return
         self.get_logger().info(
             f"=== STAGE 5: return to READY_POSE (joint goal, {PLANNER_ID}) ===")
         self._plan_joint_goal(

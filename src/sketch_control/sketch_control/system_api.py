@@ -14,15 +14,23 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, StrictBool
 
 from .process_supervisor import Supervisor, SupervisorError
+from .outpost_camera import get_json
 
 
 class ConfigurationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     profile: str = "dry_run"
     robot_ip: str = "10.0.2.7"
+    model_id: str = "rb10_1300e_u"
     launch_rviz: StrictBool | None = None
     launch_zed_driver: StrictBool | None = None
     launch_d405_driver: StrictBool | None = None
+    camera_backend: str = 'outpost'
+    outpost_http: str = 'http://127.0.0.1:8100'
+    outpost_zed_hw_id: str = ''
+    outpost_zed_serial: str = ''
+    outpost_d405_hw_id: str = ''
+    outpost_d405_serial: str = ''
 
 
 def is_loopback(host):
@@ -89,6 +97,15 @@ def create_app(supervisor, *, api_token=None, manage_monitor=False, local_only=T
     async def configuration():
         return supervisor.options
 
+    @router.get('/outpost/cameras')
+    async def outpost_cameras():
+        import asyncio
+        try:
+            cameras = await asyncio.to_thread(get_json, supervisor.options['outpost_http'], '/cameras')
+            return {'cameras': cameras}
+        except (OSError, ValueError) as exc:
+            raise HTTPException(503, 'Outpost unavailable: ' + str(exc)) from None
+
     @router.post("/configuration")
     async def configure(body: ConfigurationRequest):
         return await supervisor.configure(body.model_dump(exclude_none=True))
@@ -140,7 +157,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--host", default=os.environ.get("SKETCH_SUPERVISOR_HOST", "127.0.0.1"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("SKETCH_SUPERVISOR_PORT", "8080")))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("SKETCH_SUPERVISOR_PORT", "8081")))
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("port must be 1..65535")
@@ -151,7 +168,13 @@ def main():
     runtime = workspace / "logs/system_api"
     runtime.mkdir(parents=True, exist_ok=True)
     options = {"profile": os.environ.get("SKETCH_PROFILE", "dry_run"),
-               "robot_ip": os.environ.get("SKETCH_ROBOT_IP", "10.0.2.7")}
+               "robot_ip": os.environ.get("SKETCH_ROBOT_IP", "10.0.2.7"),
+               "model_id": os.environ.get("SKETCH_MODEL_ID", "rb10_1300e_u")}
+    for key in ('camera_backend', 'outpost_http', 'outpost_zed_hw_id', 'outpost_zed_serial',
+                'outpost_d405_hw_id', 'outpost_d405_serial'):
+        value = os.environ.get('SKETCH_' + key.upper())
+        if value is not None:
+            options[key] = value
     for key in ("launch_rviz", "launch_zed_driver", "launch_d405_driver"):
         value = os.environ.get("SKETCH_" + key.upper())
         if value is not None:

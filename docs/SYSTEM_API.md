@@ -1,5 +1,11 @@
 # Sketch Robot Supervisor API
 
+기본 카메라 입력은 **Michelo Outpost**, 기본 API 포트는 **8081**입니다.
+[Michelo 연결 안내](MICHELO_INTEGRATION.md)에 따라 카메라 ID·시리얼과 IPC 계정을 준비하세요.
+`bash scripts/run_michelo_sketch.sh`로 API와 버튼 추가 콘솔(`8101`)을 함께 실행할 수 있습니다.
+전체 시작은 카메라 스트리밍·IPC 접근을 먼저 검사하며 카메라 SDK를 직접 시작하지 않습니다.
+기존 ROS 드라이버 사용 시 `camera_backend=native`를 명시합니다.
+
 여러 터미널에서 실행하던 구성을 FastAPI 프로세스 관리 서버로 통합했습니다.
 참고한 구조는 [SNUCEM_Robot Supervisor](https://github.com/JongHyunSeo11/SNUCEM_Robot/blob/main/linux/gateway/rb10_supervisor/api.py)입니다.
 참고 저장소는 읽기만 했으며 이 구현은 `sketch_robot_ws`에 추가했습니다.
@@ -13,10 +19,10 @@
 /home/Minjea/sketch_robot_ws/scripts/run_system_api.sh
 ```
 
-- 관리 화면: http://127.0.0.1:8080/
-- API 문서/직접 호출: http://127.0.0.1:8080/docs
-- OpenAPI: http://127.0.0.1:8080/openapi.json
-- 스케치 화면: http://127.0.0.1:8080/sketch/
+- 관리 화면: http://127.0.0.1:8081/
+- API 문서/직접 호출: http://127.0.0.1:8081/docs
+- OpenAPI: http://127.0.0.1:8081/openapi.json
+- 스케치 화면: http://127.0.0.1:8081/sketch/
 
 서버 기동만으로 로봇이나 카메라가 시작되지는 않습니다. 관리 화면의 **전체 시작**으로
 순차 기동하고, **스케치 화면 열기**에서 기존처럼 평면 선택·측정·스케치·도장/뿜칠 작업을 합니다.
@@ -36,16 +42,17 @@ prepare 실패 시 이번 요청에서 시작한 항목만 정리, 역순 shutdo
 
 | 현재 프로세스 ID | 기존 터미널 역할 | 선행 프로세스 |
 |---|---|---|
-| `robot_control` (화면: robot control) | RB10·MoveIt·controller·RViz | 없음 |
-| `perception` | ZED·D405·TF·평면 인식·스케치 변환 | robot_control |
+| `robot_control` (화면: robot control) | RB10/RB20·MoveIt·controller·RViz | 없음 |
+| `perception` | Outpost ROS 브리지·TF·평면 인식·스케치 변환 | robot_control |
 | `force_pipeline` | 목표 wrench·F/T monitor | robot_control |
 | `executor` | 경로 실행기·flight recorder | robot_control, perception, force_pipeline |
 | `rosbridge` | 기존 웹 UI의 ROS WebSocket, 9090 | 없음 |
-| API 서버 자체 | 웹 화면과 실행 관리, 8080 | 위 스크립트로 한 번 기동 |
+| API 서버 자체 | 웹 화면과 실행 관리, 8081 | 위 스크립트로 한 번 기동 |
 
 기존 `rb10_painting_system.launch.py`에 그룹별 실행 스위치만 추가했습니다.
-기본값은 기존 통합 실행과 동일합니다. Supervisor는 각 프로세스에 해당 그룹만 켭니다.
-카메라는 기존 스케치 프로젝트의 ROS 드라이버를 사용하며 Outpost로 교체하지 않았습니다.
+Supervisor는 각 프로세스에 해당 그룹만 켭니다.
+기본 카메라 입력은 Outpost 원본 IPC입니다. 카메라 드라이버는 별도로 시작하지 않습니다.
+기존 ROS 드라이버 사용은 `camera_backend=native`로 명시적으로 선택할 수 있습니다.
 참고 저장소의 Haply/공유제어용 7개 ID나 `start-teleop`은 이 프로젝트에 해당하지 않습니다.
 따라서 기존 Windows Michelo 7개 버튼 화면과의 완전한 호환을 뜻하지 않습니다.
 현재 제공되는 관리 웹 화면 또는 아래 HTTP API를 사용합니다.
@@ -56,6 +63,7 @@ prepare 실패 시 이번 요청에서 시작한 항목만 정리, 역순 shutdo
 |---|---|---|---|
 | `dry_run` (기본) | 실제 연결 | 모의 실행 | 꺼짐 |
 | `work` | 실제 연결 | 기존 실행 인터록 통과 후 허용 | 기존 도장 제어 |
+| `spray_motion_test` | 실제 연결·현재 EOAT | 뿜칠 경로 실제 이동, 분사 항상 OFF | 꺼짐·뿜칠 모드 고정 |
 | `fake` | 가상 하드웨어 | 모의 실행 | 꺼짐 |
 
 `work`는 기존 통합 launch의 `real_painting_enabled=true`, `dry_run=false`,
@@ -64,6 +72,14 @@ prepare 실패 시 이번 요청에서 시작한 항목만 정리, 역순 shutdo
 건 ON/OFF 규칙은 기존 executor가 처리합니다. `fake`의 카메라/RViz 시작 기본값은 false입니다.
 
 설정은 전체 종료 상태에서 관리 화면 또는 `POST /configuration`으로 바꿉니다.
+**로봇 모델**에서 RB10-1300E 또는 RB20-1900ES를 선택합니다. 기본값은 RB10입니다.
+`model_id`는 URDF·MoveIt·실행기에 함께 전달되며 실행 중에는 변경할 수 없습니다.
+재시작 후에도 유지하려면 `config/sketch_runtime.env`에 `SKETCH_MODEL_ID=rb20_1900es`를 설정합니다.
+RB20의 EOAT 기준 좌표계, 별도 보정 파일 및 검증 범위는 [로봇 모델 선택](ROBOT_MODELS.md)을 참고하세요.
+뿜칠건이 없는 현재 EOAT의 실기 검증은 **EOAT 뿜칠 이동 검증 · 분사 OFF**를 선택합니다.
+`dry_run`과 달리 실제로 움직이며, 건 상태 응답을 모의로 생성하지 않습니다.
+이 모드의 분사 출력은 항상 OFF이고 롤러 도장으로 전환할 수 없습니다.
+상세 절차는 [EOAT 이동 검증](SPRAY_MOTION_TEST.md)을 참고하세요.
 서버 재시작 후 유지할 PC별 설정은 다음 파일을 사용합니다.
 
 ```bash
@@ -85,6 +101,7 @@ API 요청으로 임의 shell 명령, 실행 파일, ROS 인자를 전달할 수
 | `GET /configuration` | 실행 설정 |
 | `POST /configuration` | 종료 상태에서 설정 변경 |
 | `GET /processes/{name}` | 개별 상태 |
+| `GET /outpost/cameras` | 데몬에 연결된 카메라 목록 조회 (연결·시작 명령 없음) |
 | `GET /processes/{name}/logs?lines=100` | 최근 로그, 최대 500줄 |
 | `POST /processes/{name}/start` | 의존 프로세스 실행 확인 후 기동 |
 | `POST /processes/{name}/stop?cascade=false` | 종료; 의존 항목 실행 중이면 409 |
@@ -97,15 +114,15 @@ GET 상태 조회는 프로세스를 시작하지 않습니다. 실행 중인 �
 알 수 없는 ID는 404, 인증 실패는 401, 의존성·중복 실행 충돌은 409입니다.
 
 ```bash
-curl http://127.0.0.1:8080/status
+curl http://127.0.0.1:8081/status
 
 # 가상 하드웨어 모드 설정 (실로봇 연결 없음)
-curl -X POST http://127.0.0.1:8080/configuration \
+curl -X POST http://127.0.0.1:8081/configuration \
   -H 'Content-Type: application/json' -d '{"profile":"fake"}'
 
-curl -X POST http://127.0.0.1:8080/prepare-system
-curl http://127.0.0.1:8080/processes/executor/logs?lines=100
-curl -X POST http://127.0.0.1:8080/shutdown-system
+curl -X POST http://127.0.0.1:8081/prepare-system
+curl http://127.0.0.1:8081/processes/executor/logs?lines=100
+curl -X POST http://127.0.0.1:8081/shutdown-system
 ```
 
 상태는 `STOPPED / STARTING / RUNNING / STOPPING / EXITED / FAILED`입니다.
@@ -120,12 +137,12 @@ curl -X POST http://127.0.0.1:8080/shutdown-system
 
 ```bash
 SKETCH_SUPERVISOR_HOST=0.0.0.0
-SKETCH_SUPERVISOR_PORT=8080
+SKETCH_SUPERVISOR_PORT=8081
 SKETCH_SUPERVISOR_API_TOKEN=직접_생성한_비밀_토큰
 ```
 
 토큰 생성 예: `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`.
-설정 후 서버를 재시작하고 다른 PC에서 `http://로봇PC주소:8080/`에 접속합니다.
+설정 후 서버를 재시작하고 다른 PC에서 `http://로봇PC주소:8081/`에 접속합니다.
 관리 화면의 API 토큰 입력란에 입력 후 **연결 확인**을 누릅니다. 토큰은 브라우저 메모리에만 둡니다.
 직접 호출 시 `Authorization: Bearer <token>` 헤더를 사용합니다. `/docs`의 Authorize도 지원합니다.
 

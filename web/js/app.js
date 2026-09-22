@@ -2,6 +2,7 @@
 // 현재 구현은 Three.js 가 아니라 native canvas overlay 를 사용한다.
 
 let processMode = "paint";
+let sprayMotionTest = false;
 let processModePending = false;
 let multiPlaneBusy = false;
 let stopRequested = false;
@@ -1629,11 +1630,13 @@ $("btn-run-robot").addEventListener("click", () => {
   const forceNumber = Number(derived.targetForce);
   const forceText = Number.isFinite(forceNumber) ? `${forceNumber.toFixed(2)} N` : "missing";
   const ok = window.confirm(
-    "RB10 실제 실행을 승인합니까?\n\n" +
+    "로봇 실제 실행을 승인합니까?\n\n" +
     `작업 방식: ${processMode === "spray" ? "내화뿜칠" : "롤러 도장"}\n` +
     (processMode === "paint" ? `목표 접촉력: ${forceText}\n\n` : "\n") +
     (processMode === "spray"
-      ? "로봇이 작업면에서 50 cm 이격하여 이동합니다. 도포 경로에서만 뿜칠건이 켜집니다."
+      ? (sprayMotionTest
+        ? "현재 EOAT로 작업면에서 50 cm 이격하여 실제 이동합니다. 뿜칠건 미장착 이동 검증이며 분사 출력은 항상 OFF입니다."
+        : "로봇이 작업면에서 50 cm 이격하여 이동합니다. 도포 경로에서만 뿜칠건이 켜집니다.")
       : "로봇이 즉시 움직입니다. 10 mm pre-contact에서 정지한 후 간격을 확인하고 F/T tare를 수행합니다."),
   );
   if (!ok) {

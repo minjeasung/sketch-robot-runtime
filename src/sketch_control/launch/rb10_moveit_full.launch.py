@@ -1,4 +1,5 @@
 import os
+from sketch_control.robot_models import DEFAULT_MODEL, model_srdf, validate_model
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -56,14 +57,8 @@ def generate_launch_description():
     )
 
 
-def _named_srdf():
-    srdf_path = os.path.join(
-        get_package_share_directory("sketch_control"),
-        "config",
-        "rbpodo_named.srdf",
-    )
-    with open(srdf_path, "r", encoding="utf-8") as f:
-        return f.read()
+def _named_srdf(selected_model=DEFAULT_MODEL):
+    return model_srdf(selected_model)
 
 
 def _robot_description_with_eoat():
@@ -108,6 +103,7 @@ def _validate_painting_config_contract(
 
 
 def launch_setup(context, *args, **kwargs):
+    selected_model = validate_model(model_id.perform(context))
     use_sim_time = {"use_sim_time": use_sim_time_cfg}
     is_isaac_sim = context.perform_substitution(use_isaac_sim).lower() in (
         "true",
@@ -180,7 +176,7 @@ def launch_setup(context, *args, **kwargs):
     )
     moveit_config.robot_description = _robot_description_with_eoat()
     moveit_config.robot_description_semantic = {
-        "robot_description_semantic": _named_srdf()
+        "robot_description_semantic": _named_srdf(selected_model)
     }
 
     move_group = Node(
