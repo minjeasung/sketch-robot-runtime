@@ -36,6 +36,14 @@ ROI_SAMPLE_STRIDE = 4
 MIN_TARGET_POINTS = 80
 RANSAC_DIST = 0.015
 RANSAC_ITERS = 2000
+RANSAC_MAX_PLANES = 8
+RANSAC_VOXEL_M = 0.01
+RANSAC_SOR_MEAN_K = 12
+RANSAC_SOR_STD_RATIO = 1.0
+RANSAC_SOR_MAX_POINTS = 3500
+RANSAC_MAX_FIT_POINTS = 7000
+RANSAC_REMOVAL_THRESHOLD_SCALE = 1.25
+RANSAC_MIN_GLOBAL_INLIER_RATIO = 0.02
 
 
 LATCHED_QOS = QoSProfile(
@@ -124,7 +132,21 @@ class TargetSelectorNode(Node):
             pixels, z = pixels[valid], z[valid]
             points = np.column_stack(((pixels[:,0]-self.K[0,2])*z/self.K[0,0],
                                       (pixels[:,1]-self.K[1,2])*z/self.K[1,1], z))
-            planes = extract_planes(points, pixels)
+            planes = extract_planes(
+                points,
+                pixels,
+                max_planes=RANSAC_MAX_PLANES,
+                min_points=MIN_TARGET_POINTS,
+                threshold=RANSAC_DIST,
+                iterations=RANSAC_ITERS,
+                voxel_size=RANSAC_VOXEL_M,
+                sor_mean_k=RANSAC_SOR_MEAN_K,
+                sor_std_ratio=RANSAC_SOR_STD_RATIO,
+                sor_max_points=RANSAC_SOR_MAX_POINTS,
+                max_fit_points=RANSAC_MAX_FIT_POINTS,
+                removal_threshold_scale=RANSAC_REMOVAL_THRESHOLD_SCALE,
+                min_global_inlier_ratio=RANSAC_MIN_GLOBAL_INLIER_RATIO,
+            )
             generation = str(msg.header.stamp.sec*1_000_000_000 + msg.header.stamp.nanosec)
             for index, plane in enumerate(planes):
                 plane["id"] = generation + ":" + str(index+1)
