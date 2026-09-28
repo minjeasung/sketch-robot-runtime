@@ -49,7 +49,10 @@ from geometry_msgs.msg import Pose, PoseArray, PoseStamped
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
 from std_msgs.msg import Empty, String
-from sketch_control.pointcloud_utils import ransac_plane, voxel_downsample
+from sketch_control.pointcloud_utils import (
+    segment_planes_iterative_ransac,
+    voxel_downsample,
+)
 from sketch_control.rotation_utils import quat_apply, quat_to_matrix
 from visualization_msgs.msg import Marker, MarkerArray
 from sketch_control.targets import load_objects_config
@@ -378,47 +381,64 @@ class EnvironmentScannerNode(Node):
             f"  preprocess: {remaining.shape[0]} pts "
             f"(voxel={VOXEL_DOWN}, crop<{CROP_MAX_DIST}m)")
 
-        # ── 반복 RANSAC: 최대 MAX_PLANES 개 추출 ───────────
-        planes = []  # list of dict {normal, centroid, inlier_pts, n_inliers}
-        for i in range(MAX_PLANES):
-            if remaining.shape[0] < MIN_PLANE_INLIERS:
-                break
-            try:
-                model, inliers = ransac_plane(
-                    remaining, RANSAC_DIST, RANSAC_ITERS)
-            except Exception as e:
-                self.get_logger().warn(f"segment_plane 실패: {e}")
-                break
-            if len(inliers) < MIN_PLANE_INLIERS:
-                self.get_logger().info(
-                    f"  plane#{i}: inliers {len(inliers)} < {MIN_PLANE_INLIERS} — 종료")
-                break
+        # ── 공통 robust 반복 RANSAC: 최대 MAX_PLANES 개 추출 ──
+        scan_points = remaining
+        segments = segment_planes_iterative_ransac(
+            scan_points,
+            max_planes=MAX_PLANES,
+            max_iterations=RANSAC_ITERS,
+            distance_threshold=RANSAC_DIST,
+            min_inliers=MIN_PLANE_INLIERS,
+            # scan_points는 이미 VOXEL_DOWN으로 downsample 되어 있으므로
+            # 여기서는 추가 voxel 축약 없이 SOR + full-cloud refinement만 적용.
+            voxel_size=0.0,
+            sor_mean_k=12,
+            sor_std_ratio=1.0,
+            sor_max_points=3500,
+            max_fit_points=7000,
+            seed=7,
+            removal_threshold_scale=1.25,
+            min_global_inlier_ratio=0.03,
+        )
 
-            a, b, c, _d = model
+        planes = []  # list of dict {normal, centroid, inlier_pts, n_inliers}
+        residual_mask = np.ones(scan_points.shape[0], dtype=bool)
+        for i, segment in enumerate(segments):
+            model = segment["model"]
+            a, b, c, d = model
             n = np.array([a, b, c], dtype=float)
             n_norm = np.linalg.norm(n)
             if n_norm < 1e-6:
-                break
+                continue
             n /= n_norm
 
-            inlier_idx = np.asarray(inliers, dtype=int)
-            inlier_pts = remaining[inlier_idx]
+            inlier_idx = np.asarray(segment["inlier_indices"], dtype=int)
+            inlier_pts = scan_points[inlier_idx]
+            if inlier_pts.shape[0] < MIN_PLANE_INLIERS:
+                continue
             centroid = inlier_pts.mean(axis=0)
 
             planes.append({
                 "normal": n,
                 "centroid": centroid,
                 "inlier_pts": inlier_pts,
-                "n_inliers": int(len(inliers)),
+                "n_inliers": int(segment["inlier_count"]),
             })
             self.get_logger().info(
                 f"  plane#{i}: n=({n[0]:+.2f},{n[1]:+.2f},{n[2]:+.2f}) "
-                f"inliers={len(inliers)} centroid=({centroid[0]:+.2f},"
-                f"{centroid[1]:+.2f},{centroid[2]:+.2f})")
+                f"inliers={segment['inlier_count']} rms={segment['rms_m']:.4f} "
+                f"centroid=({centroid[0]:+.2f},{centroid[1]:+.2f},"
+                f"{centroid[2]:+.2f})")
 
-            mask = np.ones(remaining.shape[0], dtype=bool)
-            mask[inlier_idx] = False
-            remaining = remaining[mask]
+            # Keep obstacle residual semantics aligned with the common fitter:
+            # points close to an accepted plane (expanded removal threshold)
+            # are removed before publishing the remaining scene voxels.
+            residual_mask &= (
+                np.abs(scan_points @ n + float(d))
+                > RANSAC_DIST * 1.25
+            )
+
+        remaining = scan_points[residual_mask]
 
         # ── 평면 분류 ───────────────────────────────────────
         labels = self._classify(planes)
