@@ -255,9 +255,9 @@ def segment_planes_iterative_ransac(
             refined_local = np.flatnonzero(
                 np.abs(pts[remaining] @ normal + d) <= threshold
             )
-            if refined_local.shape[0] < minimum:
-                break
             inlier_local = refined_local
+            if inlier_local.shape[0] < minimum:
+                break
 
         if inlier_local.shape[0] < minimum:
             break
