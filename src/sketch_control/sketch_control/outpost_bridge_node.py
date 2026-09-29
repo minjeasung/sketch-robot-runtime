@@ -22,7 +22,8 @@ from .outpost_camera import camera_status, decode_frame, FrameGuard
 CAMERA_SPECS = {
     "zed": {
         "kind": "zed",
-        "frame": "zed_left_camera_frame_optical",
+        "image_frame": "zed_left_camera_frame_optical",
+        "cloud_frame": "zed_left_camera_frame",
         "topics": (
             "/zed/zed_node/rgb/color/rect/image",
             "/zed/zed_node/rgb/color/rect/camera_info",
@@ -33,7 +34,8 @@ CAMERA_SPECS = {
     },
     "d405": {
         "kind": "realsense",
-        "frame": "d405_color_optical_frame",
+        "image_frame": "d405_color_optical_frame",
+        "cloud_frame": "d405_color_optical_frame",
         "topics": (
             "/d405/d405/color/image_raw",
             "/d405/d405/color/camera_info",
@@ -45,8 +47,8 @@ CAMERA_SPECS = {
 }
 
 
-def sample_pointcloud_grid(cloud, rgb, stride):
-    """Pair an already-strided XYZ grid with its matching full-image RGB pixels."""
+def sample_pointcloud_grid(cloud, rgb, stride, camera_name=None):
+    """Pair strided XYZ with RGB and apply the public cloud frame convention."""
     stride = int(stride)
     if stride < 1:
         raise ValueError("point_stride must be >= 1")
@@ -54,6 +56,14 @@ def sample_pointcloud_grid(cloud, rgb, stride):
     sampled_rgb = np.asarray(rgb)[::stride, ::stride]
     if cloud.shape[:2] != sampled_rgb.shape[:2]:
         raise ValueError("RGB and point cloud stride/grid differ")
+    if camera_name == "zed":
+        # Outpost depth rays are optical: x right, y down, z forward.
+        # cloud_registered consumers expect zed_left_camera_frame:
+        # x forward, y left, z up.
+        cloud = np.stack(
+            (cloud[..., 2], -cloud[..., 0], -cloud[..., 1]),
+            axis=-1,
+        )
     return cloud, sampled_rgb
 
 
@@ -98,7 +108,7 @@ class OutpostBridge(Node):
         }
         try:
             for name, spec in selected.items():
-                kind, frame, topics = spec["kind"], spec["frame"], spec["topics"]
+                kind, topics = spec["kind"], spec["topics"]
                 hw = self.declare_parameter(f"outpost_{name}_hw_id", "").value
                 serial = self.declare_parameter(f"outpost_{name}_serial", "").value
                 status = camera_status(self.origin, hw, serial, kind)
@@ -106,7 +116,8 @@ class OutpostBridge(Node):
                     dict(
                         name=name,
                         kind=kind,
-                        frame=frame,
+                        image_frame=spec["image_frame"],
+                        cloud_frame=spec["cloud_frame"],
                         status=status,
                         hw=hw,
                         serial=serial,
@@ -201,7 +212,7 @@ class OutpostBridge(Node):
 
     def publish_frame(self, camera, data):
         stamp, _, rgb, depth, cloud = data
-        header = Header(frame_id=camera["frame"])
+        header = Header(frame_id=camera["image_frame"])
         header.stamp.sec, header.stamp.nanosec = divmod(stamp, 1_000_000_000)
         h, w = depth.shape
         pubs = camera["publishers"]
@@ -247,7 +258,7 @@ class OutpostBridge(Node):
         if not pubs[4].get_subscription_count():
             return
         sampled_cloud, sampled_rgb = sample_pointcloud_grid(
-            cloud, rgb, camera["point_stride"]
+            cloud, rgb, camera["point_stride"], camera["name"]
         )
         ph, pw = sampled_cloud.shape[:2]
         packed = np.empty(
@@ -270,9 +281,11 @@ class OutpostBridge(Node):
             )
             for i, axis in enumerate(("x", "y", "z", "rgb"))
         ]
+        cloud_header = Header(frame_id=camera["cloud_frame"])
+        cloud_header.stamp = header.stamp
         pubs[4].publish(
             PointCloud2(
-                header=header,
+                header=cloud_header,
                 height=ph,
                 width=pw,
                 fields=fields,
