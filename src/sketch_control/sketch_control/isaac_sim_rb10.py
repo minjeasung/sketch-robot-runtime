@@ -272,7 +272,7 @@ print(f"[OK] 카메라 마운트 세그먼트2 (수직): "
 
 # 카메라 mount: ball head + 1점 볼트 (실로봇 reference 사진과 1:1 일치).
 # 체인 — MountSeg2 top → ball head (sphere) → 볼트 (cylinder) → ZED 바닥.
-# 실 ZED X 는 보통 swivel head 로 부착, 1/4" 볼트 1점 → 시뮬도 동일 chain 으로
+# 실 ZED 2i 는 보통 swivel head 로 부착, 1/4" 볼트 1점 → 시뮬도 동일 chain 으로
 # hand-eye calib 시 sim/real transform parameterization 일치.
 MOUNT_BALL_CENTER = _tcp_authored_xyz_to_base([0.2, 0.5, 0.92])      # Seg2 top (0.89) 위 +0.03m
 MOUNT_BALL_RADIUS = 0.025                            # Φ50mm
@@ -305,8 +305,8 @@ print(f"[OK] 카메라 마운트 볼트: center={MOUNT_BOLT_CENTER.tolist()} "
 # ---- 초기화 -------------------------------------------------------------------
 world.reset()
 
-# ---- ZED 카메라 (zed-isaac-sim 의 ZED_X.usdc reference) -----------------------
-# ZED_X.usdc 를 reference 하는 이유: 시각적 sim-to-real fidelity (실 ZED X mesh +
+# ---- ZED 카메라 (zed-isaac-sim 의 ZED_2i.usdc reference) -----------------------
+# ZED_2i.usdc 를 reference 하는 이유: 시각적 sim-to-real fidelity (실 ZED 2i mesh +
 # CameraLeft/CameraRight intrinsic + IMU prim 모두 검증된 ZED official asset).
 # Phase 5 옵션 C 부터는 sl.sensor.camera ZED_Camera Helper (IPC streamer) 사용 X —
 # 아래 ZedROS2Graph 가 Isaac Sim native ROS2CameraHelper 로 wrapper 와 동일한
@@ -315,10 +315,9 @@ world.reset()
 # 위치: world.reset() 다음. 이유 — reset 전에 USD reference 로 새 rigid body 가 추가되면
 # Robot articulation 의 simulation view 가 invalidate 되어 무한 에러 → Isaac Sim crash.
 CAMERA_PATH = "/World/SketchCamera"
-# ZED X USD 의 origin 은 base_link 와 일치 — [DIAG] 가 (0.97 의도 → 0.97 실제)
-# 확인 (이전 run). 그러나 본체 mesh 들이 origin 아래로 ~0.04m 뻗음 (이전 viewport
-# 에서 어댑터 plate top (z=0.93) 까지 관통). 따라서 mesh 아래 extent 보다 더
-# 큰 buffer 필요 — bolt top 위로 0.045m 잡음.
+# Official ZED_2i.usdc root is mounted as one rigid stereo body. Keep the
+# existing 45 mm clearance above the bolt as a conservative physical mount
+# allowance; the visual/sensor geometry itself now comes from the ZED 2i asset.
 _BALL_TOP_Z = float(MOUNT_BALL_CENTER[2] + MOUNT_BALL_RADIUS)             # 0.945
 _BOLT_TOP_Z = float(MOUNT_BOLT_CENTER[2] + MOUNT_BOLT_HEIGHT / 2.0)       # 0.955
 CAMERA_EYE = Gf.Vec3d(
@@ -327,16 +326,16 @@ CAMERA_EYE = Gf.Vec3d(
     _BOLT_TOP_Z + 0.045,                    # 1.0 (bolt top + 본체 mesh extent buffer)
 )
 CAMERA_TARGET = Gf.Vec3d(_WALL_FRONT_X, 0.0, 0.5)
-ZED_X_USD_PATH = (
+ZED_2I_USD_PATH = (
     "/home/minjea/sketch_robot_ws/zed-isaac-sim/"
-    "exts/sl.sensor.camera/data/usd/ZED_X.usdc"
+    "exts/sl.sensor.camera/data/usd/ZED_2i.usdc"
 )
 
-# CAMERA_PATH 를 Xform 으로 만들고 ZED_X.usdc 를 reference. defaultPrim 이 child 가 됨.
+# CAMERA_PATH 를 Xform 으로 만들고 ZED_2i.usdc 를 reference. defaultPrim 이 child 가 됨.
 zed_carrier = UsdGeom.Xform.Define(stage, CAMERA_PATH)
-zed_carrier.GetPrim().GetReferences().AddReference(ZED_X_USD_PATH)
+zed_carrier.GetPrim().GetReferences().AddReference(ZED_2I_USD_PATH)
 
-# ---- ZED X 의 world pose (look-at) 를 USD reference 직후 먼저 적용 ----------------
+# ---- ZED 2i 의 world pose (look-at) 를 USD reference 직후 먼저 적용 ----------------
 # 이유: FixedJoint 가 ZED root 의 world pose 를 기준으로 anchor 계산. transform 이
 # 나중에 적용되면 joint 가 origin 으로 끌어당겨 받침대 한가운데에 박힘.
 from scipy.spatial.transform import Rotation as _R
@@ -371,17 +370,17 @@ _M = Gf.Matrix4d(1.0)
 _M.SetRotateOnly(Gf.Rotation(_qd_lookat))
 _M.SetTranslateOnly(Gf.Vec3d(CAMERA_EYE[0], CAMERA_EYE[1], CAMERA_EYE[2]))
 zed_xf.AddTransformOp().Set(_M)
-print(f"[OK] ZED X USD reference + transform: {CAMERA_PATH}")
+print(f"[OK] ZED 2i USD reference + transform: {CAMERA_PATH}")
 print(f"     eye={tuple(CAMERA_EYE)} → target={tuple(CAMERA_TARGET)}")
 
 # ---- 진단: ZED 내부 prim 들의 실제 world 위치 ---------------------------------
-# ZED_X.usdc 의 base_link 가 자체 xformOp 을 갖고 있을 수 있음. 의도한 CAMERA_EYE
+# ZED_2i.usdc 의 base_link 가 자체 xformOp 을 갖고 있을 수 있음. 의도한 CAMERA_EYE
 # 와 실제 base_link world 위치 차이 = ZED USD 내부 origin offset → 시각적 박힘
 # 원인 추적용. (의도값 ≠ 실제값이면 ZED 내부 transform 추가 보정 필요.)
 for _diag_path in [
     CAMERA_PATH,
     CAMERA_PATH + "/base_link",
-    CAMERA_PATH + "/base_link/ZED_X",
+    CAMERA_PATH + "/base_link/ZED_2i",
 ]:
     _diag_prim = stage.GetPrimAtPath(_diag_path)
     if _diag_prim.IsValid() and _diag_prim.IsA(UsdGeom.Xformable):
@@ -392,7 +391,7 @@ for _diag_path in [
         print(f"[DIAG] {_diag_path} world pos = "
               f"({_world_t[0]:.4f}, {_world_t[1]:.4f}, {_world_t[2]:.4f})")
 
-# ---- ZED X rigid body: dynamic + disableGravity --------------------------------
+# ---- ZED 2i rigid body: dynamic + disableGravity --------------------------------
 # IMU 는 dynamic body 에서만 sensor reading 유효. 중력 차단은 아래 fixed joint 와
 # 함께 작용 (joint 가 위치 고정 + gravity off 가 외력 차단).
 _zed_rb_paths = []
@@ -403,24 +402,24 @@ for _descendant in Usd.PrimRange(zed_carrier.GetPrim()):
         _physx_rb = PhysxSchema.PhysxRigidBodyAPI.Apply(_descendant)
         _physx_rb.CreateDisableGravityAttr().Set(True)       # gravity off
         _zed_rb_paths.append(_descendant.GetPath().pathString)
-print(f"[OK] ZED X rigid body: {len(_zed_rb_paths)} prim (dynamic + disableGravity)")
+print(f"[OK] ZED 2i rigid body: {len(_zed_rb_paths)} prim (dynamic + disableGravity)")
 print(f"     paths={_zed_rb_paths}")
 
-# ---- ZED X IMU prim 재등록 (kit command — sensor backend 등록 필수) -------------
-# ZED_X.usdc 의 Imu_Sensor 는 IsaacImuSensor typed prim 으로 USD 안에 정의됨.
+# ---- ZED 2i IMU prim 재등록 (kit command — sensor backend 등록 필수) -------------
+# ZED_2i.usdc 의 Imu_Sensor 는 IsaacImuSensor typed prim 으로 USD 안에 정의됨.
 # 그러나 C++ sensor backend (acquire_imu_sensor_interface) 는 USD load 만으론
 # 등록 안 함 — IsaacSensorCreateImuSensor kit command 가 호출돼야 internal
 # registration 됨 → 이전 run 의 "no valid sensor reading" 원인.
 # 해결: 기존 prim 의 pose 보존하면서 kit command 로 재생성.
 import omni.kit.commands  # noqa: E402
-IMU_PARENT_PATH = CAMERA_PATH + "/base_link/ZED_X"
+IMU_PARENT_PATH = CAMERA_PATH + "/base_link/ZED_2i"
 IMU_PRIM_PATH = IMU_PARENT_PATH + "/Imu_Sensor"
 try:
     _old_imu_prim = stage.GetPrimAtPath(IMU_PRIM_PATH)
     _imu_t = Gf.Vec3d(0.0, 0.0, 0.0)
     _imu_q = Gf.Quatd(1.0, 0.0, 0.0, 0.0)
     if _old_imu_prim.IsValid():
-        # 기존 prim 의 translate/orient 보존 (ZED_X.usdc 의 IMU 위치/자세)
+        # 기존 prim 의 translate/orient 보존 (ZED_2i.usdc 의 IMU 위치/자세)
         _t_attr = _old_imu_prim.GetAttribute("xformOp:translate")
         _q_attr = _old_imu_prim.GetAttribute("xformOp:orient")
         if _t_attr and _t_attr.HasAuthoredValue():
@@ -455,7 +454,7 @@ try:
 except Exception as _e:
     print(f"[ERROR] IMU 재생성 실패: {_e}")
 
-# ---- ZED X 를 MountBallhead (ball head sphere) 에 fixed joint 로 anchoring --------
+# ---- ZED 2i 를 MountBallhead (ball head sphere) 에 fixed joint 로 anchoring --------
 # 체인: World ← (kinematic) MountBallhead ← (FixedJoint) → ZED /Root.
 # Sim-to-real: 실 ZED 의 swivel head ball + 1/4" 볼트 1점 부착과 1:1 모사.
 # localPos0 = CAMERA_EYE - MOUNT_BALL_CENTER (Ball local frame, identity rot).
@@ -493,9 +492,9 @@ else:
     print(f"[WARN] FixedJoint anchoring skip "
           f"(ball valid={_ball_prim.IsValid()}, zed_rb_count={len(_zed_rb_paths)})")
 
-# CameraHelper 가 참조할 left/right camera prim path (ZED_X USD 내부 구조)
-LEFT_CAMERA_PATH = CAMERA_PATH + "/base_link/ZED_X/CameraLeft"
-RIGHT_CAMERA_PATH = CAMERA_PATH + "/base_link/ZED_X/CameraRight"
+# CameraHelper 가 참조할 left/right camera prim path (ZED_2i USD 내부 구조)
+LEFT_CAMERA_PATH = CAMERA_PATH + "/base_link/ZED_2i/CameraLeft"
+RIGHT_CAMERA_PATH = CAMERA_PATH + "/base_link/ZED_2i/CameraRight"
 
 try:
     _dofs = robot.num_dof
@@ -910,7 +909,7 @@ keys = og.Controller.Keys
 # 로봇 TF 는 robot_state_publisher 가 /joint_states + 같은 URDF 로 만든다.
 # Isaac 은 camera TF 만 publish 하여 RViz/MoveIt 과 TF authority 를 분리한다.
 _tf_targets = [
-    Sdf.Path(CAMERA_PATH),         # ZED X USD reference root — base_link/ZED_X/Camera* 자동
+    Sdf.Path(CAMERA_PATH),         # ZED 2i USD reference root — base_link/ZED_X/Camera* 자동
 ]
 
 og.Controller.edit(
@@ -992,9 +991,9 @@ og.Controller.edit(
 #   /zed/zed_node/depth/camera_info              (sensor_msgs/CameraInfo)
 #   /zed/zed_node/imu/data                       (sensor_msgs/Imu)
 #
-# 해상도: ZED X HD720 (1280x720) — sim 성능 vs 실 ZED X 출력 절충.
+# 해상도: ZED 2i HD720 (1280x720) — sim 성능 vs 실 ZED 2i 출력 절충.
 # Frame ID: zed_left_camera_frame_optical / zed_imu_link (실 wrapper 와 동일).
-# 발행 빈도: 시뮬 physics 60 Hz, frameSkipCount=1 → 30 Hz (실 ZED X HD720 와 일치).
+# 발행 빈도: 시뮬 physics 60 Hz, frameSkipCount=1 → 30 Hz (실 ZED 2i HD720 와 일치).
 ZED_RES_W = 1280
 ZED_RES_H = 720
 ZED_FRAME_SKIP = 1                          # 60 Hz / (1+1) = 30 Hz
@@ -1079,8 +1078,8 @@ og.Controller.edit(
 )
 
 # cameraPrim 은 OGN 의 type="target" relationship — SET_VALUES 로 안 잡힘. 별도 설정.
-_LEFT_CAM = CAMERA_PATH + "/base_link/ZED_X/CameraLeft"
-_RIGHT_CAM = CAMERA_PATH + "/base_link/ZED_X/CameraRight"
+_LEFT_CAM = CAMERA_PATH + "/base_link/ZED_2i/CameraLeft"
+_RIGHT_CAM = CAMERA_PATH + "/base_link/ZED_2i/CameraRight"
 for _node_name, _target in [
     ("/World/ZedROS2Graph/LeftRP",  _LEFT_CAM),
     ("/World/ZedROS2Graph/RightRP", _RIGHT_CAM),
