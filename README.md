@@ -7,7 +7,10 @@ Michelo Outpost의 ZED/D405 데이터로 작업 평면을 측정하고 웹 스�
 
 ## 로봇 PC 설치
 
-Ubuntu 24.04 x86_64 / ROS 2 Jazzy 및 실제 ZED 운용을 위한 GPU·ZED SDK 환경을 먼저 준비합니다.
+Ubuntu 24.04 x86_64 / ROS 2 Jazzy를 준비합니다. 기본 카메라 입력은 Michelo Outpost이므로
+Sketch Runtime 자체에는 ZED SDK/CUDA/`zed_wrapper`가 필요하지 않습니다. ZED 2i를 직접 여는
+Outpost 환경에만 ZED SDK가 필요하며, RViz/MoveIt 형상은 SDK와 독립적인 공식
+`zed_description`의 ZED 2i mesh를 사용합니다.
 이 저장소는 비공개이므로 먼저 접근 권한이 있는 GitHub 계정으로 Git 인증을 설정합니다.
 기존 작업 폴더가 있다면 복제할 경로를 바꿉니다.
 
