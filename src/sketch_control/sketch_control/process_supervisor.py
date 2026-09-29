@@ -195,7 +195,13 @@ class Supervisor:
         conflicts = set(r["spec"].nodes)
         if name == "perception":
             if self.options['camera_backend'] == 'outpost':
-                conflicts.add('sketch_outpost_bridge')
+                # Reject both the current split bridge nodes and the legacy
+                # single-process name to prevent duplicate Outpost consumers.
+                conflicts.update({
+                    'sketch_outpost_zed_bridge',
+                    'sketch_outpost_d405_bridge',
+                    'sketch_outpost_bridge',
+                })
             if self.options["launch_zed_driver"]:
                 conflicts.add("zed_node")
             if self.options["launch_d405_driver"]:
