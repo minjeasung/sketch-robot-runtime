@@ -51,10 +51,13 @@ def test_zed_stride_reduces_xyz_work_without_reducing_depth_grid():
     assert rgb.shape == (2, 2, 3)
     assert depth.shape == (2, 2)
     assert cloud.shape == (1, 1, 3)
-    paired_cloud, paired_rgb = sample_pointcloud_grid(cloud, rgb, 2)
+    paired_cloud, paired_rgb = sample_pointcloud_grid(
+        cloud, rgb, 2, camera_name='zed')
     assert paired_cloud.shape == (1, 1, 3)
     assert paired_rgb.shape == (1, 1, 3)
-    np.testing.assert_allclose(paired_cloud[0, 0], [0.0, 0.0, 1.0])
+    # Optical [right, down, forward] -> zed_left_camera_frame
+    # [forward, left, up].
+    np.testing.assert_allclose(paired_cloud[0, 0], [1.0, 0.0, 0.0])
 
 
 def test_outpost_launch_splits_zed_and_d405_processes():
