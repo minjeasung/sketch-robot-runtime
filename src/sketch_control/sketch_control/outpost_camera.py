@@ -74,12 +74,17 @@ def intrinsics(values):
     return result
 
 
-def decode_frame(parts, status, kind):
-    """Return timestamp, sequence, RGB, depth metres and optical XYZ metres.
+def decode_frame(parts, status, kind, point_stride=1):
+    """Return timestamp, sequence, full RGB/depth and optical XYZ metres.
 
-    D405 retains SDK sub-mm XYZ; never reconstruct it from PNG/uint16 depth.
-    RGB must be aligned to the same depth grid. Header indices include topic.
+    ZED XYZ is computed directly on the requested pixel stride so global cloud
+    work scales with the published cloud density.  RGB/depth remain full
+    resolution for sketch pixel-to-ray reconstruction.  D405 keeps SDK XYZ
+    (sub-mm geometry) and only subsamples after restoring the calibrated grid.
     """
+    point_stride = int(point_stride)
+    if point_stride < 1:
+        raise ValueError('point_stride must be >= 1')
     if len(parts) < 4 or parts[0] != status['hw_id'].encode():
         raise ValueError('Wrong raw camera topic')
     header = json.loads(parts[1])
@@ -116,8 +121,11 @@ def decode_frame(parts, status, kind):
             or list(depth.shape[::-1]) != status['resolution']
             or header.get('frame_size') != status['resolution']):
         raise ValueError('RGB/depth calibration grid mismatch; align RGB to depth')
+
     metres = depth.astype(np.float32) * (0.001 if depth.dtype == np.uint16 else 1.0)
     valid = np.isfinite(metres) & (metres > 0)
+    metres[~valid] = np.nan
+
     if kind == 'realsense':
         points = arrays['point_cloud']
         if (depth.dtype != np.uint16 or points.shape != (int(valid.sum()), 3)
@@ -126,12 +134,19 @@ def decode_frame(parts, status, kind):
             raise ValueError('D405 SDK XYZ does not match depth pixels/units')
         cloud = np.full((*depth.shape, 3), np.nan, dtype=np.float32)
         cloud[valid] = points * np.float32(0.001)
+        cloud = cloud[::point_stride, ::point_stride]
     else:
+        # Compute only sampled rays instead of constructing the full XYZ grid.
         k = intrinsics(status['intrinsics'])
-        v, u = np.indices(depth.shape, dtype=np.float32)
-        cloud = np.stack(((u-k['cx'])*metres/k['fx'], (v-k['cy'])*metres/k['fy'], metres), -1)
-        cloud[~valid] = np.nan
-    metres[~valid] = np.nan
+        sampled = metres[::point_stride, ::point_stride]
+        h, w = sampled.shape
+        u = (np.arange(w, dtype=np.float32) * point_stride)[None, :]
+        v = (np.arange(h, dtype=np.float32) * point_stride)[:, None]
+        x = (u - k['cx']) * sampled / k['fx']
+        y = (v - k['cy']) * sampled / k['fy']
+        cloud = np.stack((x, y, sampled), axis=-1)
+        cloud[~np.isfinite(sampled)] = np.nan
+
     return header['capture_timestamp_ns'], header['seq'], rgb, metres, cloud
 
 
