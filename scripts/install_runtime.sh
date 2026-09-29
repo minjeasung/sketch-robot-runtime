@@ -29,7 +29,7 @@ if [[ "$SKETCH_INSTALL_APT" == true ]]; then
       python3-numpy python3-zmq python3-pil python3-pil.imagetk libeigen3-dev libboost-all-dev \
       ros-jazzy-moveit ros-jazzy-ros2-control ros-jazzy-ros2-controllers \
       ros-jazzy-kinematics-interface-kdl ros-jazzy-realsense2-camera ros-jazzy-cv-bridge \
-      ros-jazzy-rosbridge-server ros-jazzy-tf-transformations
+      ros-jazzy-zed-description ros-jazzy-rosbridge-server ros-jazzy-tf-transformations
 fi
 python3 scripts/fetch_runtime_sources.py "${SKETCH_INSTALL_ARGS[@]}"
 if [[ "$SKETCH_INSTALL_APT" == true ]]; then
