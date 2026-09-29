@@ -437,6 +437,7 @@ def _axis_offset(axis, distance):
 
 _AFT200_MESH_CACHE = None
 _EOAT_NO_CAMERA_MESH_CACHE = None
+_STATIC_MESH_CACHE = {}
 
 
 def _cad_z_to_tcp_minus_y_np(x, y, z):
@@ -496,6 +497,36 @@ def _load_eoat_no_camera_mesh():
     )
     _EOAT_NO_CAMERA_MESH_CACHE = mesh
     return copy.deepcopy(mesh)
+
+
+def _resolve_package_resource(resource):
+    """Resolve package://pkg/path for static collision assets."""
+    text = str(resource or "").strip()
+    prefix = "package://"
+    if not text.startswith(prefix):
+        raise ValueError(f"unsupported mesh resource: {text!r}")
+    package_and_path = text[len(prefix):]
+    package, sep, relative = package_and_path.partition("/")
+    if not sep or not package or not relative:
+        raise ValueError(f"invalid package mesh resource: {text!r}")
+    if get_package_share_directory is None:
+        raise RuntimeError("ament package lookup unavailable")
+    path = Path(get_package_share_directory(package)) / relative
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return path
+
+
+def _load_static_collision_mesh(resource):
+    """Load and cache an immutable static-world STL such as the ZED 2i body."""
+    key = str(resource)
+    cached = _STATIC_MESH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    path = _resolve_package_resource(resource)
+    mesh = _load_stl_mesh(path, lambda x, y, z: np.array([x, y, z], dtype=float))
+    _STATIC_MESH_CACHE[key] = mesh
+    return mesh
 
 
 from sketch_control.spray_execution import SprayExecutionMixin
@@ -9696,17 +9727,53 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             co = CollisionObject()
             co.id = obj["name"]
             co.header.frame_id = BASE_FRAME
-            prim = SolidPrimitive()
-            prim.type = SolidPrimitive.BOX
-            padding = 0.0 if obj["name"] == self.active_target_name \
-                else WORLD_COLLISION_PADDING
-            prim.dimensions = [
-                float(v) + 2.0 * padding for v in obj["size"]
-            ]
-            pose = self._transform_xyz_quat_to_pose(
-                obj["position"], [0.0, 0.0, 0.0, 1.0], world_to_base)
-            co.primitives.append(prim)
-            co.primitive_poses.append(pose)
+
+            use_mesh = str(obj.get("moveit_shape", "")).strip().lower() == "mesh"
+            if use_mesh:
+                try:
+                    mesh_frame = str(obj.get("mesh_frame", "World")).strip() or "World"
+                    mesh_tf = self._lookup_transform_to_base(
+                        mesh_frame, timeout_s=0.05)
+                    if mesh_tf is None:
+                        raise RuntimeError(
+                            f"{BASE_FRAME}<-{mesh_frame} TF unavailable")
+                    mesh = _load_static_collision_mesh(obj["mesh_resource"])
+                    mesh_pose = self._transform_xyz_quat_to_pose(
+                        obj.get("mesh_position", [0.0, 0.0, 0.0]),
+                        obj.get("mesh_orientation", [0.0, 0.0, 0.0, 1.0]),
+                        mesh_tf,
+                    )
+                    co.meshes.append(mesh)
+                    co.mesh_poses.append(mesh_pose)
+                except Exception as e:
+                    # Keep the previous conservative world box as an explicit
+                    # fail-safe if zed_description or its calibrated TF is absent.
+                    self.get_logger().warn(
+                        f"[SCENE] {obj['name']} mesh collision unavailable; "
+                        f"bbox fallback 사용: {e}",
+                        throttle_duration_sec=2.0)
+                    prim = SolidPrimitive()
+                    prim.type = SolidPrimitive.BOX
+                    prim.dimensions = [
+                        float(v) + 2.0 * WORLD_COLLISION_PADDING
+                        for v in obj["size"]
+                    ]
+                    pose = self._transform_xyz_quat_to_pose(
+                        obj["position"], [0.0, 0.0, 0.0, 1.0], world_to_base)
+                    co.primitives.append(prim)
+                    co.primitive_poses.append(pose)
+            else:
+                prim = SolidPrimitive()
+                prim.type = SolidPrimitive.BOX
+                padding = WORLD_COLLISION_PADDING
+                prim.dimensions = [
+                    float(v) + 2.0 * padding for v in obj["size"]
+                ]
+                pose = self._transform_xyz_quat_to_pose(
+                    obj["position"], [0.0, 0.0, 0.0, 1.0], world_to_base)
+                co.primitives.append(prim)
+                co.primitive_poses.append(pose)
+
             co.operation = CollisionObject.ADD
             ps.world.collision_objects.append(co)
 
