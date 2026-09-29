@@ -46,15 +46,15 @@ CAMERA_SPECS = {
 
 
 def sample_pointcloud_grid(cloud, rgb, stride):
-    """Downsample only the ROS point cloud grid, preserving full RGB/depth images."""
+    """Pair an already-strided XYZ grid with its matching full-image RGB pixels."""
     stride = int(stride)
     if stride < 1:
         raise ValueError("point_stride must be >= 1")
     cloud = np.asarray(cloud)
-    rgb = np.asarray(rgb)
-    if cloud.shape[:2] != rgb.shape[:2]:
-        raise ValueError("RGB and point cloud grids differ")
-    return cloud[::stride, ::stride], rgb[::stride, ::stride]
+    sampled_rgb = np.asarray(rgb)[::stride, ::stride]
+    if cloud.shape[:2] != sampled_rgb.shape[:2]:
+        raise ValueError("RGB and point cloud stride/grid differ")
+    return cloud, sampled_rgb
 
 
 class OutpostBridge(Node):
@@ -310,7 +310,12 @@ class OutpostBridge(Node):
                     parts = sock.recv_multipart()
 
                 try:
-                    frame = decode_frame(parts, camera["status"], camera["kind"])
+                    frame = decode_frame(
+                        parts,
+                        camera["status"],
+                        camera["kind"],
+                        point_stride=camera["point_stride"],
+                    )
                 except ValueError as exc:
                     # A generation race can leave one old multipart frame queued
                     # immediately after a safe reconnect.  Refresh once; any
