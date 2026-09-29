@@ -2,6 +2,12 @@
 
 Michelo Outpost의 ZED/D405 데이터로 작업 평면을 측정하고 웹 스케치로 RB10/RB20의 도장·내화뿜칠 경로를 제어합니다.
 
+도장(Paint)은 기존 ZED+D405 구성을 유지합니다. 뿜칠(Spray)은 시작 설정
+`process_mode=spray`로 **ZED만 사용**하며 D405 연결·보정·측정 이동을 요구하지 않습니다.
+기본 공정은 Paint이고 `spray_motion_test`는 Spray로 시작합니다. 뿜칠 기본값은
+노즐 이격 0.500 m, 폭 0.350 m, 겹침 30%, 속도 0.020 m/s입니다.
+[9단계 작업 흐름과 현장 검증 항목](docs/MULTI_PLANE_SPRAY.md)을 먼저 확인하세요.
+
 **로봇 PC에 설치하고, 같은 네트워크의 원격 PC에서 브라우저로 접속합니다.**
 원격 PC에는 ROS나 Python 설치가 필요 없습니다.
 

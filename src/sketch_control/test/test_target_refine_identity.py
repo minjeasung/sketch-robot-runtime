@@ -1,4 +1,5 @@
 import json
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -75,6 +76,7 @@ def test_target_selector_preserves_nonzero_selection_stamp_exactly():
     node = object.__new__(TargetSelectorNode)
     node.K = np.eye(3)
     node.latest_depth = np.ones((100, 100), dtype=np.float32)
+    node.latest_depth_received_at = time.monotonic()
     node.latest_depth_header = SimpleNamespace(
         frame_id="zed_left_camera_frame_optical"
     )
@@ -134,6 +136,25 @@ def test_target_selector_rejects_zero_request_stamp():
     TargetSelectorNode._on_selection(node, selection)
 
     assert node.pub.messages == []
+
+
+@pytest.mark.skipif(TargetSelectorNode is None, reason="ROS 2 is not available")
+def test_target_selector_rejects_stale_depth_with_current_request_identity():
+    node = object.__new__(TargetSelectorNode)
+    node.K = np.eye(3)
+    node.latest_depth = np.ones((10, 10), dtype=np.float32)
+    node.latest_depth_received_at = time.monotonic() - 2.0
+    node.catalog_pub = _Publisher()
+    node.get_logger = lambda: _Logger()
+    selection = PoseArray()
+    selection.header.frame_id = "zed_raw"
+    selection.header.stamp.sec = 123
+    selection.poses.append(PoseStamped().pose)
+    node._on_selection(selection)
+    payload = json.loads(node.catalog_pub.messages[-1].data)
+    assert payload["generation"] == "123000000000"
+    assert payload["planes"] == []
+    assert payload["error"] == "ZED_DEPTH_STALE"
 
 
 @pytest.mark.skipif(

@@ -82,6 +82,28 @@ def test_api_model_selection_is_explicit_and_locked_while_running(client, superv
     assert client.post('/configuration',json={'model_id':'unknown'}).status_code==400
 
 
+def test_api_process_selection_reaches_supervisor_and_locks_while_running(client, supervisor):
+    response = client.post('/configuration', json={'profile': 'fake', 'process_mode': 'spray'})
+    assert response.status_code == 200, response.text
+    assert response.json()['process_mode'] == 'spray'
+    assert all('process_mode:=spray' in r['spec'].command for r in supervisor.records.values())
+    supervisor.records['robot_control']['process'] = object()
+    try:
+        assert client.post('/configuration', json={'process_mode': 'paint'}).status_code == 409
+    finally:
+        supervisor.records['robot_control']['process'] = None
+    assert client.post('/configuration', json={'process_mode': 'unknown'}).status_code == 400
+
+
+def test_api_motion_test_defaults_to_spray_and_rejects_explicit_paint(client):
+    response = client.post('/configuration', json={'profile': 'spray_motion_test'})
+    assert response.status_code == 200, response.text
+    assert response.json()['process_mode'] == 'spray'
+    assert client.post('/configuration', json={
+        'profile': 'spray_motion_test', 'process_mode': 'paint',
+    }).status_code == 400
+
+
 def test_rb20_missing_calibration_rejects_prepare_before_any_process_starts(client, supervisor):
     assert client.post('/configuration',json={'profile':'spray_motion_test','model_id':'rb20_1900es'}).status_code==200
     response=client.post('/prepare-system')

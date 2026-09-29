@@ -14,6 +14,7 @@ target_selector_node — ZED 전역 이미지 위 사용자 스케치로 작업�
 이후 작업영역 projection 과 경로 생성의 기준 surface 가 된다.
 """
 import json
+import time
 import numpy as np
 from std_msgs.msg import String
 from sketch_control.multi_plane_geometry import polygon_mask, extract_planes
@@ -77,6 +78,7 @@ class TargetSelectorNode(Node):
         self.K = None
         self.latest_depth = None
         self.latest_depth_header = None
+        self.latest_depth_received_at = 0.0
 
         self.create_subscription(
             CameraInfo, CAMERA_INFO_TOPIC, self._on_info, qos_profile_sensor_data)
@@ -99,6 +101,7 @@ class TargetSelectorNode(Node):
         try:
             self.latest_depth = self._decode_depth(msg)
             self.latest_depth_header = msg.header
+            self.latest_depth_received_at = time.monotonic()
         except Exception as e:
             self.get_logger().warn(f"depth decode 실패: {e}")
 
@@ -121,6 +124,12 @@ class TargetSelectorNode(Node):
             return
 
         try:
+            age = time.monotonic() - getattr(self, "latest_depth_received_at", 0.0)
+            if not 0.0 <= age <= 1.0:
+                raise ValueError("ZED_DEPTH_STALE")
+            if (not np.isfinite(self.K).all() or self.K[0, 0] <= 0.0
+                    or self.K[1, 1] <= 0.0):
+                raise ValueError("ZED_INTRINSICS_INVALID")
             polygons = {}
             for p in msg.poses:
                 polygons.setdefault(int(round(p.position.z)), []).append([p.position.x, p.position.y])

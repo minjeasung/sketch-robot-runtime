@@ -13,7 +13,8 @@ from rbpodo_painting_control.segment_path import (
     validate_segment_path_for_real_execution, segment_waypoint_position,
     rotation_from_surface_path, build_execution_steps,
 )
-from test_eoat_segment_generation import _generator_stub, _publish_two_strokes, _CapturePublisher
+from rbpodo_painting_control.spray_path import rotation_from_spray_path
+from test_eoat_segment_generation import _spray_generator_stub, _publish_two_strokes, _CapturePublisher
 from test_target_refine_identity import _refiner_stub, _target_pose
 
 
@@ -35,7 +36,7 @@ def test_two_walls_have_independent_normals_and_pixel_support():
 
 
 def spray_plan():
-    node=_generator_stub(real=True); node.process_mode='spray'
+    node=_spray_generator_stub(real=True)
     path=_publish_two_strokes(node)
     assert path is not None
     return path
@@ -44,13 +45,15 @@ def spray_plan():
 def test_spray_geometry_and_stroke_transitions_match_preview():
     path=spray_plan(); validate_segment_path_for_real_execution(path)
     assert [s.mode for s in build_execution_steps(path.rows)]==[
-        'SPRAY_APPROACH','SPRAY','SPRAY_TRAVEL','SPRAY','SPRAY_FINISH']
+        'SPRAY_APPROACH','SPRAY','SPRAY_TRAVEL','SPRAY',
+        'SPRAY_TRAVEL','SPRAY','SPRAY_TRAVEL','SPRAY','SPRAY_FINISH']
     previous=None
     for row in path.rows:
         p=np.asarray(segment_waypoint_position(path,row))
-        assert np.dot(p-np.asarray(row.position),row.normal)-path.contact_geometry_offset_m == pytest.approx(.5)
+        assert np.dot(p-np.asarray(row.position),row.normal) == pytest.approx(.5)
+        assert path.contact_geometry_offset_m == 0.
         assert row.force_n==0
-        rotation=rotation_from_surface_path(row.normal,row.tangent,previous)
+        rotation=rotation_from_spray_path(row.normal,row.tangent,path.spray_tool_axis,previous)
         np.testing.assert_allclose(rotation[:,1],row.normal,atol=1e-9)
         assert abs(rotation[:,0] @ row.tangent)<1e-9
         previous=rotation[:,0]

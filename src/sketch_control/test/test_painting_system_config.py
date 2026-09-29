@@ -1,5 +1,6 @@
 import ast
 import importlib.util
+import json
 import math
 from pathlib import Path
 import subprocess
@@ -20,6 +21,265 @@ def _load_module(name, path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize('profile', ['dry_run', 'work', 'fake'])
+def test_process_startup_defaults_to_paint(profile, tmp_path):
+    from sketch_control.process_supervisor import build_specs
+    options, specs = build_specs(tmp_path, {'profile': profile})
+    assert options['process_mode'] == 'paint'
+    assert all('process_mode:=paint' in spec.command for spec in specs)
+    assert 'd405_surface_refiner' in next(s for s in specs if s.name == 'perception').nodes
+
+
+@pytest.mark.parametrize('profile', ['dry_run', 'work', 'fake', 'spray_motion_test'])
+@pytest.mark.parametrize('backend', ['native', 'outpost'])
+def test_spray_startup_has_no_d405_dependency(profile, backend, tmp_path):
+    from sketch_control.process_supervisor import build_specs
+    options, specs = build_specs(tmp_path, {
+        'profile': profile, 'process_mode': 'spray', 'camera_backend': backend,
+        'launch_d405_driver': True,
+    })
+    assert options['process_mode'] == 'spray'
+    assert options['launch_d405_driver'] is False
+    for spec in specs:
+        assert 'process_mode:=spray' in spec.command
+        assert 'launch_d405_driver:=false' in spec.command
+        assert 'painting_force_enabled:=false' in spec.command
+        assert not any(arg.startswith('d405_calibration_file:=') for arg in spec.command)
+    perception = next(s for s in specs if s.name == 'perception')
+    assert 'd405_surface_refiner' not in perception.nodes
+    assert {'target_selector', 'wall_projector', 'sketch_to_waypoints'} <= set(perception.nodes)
+
+
+def test_motion_test_selects_spray_and_rejects_explicit_paint(tmp_path):
+    from sketch_control.process_supervisor import build_specs, SupervisorError
+    options, _ = build_specs(tmp_path, {'profile': 'spray_motion_test'})
+    assert options['process_mode'] == 'spray'
+    with pytest.raises(SupervisorError, match='requires process_mode=spray'):
+        build_specs(tmp_path, {'profile': 'spray_motion_test', 'process_mode': 'paint'})
+
+
+@pytest.mark.parametrize('mode', ['unknown', '', True, None, ['spray']])
+def test_invalid_startup_process_modes_rejected(mode, tmp_path):
+    from sketch_control.process_supervisor import build_specs, SupervisorError
+    with pytest.raises(SupervisorError, match='process_mode'):
+        build_specs(tmp_path, {'process_mode': mode})
+
+
+def test_rb20_spray_requires_zed_calibration_but_not_d405(tmp_path):
+    from sketch_control.robot_models import model_calibration_files, validate_calibration_files
+    paths = model_calibration_files(tmp_path, 'rb20_1900es', process_mode='spray')
+    assert set(paths) == {'zed_calibration_file'}
+    with pytest.raises(ValueError, match='calibration required'):
+        validate_calibration_files(paths, process_mode='spray')
+    path = Path(paths['zed_calibration_file'])
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({'T_world_zed_optical': {
+        'translation': [0, 0, 0], 'rotation_xyzw': [0, 0, 0, 1],
+    }}))
+    validate_calibration_files(paths, process_mode='spray')
+    with pytest.raises(ValueError, match='calibration required'):
+        validate_calibration_files(model_calibration_files(tmp_path, 'rb20_1900es'))
+
+
+@pytest.mark.parametrize('mode,expected', [('paint', ['zed', 'realsense']), ('spray', ['zed'])])
+def test_supervisor_preflight_checks_only_process_cameras(mode, expected, tmp_path, monkeypatch):
+    from sketch_control import process_supervisor
+    calls = []
+    monkeypatch.setattr(process_supervisor, 'camera_status',
+                        lambda origin, hw_id, serial, kind: calls.append(kind))
+    supervisor = process_supervisor.Supervisor(tmp_path, None, {'process_mode': mode})
+    supervisor._validate_cameras()
+    assert calls == expected
+
+
+def test_spray_config_keeps_explicit_geometry_and_safe_defaults():
+    config = yaml.safe_load(CONFIG_PATH.read_text(encoding='utf-8'))
+    for node in ('moveit_executor', 'sketch_to_waypoints', 'wall_projector', 'd405_surface_refiner'):
+        assert config[node]['ros__parameters']['process_mode'] == 'paint'
+    for node in ('moveit_executor', 'sketch_to_waypoints'):
+        assert config[node]['ros__parameters']['model_id'] == 'rb10_1300e_u'
+        assert config[node]['ros__parameters']['spray_tool_axis'] == ''
+    generator = config['sketch_to_waypoints']['ros__parameters']
+    assert generator['spray_footprint_width_m'] == .35
+    assert generator['spray_overlap'] == .30
+    assert generator['spray_speed_mps'] == .020
+    assert generator['spray_standoff_m'] == .5
+
+
+def test_rb20_spray_supervisor_validates_zed_only_before_start(tmp_path):
+    from sketch_control.process_supervisor import Supervisor, SupervisorError
+    from sketch_control.robot_models import model_calibration_files
+    supervisor = Supervisor(tmp_path, None, {'model_id': 'rb20_1900es', 'process_mode': 'spray'})
+    with pytest.raises(SupervisorError, match='calibration required'):
+        supervisor._validate_model_calibration()
+    paths = model_calibration_files(tmp_path, 'rb20_1900es')
+    path = Path(paths['zed_calibration_file'])
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({'T_world_zed_optical': {
+        'translation': [0, 0, 0], 'rotation_xyzw': [0, 0, 0, 1],
+    }}))
+    supervisor._validate_model_calibration()
+    supervisor.options['process_mode'] = 'paint'
+    with pytest.raises(SupervisorError, match='d405_eyeinhand'):
+        supervisor._validate_model_calibration()
+
+
+def test_spray_supervisor_still_rejects_missing_zed(tmp_path, monkeypatch):
+    from sketch_control import process_supervisor
+    def unavailable(origin, hw_id, serial, kind):
+        assert kind == 'zed'
+        raise ValueError('ZED unavailable')
+    monkeypatch.setattr(process_supervisor, 'camera_status', unavailable)
+    supervisor = process_supervisor.Supervisor(tmp_path, None, {'process_mode': 'spray'})
+    with pytest.raises(process_supervisor.SupervisorError, match='ZED unavailable'):
+        supervisor._validate_cameras()
+
+
+def test_spray_duplicate_detection_ignores_d405_but_keeps_zed_and_projector(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from sketch_control import process_supervisor
+    monkeypatch.setattr(process_supervisor, 'camera_status', lambda *args: None)
+    graph = {'graph_fresh': True, 'nodes': ['/sketch_outpost_d405_bridge', '/d405_surface_refiner']}
+    monitor = SimpleNamespace(snapshot=lambda: graph)
+    supervisor = process_supervisor.Supervisor(tmp_path, monitor, {'process_mode': 'spray'})
+    supervisor.preflight('perception')
+    for name in ('sketch_outpost_zed_bridge', 'wall_projector', 'sketch_to_waypoints'):
+        graph['nodes'] = ['/' + name]
+        with pytest.raises(process_supervisor.SupervisorError, match='Already running'):
+            supervisor.preflight('perception')
+    supervisor = process_supervisor.Supervisor(tmp_path, monitor, {'process_mode': 'paint'})
+    graph['nodes'] = ['/sketch_outpost_d405_bridge']
+    with pytest.raises(process_supervisor.SupervisorError, match='Already running'):
+        supervisor.preflight('perception')
+
+
+def _launch_function(filename, function_name, **namespace):
+    """Exercise Python launch guards without importing the ROS launch runtime."""
+    path = WORKSPACE_SRC / 'sketch_control/launch' / filename
+    tree = ast.parse(path.read_text(encoding='utf-8'))
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == function_name)
+    module = ast.Module(body=[function], type_ignores=[])
+    exec(compile(module, str(path), 'exec'), namespace)
+    return namespace[function_name]
+
+
+class _LaunchValue:
+    def __init__(self, name):
+        self.name = name
+
+    def perform(self, context):
+        return context[self.name]
+
+
+def test_spray_launch_disables_every_d405_source_and_skips_calibration_read():
+    from sketch_control.robot_models import validate_process_mode
+    configure = _launch_function('rb10_perception_sketch.launch.py', '_configure_process',
+                                 LaunchConfiguration=_LaunchValue,
+                                 SetLaunchConfiguration=lambda name, value: (name, value),
+                                 validate_process_mode=validate_process_mode)
+    assert configure({'process_mode': 'paint'}) == []
+    updates = dict(configure({'process_mode': 'spray'}))
+    assert updates['front_view_source'] == 'zed'
+    for key in ('use_sim_d405_depth_pointcloud', 'use_d405_refinement', 'use_d405_mount_tf',
+                'use_d405_optical_tf', 'use_d405_calibration_file', 'use_ft_normal_controller'):
+        assert updates[key] == 'false'
+    mount = _launch_function('rb10_perception_sketch.launch.py', '_make_d405_mount_static_tf',
+                             LaunchConfiguration=_LaunchValue)
+    # No camera settings or loader exist in this context: spray must exit first.
+    assert mount({'process_mode': 'spray', 'use_d405_mount_tf': 'true'}) == []
+
+
+def test_spray_launch_rejects_paint_and_force_bypasses_without_ros():
+    from sketch_control.robot_models import validate_process_mode
+    validate = _launch_function('rb10_painting_system.launch.py', '_validate_interlock_values',
+                                validate_process_mode=validate_process_mode)
+    flags = dict(use_fake_hardware=False, use_isaac_sim=False, real_painting_enabled=True,
+                 dry_run=False, painting_force_enabled=False, process_mode='spray')
+    validate(**flags)
+    with pytest.raises(RuntimeError, match='painting_force_enabled=false'):
+        validate(**(flags | {'painting_force_enabled': True}))
+    with pytest.raises(RuntimeError, match='requires process_mode=spray'):
+        validate(**(flags | {'spray_motion_test': True, 'process_mode': 'paint'}))
+    with pytest.raises(RuntimeError, match='real_painting_enabled=true'):
+        validate(**(flags | {'real_painting_enabled': False}))
+
+
+@pytest.mark.parametrize('mode,expected', [('paint', ['zed', 'realsense']), ('spray', ['zed'])])
+def test_real_perception_launch_validates_only_required_camera_descriptors(mode, expected):
+    from sketch_control.robot_models import validate_process_mode, process_cameras
+    calls = []
+    validate = _launch_function('rb10_real_perception_sketch.launch.py', '_validate_camera_backend',
+                                LaunchConfiguration=_LaunchValue,
+                                SetLaunchConfiguration=lambda name, value: (name, value),
+                                validate_process_mode=validate_process_mode, process_cameras=process_cameras,
+                                camera_status=lambda origin, hw_id, serial, kind: calls.append(kind))
+    context = {'process_mode': mode, 'camera_backend': 'outpost', 'outpost_http': 'http://127.0.0.1:8100'}
+    for camera, _ in process_cameras(mode):
+        context.update({f'launch_{camera}_driver': 'false', f'outpost_{camera}_hw_id': camera,
+                        f'outpost_{camera}_serial': camera})
+    updates = dict(validate(context))
+    assert calls == expected
+    if mode == 'spray':
+        assert updates['launch_d405_driver'] == 'false'
+        assert updates['front_view_source'] == 'zed'
+
+
+def test_top_launch_rb20_spray_needs_only_zed_descriptors_and_calibration(tmp_path, monkeypatch):
+    import os
+    from sketch_control import robot_models
+    monkeypatch.setenv('SKETCH_WORKSPACE', str(tmp_path))
+    paths = robot_models.model_calibration_files(tmp_path, 'rb20_1900es', 'spray')
+    path = Path(paths['zed_calibration_file'])
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({'T_world_zed_optical': {
+        'translation': [0, 0, 0], 'rotation_xyzw': [0, 0, 0, 1],
+    }}))
+    calls = []
+    validate_values = _launch_function('rb10_painting_system.launch.py', '_validate_interlock_values',
+                                       validate_process_mode=robot_models.validate_process_mode)
+    validate = _launch_function('rb10_painting_system.launch.py', '_validate_launch_interlocks',
+                                os=os, LaunchConfiguration=_LaunchValue,
+                                SetLaunchConfiguration=lambda name, value: (name, value),
+                                _validate_interlock_values=validate_values,
+                                camera_status=lambda origin, hw_id, serial, kind: calls.append(kind),
+                                **{name: getattr(robot_models, name) for name in (
+                                    'DEFAULT_MODEL', 'validate_model', 'validate_process_mode',
+                                    'process_cameras', 'model_calibration_files', 'validate_calibration_files')})
+    context = {
+        'model_id': 'rb20_1900es', 'process_mode': 'spray', 'use_fake_hardware': 'false',
+        'use_isaac_sim': 'false', 'real_painting_enabled': 'true', 'dry_run': 'false',
+        'painting_force_enabled': 'false', 'spray_motion_test': 'true', 'launch_perception': 'true',
+        'zed_calibration_file': '', 'camera_backend': 'outpost', 'launch_zed_driver': 'false',
+        'outpost_http': 'http://127.0.0.1:8100', 'outpost_zed_hw_id': 'zed', 'outpost_zed_serial': '123',
+    }
+    updates = dict(validate(context))
+    assert calls == ['zed']
+    assert updates['zed_calibration_file'] == str(path)
+    assert 'd405_calibration_file' not in updates
+    assert updates['launch_d405_driver'] == 'false'
+    path.unlink()
+    with pytest.raises(ValueError, match='calibration required'):
+        validate(context)
+
+
+@pytest.mark.parametrize('filename', [
+    'rb10_painting_system.launch.py', 'rb10_real_perception_sketch.launch.py',
+    'rb10_perception_sketch.launch.py', 'core.launch.py', 'sketch_control.launch.py',
+    'phase1_python.launch.py', 'phase2_unity.launch.py',
+])
+def test_all_active_launches_expose_process_and_spray_geometry(filename):
+    tree = ast.parse((WORKSPACE_SRC / 'sketch_control/launch' / filename).read_text(encoding='utf-8'))
+    declarations = {n.args[0].value: {k.arg: k.value for k in n.keywords}
+                    for n in ast.walk(tree) if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Name) and n.func.id == 'DeclareLaunchArgument'
+                    and n.args and isinstance(n.args[0], ast.Constant)}
+    assert 'process_mode' in declarations
+    for key, expected in {'model_id': 'rb10_1300e_u', 'spray_tool_axis': '',
+                          'spray_footprint_width_m': '0.35', 'spray_overlap': '0.30',
+                          'spray_speed_mps': '0.020', 'spray_standoff_m': '0.5'}.items():
+        assert ast.literal_eval(declarations[key]['default_value']) == expected
 
 
 def test_common_config_is_accepted_by_ros_argument_parser():

@@ -48,7 +48,12 @@ calibration/rb20_1900es/d405_eyeinhand_charuco_calibration.json
 필요한 pose 키는 각각 `T_world_zed_optical`, `T_d405_optical_to_tcp`이며 기존
 보정 도구의 translation/rotation_xyzw 형식이다. 교체한 팔과 정규화된 TCP를 기준으로
 보정해야 한다. RB10 파일을 자동 복사하지 않는다. RB20 실장비 perception은
-별도 파일이 없거나 변환이 유효하지 않으면 기동을 거부한다. fake 프로필은 이 요구를 제외한다.
+Paint일 때 두 파일 모두 필요하고, `process_mode=spray`일 때 ZED 파일만 필요하다.
+공정에 필요한 파일이 없거나 변환이 유효하지 않으면 기동을 거부한다. fake 프로필은 이 요구를 제외한다.
+ZED 보정 파일 이름에 `d405`가 포함되어 있어도 Spray에서는 `T_world_zed_optical`만 읽으며
+D405 장치나 D405 pose 키를 요구하지 않는다.
+Spray 공구 축의 기본값은 RB10 `-y`, RB20 `+z`이고 application TCP 기준이다.
+executor와 generator에 동일한 `model_id` 및 `spray_tool_axis`를 전달한다.
 소스 배포에는 보정값을 포함하지 않으며 `export_runtime.py --calibration-only`로 별도 전달한다.
 
 RB10에서 가르친 ready/view/calib 관절 자세는 RB20에서 사용하지 않는다.

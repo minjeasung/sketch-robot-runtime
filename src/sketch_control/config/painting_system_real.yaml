@@ -183,6 +183,10 @@ rbpodo_ft_tare:
 
 moveit_executor:
   ros__parameters:
+    process_mode: paint
+    model_id: rb10_1300e_u
+    # Empty resolves to RB10 -y / RB20 +z in the application TCP frame.
+    spray_tool_axis: ""
     execution_backend: follow_joint_trajectory
     follow_joint_trajectory_action: /joint_trajectory_controller/follow_joint_trajectory
     use_eoat_segments: true
@@ -266,6 +270,14 @@ moveit_executor:
 
 sketch_to_waypoints:
   ros__parameters:
+    process_mode: paint
+    model_id: rb10_1300e_u
+    spray_tool_axis: ""
+    spray_footprint_width_m: 0.35
+    spray_overlap: 0.30
+    spray_speed_mps: 0.020
+    # Nozzle-to-surface distance; no roller radius is added.
+    spray_standoff_m: 0.5
     eoat_segment_frame: link0
     publish_eoat_segments: true
     real_painting_enabled: false
@@ -317,6 +329,7 @@ sketch_to_waypoints:
 
 wall_projector:
   ros__parameters:
+    process_mode: paint
     front_view_source: d405
     allow_wall_fallback: false
     d405_image_topic: /d405/d405/color/image_raw
@@ -325,6 +338,7 @@ wall_projector:
 
 d405_surface_refiner:
   ros__parameters:
+    process_mode: paint
     defer_target_capture_until_arrival: true
     cloud_topic: /d405/d405/depth/color/points
     require_capture_trigger: true

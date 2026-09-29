@@ -105,13 +105,13 @@ def test_motion_test_startup_is_explicit_read_only_and_initializes_spray():
     declared = []
     def declare(name, default, descriptor):
         declared.append((name, default, descriptor.read_only))
-        return SimpleNamespace(value=True)
+        return SimpleNamespace(value=True if name == "spray_motion_test" else default)
     node.declare_parameter = declare
     node.create_publisher = lambda *args: node.spray_command_pub
     node.create_subscription = lambda *args: None
     node.create_timer = lambda *args: None
     node._init_spray()
-    assert declared == [('spray_motion_test', False, True)]
+    assert declared == [('spray_motion_test', False, True), ('process_mode', 'paint', True)]
     assert node.process_mode == 'spray'
     assert json.loads(node.spray_command_pub.messages[-1].data)['spray_motion_test'] is True
     node.painting_force_enabled = True

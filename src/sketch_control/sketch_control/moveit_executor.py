@@ -530,11 +530,13 @@ def _load_static_collision_mesh(resource):
 
 
 from sketch_control.spray_execution import SprayExecutionMixin
+from sketch_control.zed_spray_execution import ZedSprayExecutionMixin
+from rbpodo_painting_control.spray_path import resolve_spray_tool_axis, rotation_from_spray_path
 from sketch_control.multi_surface_execution import MultiSurfaceMixin
 from sketch_control.d405_view_geometry import measurement_samples, camera_view
 
 
-class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
+class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMixin, Node):
     def __init__(self):
         super().__init__("moveit_executor")
         self.model_id = validate_model(self.declare_parameter(
@@ -1273,6 +1275,10 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         self.create_timer(3.0, self._log_current_tcp)
         self.create_timer(0.05, self._publish_executor_heartbeat)
         self._init_spray()
+        self.spray_tool_axis = resolve_spray_tool_axis(
+            self.model_id, str(self.declare_parameter(
+                "spray_tool_axis", "", ParameterDescriptor(read_only=True)).value))
+        self._init_zed_spray()
         self._init_multi_surface()
         self.create_timer(0.5, self._update_and_publish_readiness)
 
@@ -1413,6 +1419,8 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             self._accepted_plan_hash = ""
             self._accepted_plan_path_id = ""
             self._d405_plane_accepted = False
+            if getattr(self, "process_mode", "paint") == "spray":
+                self._invalidate_zed_target("EXECUTION_CANDIDATE_INVALIDATED")
         self._execution_candidate_invalidated = False
         self._execution_candidate_invalidation_reason = ""
 
@@ -1581,8 +1589,8 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
                     ),
                 )
                 for field, actual, expected in expected_geometry:
-                    if path.process_mode == "spray" and field != "contact_geometry_offset_m":
-                        expected = 0.5
+                    if path.process_mode == "spray":
+                        expected = 0.0 if field == "contact_geometry_offset_m" else path.spray_standoff_m
                     if abs(actual - expected) > 1e-6:
                         raise SegmentPathError(
                             f"{field} differs from executor config: "
@@ -1736,6 +1744,8 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         self._request_motion_abort(f"PLAN_INVALIDATED:{reason}")
 
     def on_work_area_state(self, msg: String):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         if getattr(self, "_multi_current", None) is not None or getattr(self, "_multi_queue", []):
             # Target scanning owns an immutable candidate plane; delayed
             # work-area invalidations belong to the previous drawing.
@@ -1787,6 +1797,8 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             self._abort_active_plan_invalidation("WORK_AREA_CHANGED")
 
     def on_d405_refinement_status(self, msg: String):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         if getattr(self, "_multi_current", None) is not None or getattr(self, "_multi_queue", []):
             # Target scanning owns an immutable candidate plane; delayed
             # work-area invalidations belong to the previous drawing.
@@ -2389,10 +2401,17 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
                 ),
                 current_plane_generation_id=self._current_plane_generation_id,
                 d405_plane_accepted=self._d405_plane_accepted,
+                process_mode=getattr(self, "process_mode", "paint"),
+                zed_plane_accepted=getattr(self, "_zed_plane_accepted", False),
             )
         )
         if path is not None and path.process_mode != getattr(self, "process_mode", "paint"):
             blockers.append("PROCESS_MODE_MISMATCH")
+        if path is not None and path.process_mode == "spray":
+            if path.raw_payload.get("spray_tool_axis") != getattr(self, "spray_tool_axis", ""):
+                blockers.append("SPRAY_TOOL_AXIS_MISMATCH")
+            if path.raw_payload.get("model_id") != getattr(self, "model_id", DEFAULT_MODEL):
+                blockers.append("SPRAY_ROBOT_MODEL_MISMATCH")
         if path is not None and not blockers:
             try:
                 validate_segment_path_for_real_execution(
@@ -2722,6 +2741,12 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             "current_plan_validated": plan_valid,
         }
         if getattr(self, "process_mode", "paint") == "spray":
+            checks.pop("d405_plane_accepted")
+            checks.pop("work_area_refined")
+            checks["zed_plane_accepted"] = bool(getattr(self, "_zed_plane_accepted", False))
+            checks["zed_work_area_locked"] = bool(
+                self._current_work_area_id and self._current_plane_generation_id
+                and getattr(self, "_zed_plane_accepted", False))
             checks["spray_output_ready"] = not self._spray_motion_blockers()
         ready = all(checks.values()) if self.real_painting_enabled else plan_valid
         if getattr(self, "process_mode", "paint") == "spray":
@@ -2848,6 +2873,8 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         self.execution_status_pub.publish(message)
 
     def on_active_surface(self, msg: PoseStamped):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         if MoveItExecutor._execution_snapshot_updates_locked(
             self, "ZED surface"
         ):
@@ -2869,6 +2896,8 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         self._set_active_surface(msg, "zed")
 
     def on_refined_active_surface(self, msg: PoseStamped):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         if MoveItExecutor._execution_snapshot_updates_locked(
             self, "D405 refined surface"
         ):
@@ -3047,6 +3076,8 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         return True
 
     def on_work_area_corners(self, msg: PoseArray):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         if MoveItExecutor._execution_snapshot_updates_locked(
             self, "work-area corners"
         ) or self.executing:
@@ -3116,6 +3147,8 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         return True
 
     def on_refine_work_area(self, msg: Bool):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         if not msg.data:
             return
         if self._motion_abort_requested:
@@ -3142,6 +3175,9 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         self._try_begin_work_area_refine()
 
     def _try_begin_work_area_refine(self):
+        if getattr(self, "process_mode", "paint") == "spray":
+            self._cancel_work_area_refine_wait_timer()
+            return
         missing = []
         if self.current_joint_state is None:
             missing.append("joint_state")
@@ -3200,6 +3236,10 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
 
     def _retry_pending_surface_tf(self):
         """Surface/corner 메시지를 TF 준비 전에 받았을 때 나중에 다시 변환."""
+        if getattr(self, "process_mode", "paint") == "spray":
+            if not self.executing:
+                self._accept_pending_zed_area()
+            return
         if MoveItExecutor._execution_snapshot_updates_locked(
             self, "pending surface TF retry"
         ):
@@ -3671,7 +3711,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         if not self.use_eoat_segments or self._segment_path is None:
             return None
         path = self._segment_path
-        if self.real_painting_enabled or not self.dry_run:
+        if self.real_painting_enabled or not self.dry_run or getattr(self, "process_mode", "paint") == "spray":
             blockers = self._current_real_plan_blockers()
             if blockers:
                 self.get_logger().error(
@@ -3716,7 +3756,9 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             )
             return
         matching_path = self._matching_segment_path()
-        strict_segment_required = self.real_painting_enabled or not self.dry_run
+        strict_segment_required = (
+            self.real_painting_enabled or not self.dry_run
+            or getattr(self, "process_mode", "paint") == "spray")
         if strict_segment_required and matching_path is None:
             blockers = self._current_real_plan_blockers()
             reason = ",".join(blockers) or "MATCHING_V3_SEGMENT_REQUIRED"
@@ -3929,6 +3971,8 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
                 f"[SURFACE] D405 refined plane lock 해제: {reason}")
 
     def _maybe_begin_d405_prescan(self):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return False
         if not D405_PREFLIGHT_SCAN_ENABLED:
             return False
         if self._d405_refined_surface_fresh():
@@ -4068,6 +4112,8 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         self._finish_d405_prescan(success=False)
 
     def _begin_d405_prescan(self, mode="sketch"):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return False
         self._invalidate_d405_prescan_callbacks(clear_token=True)
         scan_poses = self._build_d405_prescan_poses()
         if not scan_poses:
@@ -5407,9 +5453,13 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
 
     def _segment_tip_pose(self, path: SegmentPath, row, previous_tcp_x=None):
         normal = np.asarray(row.normal, dtype=float)
-        rotation = rotation_from_surface_path(
-            normal, row.tangent, previous_tcp_x=previous_tcp_x
-        )
+        if path.process_mode == "spray":
+            rotation = rotation_from_spray_path(
+                normal, row.tangent, path.raw_payload["spray_tool_axis"],
+                previous_tcp_x=previous_tcp_x)
+        else:
+            rotation = rotation_from_surface_path(
+                normal, row.tangent, previous_tcp_x=previous_tcp_x)
         q = quat_from_matrix(rotation)
         position = np.asarray(segment_waypoint_position(path, row), dtype=float)
         pose = Pose()
@@ -5423,7 +5473,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         return pose, rotation[:, 0].copy()
 
     def _validate_segment_path_geometry(self, path: SegmentPath):
-        if path.contact_geometry_offset_m < ROLLER_RADIUS - 0.002:
+        if path.process_mode != "spray" and path.contact_geometry_offset_m < ROLLER_RADIUS - 0.002:
             self.get_logger().error(
                 "[PAINT PATH] contact geometry is shorter than the roller radius: "
                 f"{path.contact_geometry_offset_m:.4f} < {ROLLER_RADIUS:.4f} m"
@@ -5462,11 +5512,11 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             plane_error = abs(
                 float(np.dot(np.asarray(row.position) - plane_point, active_normal))
             )
-            if alignment < 0.90:
+            if alignment < (0.999 if path.process_mode == "spray" else 0.90):
                 errors.append(
                     f"row {row.row_number}: normal alignment={alignment:.3f}"
                 )
-            if plane_error > 0.030:
+            if plane_error > (0.003 if path.process_mode == "spray" else 0.030):
                 errors.append(
                     f"row {row.row_number}: surface plane error={plane_error:.3f}m"
                 )
@@ -5517,7 +5567,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             tip_pose, previous_tcp_x = self._segment_tip_pose(
                 path, row, previous_tcp_x
             )
-            tcp_pose = self._brush_tip_to_tcp(tip_pose)
+            tcp_pose = copy.deepcopy(tip_pose) if path.process_mode == "spray" else self._brush_tip_to_tcp(tip_pose)
             row_tip_poses[row.row_number] = tip_pose
             row_tcp_poses[row.row_number] = tcp_pose
             if row.mode in MOTION_MODES:
@@ -5556,8 +5606,8 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             "row_tcp_poses": row_tcp_poses,
             "motion_tip_poses": motion_tip_poses,
             "motion_tcp_poses": motion_tcp_poses,
-            "safety_tcp_pose": self._brush_tip_to_tcp(safety_tip),
-            "retreat_tcp_pose": self._brush_tip_to_tcp(retreat_tip),
+            "safety_tcp_pose": copy.deepcopy(safety_tip) if path.process_mode == "spray" else self._brush_tip_to_tcp(safety_tip),
+            "retreat_tcp_pose": copy.deepcopy(retreat_tip) if path.process_mode == "spray" else self._brush_tip_to_tcp(retreat_tip),
         }
 
     def _apply_segment_orientation_candidate(self, candidate):
@@ -5666,12 +5716,17 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             # and its negative.  Current TCP +X only orders those exact
             # solutions; using current +/-X directly can collapse both branches
             # when it is nearly perpendicular to the row's valid roller axis.
-            raw_rotation = rotation_from_surface_path(
-                first_motion.normal,
-                first_motion.tangent,
-            )
+            if path.process_mode == "spray":
+                raw_rotation = rotation_from_spray_path(
+                    first_motion.normal, first_motion.tangent,
+                    path.raw_payload["spray_tool_axis"])
+            else:
+                raw_rotation = rotation_from_surface_path(
+                    first_motion.normal, first_motion.tangent)
             raw_tcp_x = np.asarray(raw_rotation[:, 0], dtype=float)
-            current_tcp_x = self._current_roller_axis_seed(first_motion)
+            # Spray roll must match the preview; only Paint ranks roller symmetry.
+            current_tcp_x = (None if path.process_mode == "spray"
+                             else self._current_roller_axis_seed(first_motion))
             preferred_tcp_x = raw_tcp_x
             if (
                 current_tcp_x is not None
@@ -5683,13 +5738,15 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
                 preferred_tcp_x,
                 name="roller_x_near_current",
             )
-            candidates = (
-                preferred_candidate,
-                self._flip_segment_orientation_candidate(
+            if path.process_mode == "spray":
+                preferred_candidate["name"] = "spray_tool_axis"
+                candidates = (preferred_candidate,)
+            else:
+                candidates = (
                     preferred_candidate,
-                    name="roller_x_flipped_180",
-                ),
-            )
+                    self._flip_segment_orientation_candidate(
+                        preferred_candidate, name="roller_x_flipped_180"),
+                )
         except SegmentPathError as exc:
             self.get_logger().error(f"[PAINT PATH] pose generation failed: {exc}")
             return None
@@ -5701,7 +5758,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         self._stage1_orientation_ranked = []
         self._stage1_orientation_rank_index = -1
         # Provisional geometry is needed for status/logging only.  Do not mark a
-        # branch selected until *both* endpoint states have completed
+        # branch selected until all candidate endpoint states have completed
         # collision-aware IK validation.
         self._safety_tcp_pose = copy.deepcopy(candidates[0]["safety_tcp_pose"])
         self._retreat_tcp_pose = None
@@ -11581,7 +11638,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         mean(waypoints) 에서 roller radius+clearance 를 빼 active target 의
         collision surface 를 normal 축 방향으로 갱신한다.
         """
-        if not waypoints:
+        if getattr(self, "process_mode", "paint") == "spray" or not waypoints:
             return
         try:
             target = get_target(self.cfg, self.active_target_name)
@@ -11973,7 +12030,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
 
     def _request_stage1_nearest_ik(self):
         """현재 joint state 를 seed 로 쓰는 IK 를 먼저 풀어 Stage 1 wrist flip 을 줄인다."""
-        if len(getattr(self, "_stage1_orientation_candidates", ())) == 2:
+        if getattr(self, "_stage1_orientation_candidates", ()):
             self._request_stage1_orientation_candidate_iks()
             return
         if not self.ik_client.wait_for_service(timeout_sec=2.0):
@@ -12066,7 +12123,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         }, ""
 
     def _request_stage1_orientation_candidate_iks(self):
-        """Collision-check both task-equivalent 180-degree EOAT poses."""
+        """Collision-check every candidate before installing executable poses."""
 
         if not self.ik_client.wait_for_service(timeout_sec=2.0):
             self._fail_stage1_before_motion("DUAL_IK_SERVICE_UNAVAILABLE")
@@ -12082,6 +12139,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         self._stage1_ik_candidate_results = {}
         self._stage1_ik_candidates_finalized_generation = -1
         self._stage1_ik_seed_state = copy.deepcopy(self.current_joint_state)
+        candidate_count = len(self._stage1_orientation_candidates)
 
         for index, candidate in enumerate(self._stage1_orientation_candidates):
             req = GetPositionIK.Request()
@@ -12120,7 +12178,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
                 self._stage1_orientation_candidate_ik_done(done, g, i, t)
             )
 
-        if len(self._stage1_ik_candidate_results) == 2:
+        if len(self._stage1_ik_candidate_results) == candidate_count:
             self._finish_stage1_orientation_candidate_iks(generation, token)
             return
 
@@ -12133,7 +12191,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
                 # previous Run.  Never cancel the shared timer slot here: it
                 # could now be the watchdog for the new generation.
                 return
-            for index in range(2):
+            for index in range(candidate_count):
                 self._stage1_ik_candidate_results.setdefault(
                     index,
                     {
@@ -12149,8 +12207,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             timeout_candidates,
         )
         self.get_logger().info(
-            "[STAGE 1 SYMMETRY] collision-aware IK requested for both "
-            "D405/cable/EOAT orientation branches"
+            f"[STAGE 1 ORIENTATION] collision-aware IK requested for {candidate_count} candidates"
         )
 
     def _stage1_orientation_candidate_ik_done(
@@ -12220,7 +12277,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
                 f"[STAGE 1 SYMMETRY] {candidate['name']} rejected: "
                 f"{record['reason']}"
             )
-        if len(self._stage1_ik_candidate_results) == 2:
+        if len(self._stage1_ik_candidate_results) == len(self._stage1_orientation_candidates):
             self._finish_stage1_orientation_candidate_iks(generation, token)
 
     def _finish_stage1_orientation_candidate_iks(self, generation, token):
@@ -12230,7 +12287,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             or self._motion_abort_requested
         ):
             return
-        if len(self._stage1_ik_candidate_results) != 2:
+        if len(self._stage1_ik_candidate_results) != len(self._stage1_orientation_candidates):
             return
         if self._stage1_ik_candidates_finalized_generation == generation:
             return
@@ -12248,8 +12305,8 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
             if str(record.get("reason", "")).startswith(incomplete_prefixes)
         ]
         if incomplete:
-            # The operator explicitly requires both D405/cable/EOAT variants
-            # to be collision checked.  A transport timeout is not a negative
+            # Every configured candidate must be collision checked.
+            # A transport timeout is not a negative
             # collision result and may not be silently treated as one.
             self._fail_stage1_before_motion(
                 "ROLLER_ORIENTATION_COLLISION_CHECK_INCOMPLETE:"
@@ -12273,7 +12330,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         if not valid:
             reasons = ";".join(
                 str(self._stage1_ik_candidate_results[index].get("reason", ""))
-                for index in range(2)
+                for index in range(len(self._stage1_orientation_candidates))
             )
             self._fail_stage1_before_motion(
                 "NO_COLLISION_FREE_ROLLER_ORIENTATION:" + reasons
@@ -12292,7 +12349,7 @@ class MoveItExecutor(SprayExecutionMixin, MultiSurfaceMixin, Node):
         self._apply_segment_orientation_candidate(record["candidate"])
         self.get_logger().info(
             "[STAGE 1 SYMMETRY] planning branch %s (%d/%d); endpoint "
-            "collision checks for both candidates completed; selected endpoint passed"
+            "collision checks for all candidates completed; selected endpoint passed"
             % (
                 record["candidate"]["name"],
                 int(rank_index) + 1,

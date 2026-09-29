@@ -35,6 +35,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
 from rclpy.time import Time
+from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.qos import (
     DurabilityPolicy,
     HistoryPolicy,
@@ -58,16 +59,22 @@ from rbpodo_painting_control.segment_path import (
     segment_waypoint_position,
     validate_segment_path_for_real_execution,
 )
-from rbpodo_painting_control.spray_path import make_spray_rows
+from rbpodo_painting_control.spray_path import (
+    make_spray_rows, resolve_spray_tool_axis, rotation_from_spray_path,
+    spray_spacing_m,
+)
 from sketch_control.rotation_utils import quat_from_matrix, quat_to_matrix
+from sketch_control.zed_spray_projection import validate_target_lock
 from sketch_control.work_area_geometry import (
     WorkAreaGeometryError,
     bilinear_quad_point,
     generate_fill_strokes,
+    generate_spray_fill_strokes,
     outside_pixel_rect_indices,
     outside_quad_3d_indices,
     pixel_rect_from_points,
     quad_size_m,
+    validate_zed_surface_status,
 )
 
 
@@ -80,6 +87,8 @@ WORK_AREA_PIXELS_TOPIC = "/work_area_pixels"
 WALL_FRONT_EXTENT_TOPIC = "/perception/wall_front_extent"
 WALL_FRONT_IMAGE_TOPIC = "/perception/wall_front_view"
 D405_REFINEMENT_STATUS_TOPIC = "/perception/d405_surface_refinement_status"
+ZED_SURFACE_STATUS_TOPIC = "/perception/zed_surface_status"
+ZED_TARGET_LOCK_TOPIC = "/perception/zed_target_lock"
 WORK_AREA_STATE_TOPIC = "/painting_system/work_area_state"
 WAYPOINTS_TOPIC = "/sketch_waypoints"
 MARKERS_TOPIC = "/sketch_markers"
@@ -124,7 +133,20 @@ class SketchToWaypointsNode(Node):
     def __init__(self):
         super().__init__("sketch_to_waypoints_node")
 
-        self.process_mode = "paint"
+        startup_only = ParameterDescriptor(read_only=True)
+        self.process_mode = str(self.declare_parameter("process_mode", "paint", startup_only).value)
+        if self.process_mode not in {"paint", "spray"}:
+            raise ValueError("process_mode must be paint or spray")
+        self.model_id = str(self.declare_parameter("model_id", "rb10_1300e_u", startup_only).value)
+        self.spray_tool_axis = resolve_spray_tool_axis(
+            self.model_id, self.declare_parameter("spray_tool_axis", "", startup_only).value)
+        self.spray_footprint_width_m = float(self.declare_parameter("spray_footprint_width_m", 0.35, startup_only).value)
+        self.spray_overlap = float(self.declare_parameter("spray_overlap", 0.30, startup_only).value)
+        self.spray_speed_mps = float(self.declare_parameter("spray_speed_mps", 0.020, startup_only).value)
+        self.spray_standoff_m = float(self.declare_parameter("spray_standoff_m", 0.5, startup_only).value)
+        spray_spacing_m(self.spray_footprint_width_m, self.spray_overlap)
+        if any(not math.isfinite(v) or v <= 0 for v in (self.spray_speed_mps, self.spray_standoff_m)):
+            raise ValueError("spray speed and standoff must be finite and positive")
         self.create_subscription(String, "/painting_system/process_mode", self._on_process_mode, LATCHED_QOS)
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -139,6 +161,8 @@ class SketchToWaypointsNode(Node):
         self.latest_work_area_selection_id = ""
         self.current_work_area_id = ""
         self.work_area_invalidation_seq = ""
+        self.zed_surface_status = {}
+        self.zed_target_lock = {}
         self.d405_status = {
             "accepted": False,
             "work_area_id": "",
@@ -303,6 +327,10 @@ class SketchToWaypointsNode(Node):
             LATCHED_QOS,
         )
         self.create_subscription(
+            String, ZED_SURFACE_STATUS_TOPIC, self._on_zed_surface_status, LATCHED_QOS)
+        self.create_subscription(
+            String, ZED_TARGET_LOCK_TOPIC, self._on_zed_target_lock, LATCHED_QOS)
+        self.create_subscription(
             String,
             WORK_AREA_STATE_TOPIC,
             self._on_work_area_state,
@@ -363,9 +391,13 @@ class SketchToWaypointsNode(Node):
         return SetParametersResult(successful=True)
 
     def _on_work_area(self, msg: PoseStamped):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         self.latest_work_area = msg
 
     def _on_refined_work_area(self, msg: PoseStamped):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         if not getattr(self, "d405_refined_pose_armed", False):
             self.get_logger().warn(
                 "arm되지 않은 D405 refined Pose 무시 (stale/extra sample)"
@@ -382,6 +414,18 @@ class SketchToWaypointsNode(Node):
         return bool(getattr(self, "real_painting_enabled", False))
 
     def _current_work_area(self):
+        if getattr(self, "process_mode", "paint") == "spray":
+            status = self._accepted_zed_work_area()
+            if status is None:
+                return None, "zed_required"
+            pose = PoseStamped()
+            pose.header.frame_id = status["frame_id"]
+            pose.header.stamp.sec = status["target_stamp"]["sec"]
+            pose.header.stamp.nanosec = status["target_stamp"]["nanosec"]
+            pose.pose.position.x, pose.pose.position.y, pose.pose.position.z = status["position"]
+            (pose.pose.orientation.x, pose.pose.orientation.y,
+             pose.pose.orientation.z, pose.pose.orientation.w) = status["orientation"]
+            return pose, "zed"
         if self.real_painting_enabled:
             if self.d405_status.get("accepted") and self.latest_refined_work_area is not None:
                 return self.latest_refined_work_area, "d405_refined"
@@ -394,11 +438,19 @@ class SketchToWaypointsNode(Node):
         return self.latest_work_area, "zed"
 
     def _on_work_area_corners(self, msg: PoseArray):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         if len(msg.poses) >= 4:
             self.latest_work_area_corners = msg
 
     def _on_work_area_pixels(self, msg: PoseArray):
+        spray = getattr(self, "process_mode", "paint") == "spray"
+        selection_id = self._stamp_path_id(msg.header.stamp)
+        if spray and selection_id in getattr(self, "_retired_zed_selections", set()):
+            return
         if (msg.header.frame_id or "") != "wall_front":
+            if spray:
+                self._invalidate_zed_selection()
             self._publish_plan_status(
                 "rejected",
                 reason="WORK_AREA_PIXELS_FRAME_INVALID",
@@ -406,14 +458,20 @@ class SketchToWaypointsNode(Node):
             )
             return
         points = [(pose.position.x, pose.position.y) for pose in msg.poses]
+        pending = getattr(self, "zed_surface_status", {}) if spray else {}
+        width, height = self.view_w, self.view_h
+        if pending.get("selection_id") == selection_id:
+            width, height = pending["view_width"], pending["view_height"]
         try:
             rect = pixel_rect_from_points(
                 points,
-                self.view_w,
-                self.view_h,
+                width,
+                height,
                 boundary_tolerance_px=self.work_area_pixel_tolerance_px,
             )
         except WorkAreaGeometryError as exc:
+            if spray:
+                self._invalidate_zed_selection()
             self.latest_work_area_pixels = None
             self.latest_work_area_rect_px = None
             self._publish_plan_status(
@@ -423,10 +481,26 @@ class SketchToWaypointsNode(Node):
         self.latest_work_area_pixels = msg
         self.latest_work_area_rect_px = rect
         self.latest_work_area_selection_time = time.monotonic()
-        selection_id = self._stamp_path_id(msg.header.stamp)
+        if spray and not selection_id:
+            self._invalidate_zed_selection()
+            self._publish_plan_status("rejected", reason="WORK_AREA_SELECTION_STAMP_REQUIRED")
+            return
+        previous_selection = getattr(self, "latest_work_area_selection_id", "")
+        if spray and previous_selection and selection_id != previous_selection:
+            retired = getattr(self, "_retired_zed_selections", set())
+            retired.add(previous_selection)
+            self._retired_zed_selections = retired
         self.latest_work_area_selection_id = selection_id or (
             f"work-area-{time.monotonic_ns()}"
         )
+        if spray:
+            status = getattr(self, "zed_surface_status", {})
+            if status.get("selection_id") != selection_id:
+                self.zed_surface_status = {}
+            self._publish_plan_status("invalidated", reason="WORK_AREA_CHANGED")
+            self._publish_fill_preview(())
+            self._publish_marker_clear(WORLD_FRAME)
+            return
         # A new selection invalidates any previously accepted D405 result until
         # the refiner publishes a status tied to the new work area.
         self.latest_refined_work_area = None
@@ -448,6 +522,8 @@ class SketchToWaypointsNode(Node):
         self._publish_marker_clear(WORLD_FRAME)
 
     def _on_d405_refinement_status(self, msg: String):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         try:
             payload = json.loads(msg.data or "{}")
         except json.JSONDecodeError as exc:
@@ -523,7 +599,133 @@ class SketchToWaypointsNode(Node):
             plane_generation_id=plane_generation_id,
         )
 
+    def _invalidate_zed_selection(self, *, clear_target=False):
+        retired = getattr(self, "_retired_zed_selections", set())
+        selection = getattr(self, "latest_work_area_selection_id", "")
+        if selection:
+            retired.add(selection)
+        self._retired_zed_selections = retired
+        self.zed_surface_status = {}
+        self.latest_work_area_pixels = None
+        self.latest_work_area_rect_px = None
+        self.latest_work_area_selection_id = ""
+        self.current_work_area_id = ""
+        if clear_target:
+            generations = getattr(self, "_retired_zed_generations", set())
+            generation = getattr(self, "zed_target_lock", {}).get("plane_generation_id")
+            if generation:
+                generations.add(generation)
+            self._retired_zed_generations = generations
+            self.zed_target_lock = {}
+
+    def _on_zed_target_lock(self, msg: String):
+        if getattr(self, "process_mode", "paint") != "spray":
+            return
+        try:
+            payload = json.loads(msg.data)
+            target = validate_target_lock(payload)
+            generation = payload.get("plane_generation_id", "")
+            if generation in getattr(self, "_retired_zed_generations", set()):
+                return
+            previous_lock = getattr(self, "zed_target_lock", {})
+            previous = previous_lock.get("plane_generation_id")
+            if generation == previous:
+                if payload != previous_lock:
+                    raise ValueError("ZED geometry changed within a locked generation")
+                return
+            if target["stamp_ns"] <= getattr(self, "_latest_zed_lock_stamp_ns", 0):
+                return
+            if previous and generation != previous:
+                self._invalidate_zed_selection(clear_target=True)
+            self.zed_target_lock = payload
+            self._latest_zed_lock_stamp_ns = target["stamp_ns"]
+        except (TypeError, ValueError):
+            self._invalidate_zed_selection(clear_target=True)
+        self._publish_plan_status("invalidated", reason="ZED_TARGET_CHANGED")
+        self._publish_fill_preview(())
+        self._publish_marker_clear(WORLD_FRAME)
+
+    def _on_zed_surface_status(self, msg: String):
+        if getattr(self, "process_mode", "paint") != "spray":
+            return
+        try:
+            payload = json.loads(msg.data)
+            if isinstance(payload, dict) and (
+                payload.get("selection_id") in getattr(self, "_retired_zed_selections", set())
+                or payload.get("plane_generation_id") in getattr(self, "_retired_zed_generations", set())
+            ):
+                return
+            if isinstance(payload, dict) and payload.get("mode") == "target":
+                # Target lifecycle is owned by zed_target_lock. A target-only
+                # status cannot replace or retire an accepted work area.
+                return
+            if isinstance(payload, dict) and payload.get("accepted") is False:
+                selection = payload.get("selection_id", "")
+                generation = getattr(self, "zed_target_lock", {}).get("plane_generation_id")
+                if (not selection or selection != getattr(self, "latest_work_area_selection_id", "")
+                        or payload.get("plane_generation_id") != generation):
+                    return
+            status = validate_zed_surface_status(payload)
+        except (TypeError, ValueError) as exc:
+            self._invalidate_zed_selection()
+            self._publish_plan_status("invalidated", reason="ZED_WORK_AREA_INVALID", detail=str(exc))
+            self._publish_fill_preview(())
+            self._publish_marker_clear(WORLD_FRAME)
+            return
+        # Keep the whole message, including geometry, while waiting for its
+        # local pixels or target lock to arrive on the independent topics.
+        self.zed_surface_status = status
+        accepted = self._accepted_zed_work_area() is not None
+        self._publish_plan_status(
+            "plane_accepted" if accepted else "invalidated",
+            reason="" if accepted else "ZED_WORK_AREA_WAITING_FOR_IDENTITY",
+            work_area_id=status["work_area_id"],
+            plane_generation_id=status["plane_generation_id"],
+        )
+        self._publish_fill_preview(())
+        self._publish_marker_clear(WORLD_FRAME)
+
+    def _accepted_zed_work_area(self):
+        status = getattr(self, "zed_surface_status", {})
+        lock = getattr(self, "zed_target_lock", {})
+        pixels = getattr(self, "latest_work_area_pixels", None)
+        if (status.get("accepted") is not True or lock.get("accepted") is not True
+                or lock.get("source") != "zed" or lock.get("state") != "locked"
+                or pixels is None or pixels.header.frame_id != "wall_front"
+                or status.get("selection_id") != self._stamp_path_id(pixels.header.stamp)
+                or status.get("selection_id") != getattr(self, "latest_work_area_selection_id", "")
+                or status.get("plane_generation_id") != lock.get("plane_generation_id")
+                or status.get("target_stamp") != lock.get("stamp")
+                or status.get("frame_id") != lock.get("frame_id")):
+            return None
+        try:
+            validate_zed_surface_status(status)
+            target = validate_target_lock(lock)
+            normal = _quat_to_rot(*status["orientation"])[:, 2]
+            if (np.dot(normal, target["normal"]) < 0.999
+                    or outside_quad_3d_indices(status["front_extent"], target["corners"])):
+                return None
+            rect = pixel_rect_from_points(
+                [(pose.position.x, pose.position.y) for pose in pixels.poses],
+                status["view_width"], status["view_height"],
+                boundary_tolerance_px=getattr(self, "work_area_pixel_tolerance_px", 1.0),
+            )
+            u0, v0, u1, v1 = rect
+            expected = [bilinear_quad_point(
+                status["front_extent"], u / (status["view_width"] - 1),
+                v / (status["view_height"] - 1))
+                for u, v in ((u0, v0), (u1, v0), (u1, v1), (u0, v1))]
+            if np.max(np.linalg.norm(np.asarray(expected) - status["corners"], axis=1)) > 0.002:
+                return None
+        except (TypeError, ValueError):
+            return None
+        self.latest_work_area_rect_px = rect
+        self.view_w, self.view_h = status["view_width"], status["view_height"]
+        return status
+
     def _on_work_area_state(self, msg: String):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         try:
             payload = json.loads(msg.data or "{}")
         except json.JSONDecodeError as exc:
@@ -564,7 +766,10 @@ class SketchToWaypointsNode(Node):
 
     @staticmethod
     def _stamp_path_id(stamp) -> str:
-        stamp_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+        sec, nanosec = int(stamp.sec), int(stamp.nanosec)
+        if sec < 0 or not 0 <= nanosec < 1_000_000_000:
+            return ""
+        stamp_ns = sec * 1_000_000_000 + nanosec
         return str(stamp_ns) if stamp_ns > 0 else ""
 
     def _publish_plan_status(self, state, reason="", **fields):
@@ -587,6 +792,12 @@ class SketchToWaypointsNode(Node):
             publisher.publish(status)
 
     def _segment_context(self):
+        if getattr(self, "process_mode", "paint") == "spray":
+            status = self._accepted_zed_work_area()
+            if status is None:
+                self._publish_plan_status("rejected", reason="ZED_WORK_AREA_REQUIRED")
+                return None
+            return status["work_area_id"], status["plane_generation_id"]
         status = getattr(self, "d405_status", {}) or {}
         accepted = bool(status.get("accepted", False))
         work_area_id = str(status.get("work_area_id", "")).strip()
@@ -622,10 +833,15 @@ class SketchToWaypointsNode(Node):
         return work_area_id, plane_generation_id
 
     def _on_front_extent(self, msg: PoseArray):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         if len(msg.poses) >= 4:
             self.latest_front_extent = msg
 
     def _on_wall_front_image(self, msg: Image):
+        if (getattr(self, "process_mode", "paint") == "spray"
+                and getattr(self, "zed_surface_status", {}).get("accepted") is True):
+            return
         if msg.width <= 0 or msg.height <= 0:
             return
         if msg.width != self.view_w or msg.height != self.view_h:
@@ -634,11 +850,19 @@ class SketchToWaypointsNode(Node):
             self.get_logger().info(
                 f"wall_front view size 갱신: {self.view_w}x{self.view_h}")
 
-    def _on_sketch(self, msg: PoseArray):
+    def _on_sketch(self, msg: PoseArray, *, _spray_fill=False):
         # A fill preview represents an executable backend plan, not merely a
         # raster candidate. Any new path attempt invalidates the old preview;
         # the fill callback republishes it only after this method succeeds.
         self._publish_fill_preview((), stamp=msg.header.stamp)
+        spray = getattr(self, "process_mode", "paint") == "spray"
+        if spray and not _spray_fill:
+            self._publish_plan_status("rejected", reason="SPRAY_AUTO_COVERAGE_REQUIRED")
+            return
+        zed_status = self._accepted_zed_work_area() if spray else None
+        if spray and zed_status is None:
+            self._publish_plan_status("rejected", reason="ZED_WORK_AREA_REQUIRED")
+            return
         view = msg.header.frame_id or ""
         if view != "wall_front":
             self.get_logger().warn(
@@ -729,12 +953,16 @@ class SketchToWaypointsNode(Node):
         normal_world = T_wc[:3, :3] @ normal_cam
         normal_world /= np.linalg.norm(normal_world) + 1e-12
 
-        front_corners_world = self._pose_array_corners_world(
-            self.latest_front_extent, T_wc, source_frame
-        )
-        selected_corners_world = self._pose_array_corners_world(
-            self.latest_work_area_corners, T_wc, source_frame
-        )
+        if spray:
+            front_corners_world = np.asarray(zed_status["front_extent"]) @ T_wc[:3, :3].T + T_wc[:3, 3]
+            selected_corners_world = np.asarray(zed_status["corners"]) @ T_wc[:3, :3].T + T_wc[:3, 3]
+        else:
+            front_corners_world = self._pose_array_corners_world(
+                self.latest_front_extent, T_wc, source_frame
+            )
+            selected_corners_world = self._pose_array_corners_world(
+                self.latest_work_area_corners, T_wc, source_frame
+            )
         if front_corners_world is None or selected_corners_world is None:
             self.get_logger().error(
                 "wall-front extent/work-area 3D corners 없음 또는 frame 불일치")
@@ -805,6 +1033,7 @@ class SketchToWaypointsNode(Node):
                 "view": view,
                 "plane": work_area_source,
                 "surface_point_count": len(surface_points),
+                **({"coverage": "auto_fill"} if spray else {}),
             },
         )
         if path is None:
@@ -823,6 +1052,10 @@ class SketchToWaypointsNode(Node):
         return path
 
     def _on_fill_work_area(self, _msg: Empty):
+        spray = getattr(self, "process_mode", "paint") == "spray"
+        if spray and self._segment_context() is None:
+            self._publish_fill_preview(())
+            return
         rect = self.latest_work_area_rect_px
         if rect is None:
             self._publish_fill_preview(())
@@ -833,13 +1066,16 @@ class SketchToWaypointsNode(Node):
             return
         try:
             width_m, height_m = self._current_work_area_size_m()
-            strokes = generate_fill_strokes(
-                rect,
-                work_area_width_m=width_m,
-                work_area_height_m=height_m,
-                roller_length_m=self.roller_length_m,
-                overlap=self.fill_overlap,
-            )
+            if spray:
+                footprint, overlap = self.spray_footprint_width_m, self.spray_overlap
+                strokes = generate_spray_fill_strokes(
+                    rect, work_area_width_m=width_m, work_area_height_m=height_m,
+                    footprint_width_m=footprint, overlap=overlap)
+            else:
+                footprint, overlap = self.roller_length_m, self.fill_overlap
+                strokes = generate_fill_strokes(
+                    rect, work_area_width_m=width_m, work_area_height_m=height_m,
+                    roller_length_m=footprint, overlap=overlap)
         except WorkAreaGeometryError as exc:
             self._publish_fill_preview(())
             self.get_logger().error(f"[FILL] 거부: {exc}")
@@ -863,16 +1099,16 @@ class SketchToWaypointsNode(Node):
 
         self.get_logger().info(
             "[FILL] generated %d strokes inside selected work area "
-            "(roller=%.0fmm, overlap=%.0f%%, area=%.3fx%.3fm)"
+            "(footprint=%.0fmm, overlap=%.0f%%, area=%.3fx%.3fm)"
             % (
                 len(strokes),
-                self.roller_length_m * 1000.0,
-                self.fill_overlap * 100.0,
+                footprint * 1000.0,
+                overlap * 100.0,
                 width_m,
                 height_m,
             )
         )
-        path = self._on_sketch(fill_msg)
+        path = self._on_sketch(fill_msg, _spray_fill=True) if spray else self._on_sketch(fill_msg)
         if path is None:
             self._publish_fill_preview((), stamp=fill_msg.header.stamp)
             return
@@ -897,6 +1133,11 @@ class SketchToWaypointsNode(Node):
             publisher.publish(preview)
 
     def _current_work_area_size_m(self):
+        if getattr(self, "process_mode", "paint") == "spray":
+            status = self._accepted_zed_work_area()
+            if status is None:
+                raise WorkAreaGeometryError("accepted selected ZED work area is required")
+            return quad_size_m(status["corners"])
         msg = self.latest_work_area_corners
         if msg is None or len(msg.poses) < 4:
             raise WorkAreaGeometryError("selected work-area 3D corners are unavailable")
@@ -952,7 +1193,8 @@ class SketchToWaypointsNode(Node):
                 timeout=Duration(seconds=0.2),
             )
         except TransformException as exc:
-            if getattr(self, "real_painting_enabled", False):
+            if (getattr(self, "real_painting_enabled", False)
+                    or getattr(self, "process_mode", "paint") == "spray"):
                 self.get_logger().error(
                     "[EOAT SEGMENTS] real mode TF 실패 (%s<-%s): %s"
                     % (target_frame, WORLD_FRAME, exc)
@@ -978,6 +1220,14 @@ class SketchToWaypointsNode(Node):
         if mode not in {"paint", "spray"} or mode == self.process_mode:
             return
         self.process_mode = mode
+        self._invalidate_zed_selection(clear_target=True)
+        self.latest_work_area = None
+        self.latest_work_area_corners = None
+        self.latest_front_extent = None
+        self.latest_refined_work_area = None
+        self.d405_status = {"accepted": False, "reason": "process_mode_changed"}
+        self.d405_refined_pose_armed = False
+        self.d405_refined_pose_generation_id = ""
         self._publish_plan_status("invalidated", reason="PROCESS_MODE_CHANGED")
         self._publish_fill_preview(())
         self._publish_marker_clear(self.eoat_segment_frame or WORLD_FRAME)
@@ -994,6 +1244,17 @@ class SketchToWaypointsNode(Node):
         if context is None:
             return None
         work_area_id, plane_generation_id = context
+        spray = getattr(self, "process_mode", "paint") == "spray"
+        if spray:
+            if (source.get("coverage") != "auto_fill" or source.get("plane") != "zed"
+                    or source.get("view") != "wall_front"):
+                self._publish_plan_status("rejected", reason="SPRAY_AUTO_COVERAGE_REQUIRED")
+                return None
+            try:
+                strokes, normal_world, fallback_tangent = self._spray_coverage_world()
+            except (ValueError, TransformException) as exc:
+                self._publish_plan_status("rejected", reason="SPRAY_COVERAGE_INVALID", detail=str(exc))
+                return None
         transform = self._segment_frame_transform()
         if transform is None:
             self._publish_plan_status(
@@ -1001,6 +1262,11 @@ class SketchToWaypointsNode(Node):
             )
             return None
         frame_id, rot, trans = transform
+        if spray and (not np.all(np.isfinite(rot)) or not np.all(np.isfinite(trans))
+                      or not np.allclose(rot.T @ rot, np.eye(3), atol=1e-6)
+                      or np.linalg.det(rot) < 0.999999):
+            self._publish_plan_status("rejected", reason="SEGMENT_FINAL_FRAME_TF_INVALID")
+            return None
         normal = rot @ np.asarray(normal_world, dtype=float)
         normal /= np.linalg.norm(normal) + 1e-12
 
@@ -1021,7 +1287,7 @@ class SketchToWaypointsNode(Node):
             self._publish_plan_status("rejected", reason="EMPTY_PATH")
             return None
         rows = []
-        for idx, stroke in enumerate(valid_strokes):
+        for idx, stroke in enumerate([] if spray else valid_strokes):
             tangent_world = self._stroke_tangent(stroke, fallback_tangent)
             tangent = _tf_tangent(tangent_world)
             start = _tf_point(stroke[0])
@@ -1139,17 +1405,38 @@ class SketchToWaypointsNode(Node):
                     )
                 )
 
-        spray = getattr(self, "process_mode", "paint") == "spray"
+        spray_metadata = {}
+        plan_source = dict(source)
         if spray:
             try:
+                if source.get("plane") != "zed" or source.get("view") != "wall_front":
+                    raise ValueError("spray path source must be ZED wall_front")
+                spray_metadata = {
+                    "model_id": self.model_id,
+                    "spray_tool_axis": resolve_spray_tool_axis(self.model_id, self.spray_tool_axis),
+                    "spray_footprint_width_m": float(self.spray_footprint_width_m),
+                    "spray_overlap": float(self.spray_overlap),
+                    "spray_spacing_m": spray_spacing_m(self.spray_footprint_width_m, self.spray_overlap),
+                    "spray_speed_mps": float(self.spray_speed_mps),
+                    "spray_standoff_m": float(self.spray_standoff_m),
+                }
                 rows = make_spray_rows(valid_strokes, normal, fallback_tangent,
                     _tf_point, _tf_tangent, self._segment_row,
-                    self.paint_speed_mps, self.travel_speed_mps)
-            except ValueError as exc:
+                    self.spray_speed_mps, self.travel_speed_mps, self.spray_standoff_m)
+                plan_source.update(
+                    spray_metadata,
+                    work_area_id=work_area_id,
+                    plane_generation_id=plane_generation_id,
+                    selection_id=self.latest_work_area_selection_id,
+                )
+            except (TypeError, ValueError) as exc:
                 self._publish_plan_status("rejected", reason=str(exc))
                 return None
+        else:
+            plan_source["roller_usable_length_m"] = float(self.roller_length_m)
         payload = attach_plan_hash(
             {
+                **spray_metadata,
                 "version": SEGMENT_SCHEMA_VERSION,
                 "process_mode": "spray" if spray else "paint",
                 "frame_id": frame_id,
@@ -1159,12 +1446,12 @@ class SketchToWaypointsNode(Node):
                 "plane_generation_id": plane_generation_id,
                 "point_semantics": "surface_point",
                 "contact_geometry_offset_m": float(
-                    self.contact_geometry_offset_m
+                    0.0 if spray else self.contact_geometry_offset_m
                 ),
-                "precontact_clearance_m": float(0.5 if spray else self.precontact_clearance_m),
-                "travel_clearance_m": float(0.5 if spray else self.travel_clearance_m),
-                "safety_approach_offset_m": float(0.5 if spray else self.safety_approach_offset_m),
-                "final_retreat_offset_m": float(0.5 if spray else self.final_retreat_offset_m),
+                "precontact_clearance_m": float(self.spray_standoff_m if spray else self.precontact_clearance_m),
+                "travel_clearance_m": float(self.spray_standoff_m if spray else self.travel_clearance_m),
+                "safety_approach_offset_m": float(self.spray_standoff_m if spray else self.safety_approach_offset_m),
+                "final_retreat_offset_m": float(self.spray_standoff_m if spray else self.final_retreat_offset_m),
                 "contact_search_max_distance_m": float(
                     self.contact_search_max_distance_m
                 ),
@@ -1172,13 +1459,12 @@ class SketchToWaypointsNode(Node):
                     self.contact_search_timeout_s
                 ),
                 "normal_axis": "surface_z",
-                "tcp_normal_axis": "+y",
+                "tcp_normal_axis": spray_metadata["spray_tool_axis"] if spray else "+y",
                 "tangent_semantics": "paint_motion_direction",
                 "preserve_orientation_continuity": True,
                 "rows": rows,
                 "source": {
-                    **dict(source),
-                    "roller_usable_length_m": float(self.roller_length_m),
+                    **plan_source,
                     "real_painting_enabled": bool(
                         getattr(self, "real_painting_enabled", False)
                     ),
@@ -1237,6 +1523,36 @@ class SketchToWaypointsNode(Node):
         )
         return path
 
+    def _spray_coverage_world(self):
+        """Rebuild spray strokes from the atomic surface, never caller geometry."""
+        status = self._accepted_zed_work_area()
+        if status is None:
+            raise WorkAreaGeometryError("accepted selected ZED work area is required")
+        width, height = quad_size_m(status["corners"])
+        pixels = generate_spray_fill_strokes(
+            self.latest_work_area_rect_px,
+            work_area_width_m=width, work_area_height_m=height,
+            footprint_width_m=self.spray_footprint_width_m, overlap=self.spray_overlap,
+        )
+        rotation, translation = np.eye(3), np.zeros(3)
+        if status["frame_id"] != WORLD_FRAME:
+            transform = self.tf_buffer.lookup_transform(
+                WORLD_FRAME, status["frame_id"], Time(), timeout=Duration(seconds=0.5))
+            q, t = transform.transform.rotation, transform.transform.translation
+            quaternion = np.array([q.x, q.y, q.z, q.w])
+            if (not np.all(np.isfinite(quaternion))
+                    or abs(np.linalg.norm(quaternion) - 1.0) > .001):
+                raise WorkAreaGeometryError("spray surface transform quaternion is invalid")
+            rotation = _quat_to_rot(q.x, q.y, q.z, q.w)
+            translation = np.array([t.x, t.y, t.z])
+            if not np.all(np.isfinite(translation)):
+                raise WorkAreaGeometryError("spray surface transform translation is invalid")
+        surface_rotation = _quat_to_rot(*status["orientation"])
+        normal = rotation @ surface_rotation[:, 2]
+        strokes = [[rotation @ self._bilinear_point(status["front_extent"], u, v) + translation
+                    for u, v in stroke] for stroke in pixels]
+        return strokes, normal, rotation @ surface_rotation[:, 0]
+
     @staticmethod
     def _segment_row(mode, point, normal, tangent, force_n, offset_m, speed_mps):
         return {
@@ -1285,11 +1601,13 @@ class SketchToWaypointsNode(Node):
             if row.mode not in MOTION_MODES:
                 continue
             position = segment_waypoint_position(path, row)
-            rotation = rotation_from_surface_path(
-                row.normal,
-                row.tangent,
-                previous_tcp_x=previous_tcp_x,
-            )
+            if path.process_mode == "spray":
+                rotation = rotation_from_spray_path(
+                    row.normal, row.tangent, path.spray_tool_axis,
+                    previous_tcp_x=previous_tcp_x)
+            else:
+                rotation = rotation_from_surface_path(
+                    row.normal, row.tangent, previous_tcp_x=previous_tcp_x)
             previous_tcp_x = rotation[:, 0].copy()
             qx, qy, qz, qw = quat_from_matrix(rotation)
             pose = Pose()

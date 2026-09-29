@@ -66,10 +66,24 @@ Supervisor는 각 프로세스에 해당 그룹만 켭니다.
 | `spray_motion_test` | 실제 연결·현재 EOAT | 뿜칠 경로 실제 이동, 분사 항상 OFF | 꺼짐·뿜칠 모드 고정 |
 | `fake` | 가상 하드웨어 | 모의 실행 | 꺼짐 |
 
-`work`는 기존 통합 launch의 `real_painting_enabled=true`, `dry_run=false`,
-`painting_force_enabled=true`를 전달합니다. 서버 시작이나 prepare는 작업 경로를 제출하지 않습니다.
-도장/뿜칠 선택은 스케치 화면에서 하며 뿜칠의 F/T 미사용, 50cm 이격,
-건 ON/OFF 규칙은 기존 executor가 처리합니다. `fake`의 카메라/RViz 시작 기본값은 false입니다.
+`work`의 기본 공정은 `process_mode=paint`이며 기존 통합 launch의
+`real_painting_enabled=true`, `dry_run=false`, `painting_force_enabled=true`를 전달합니다.
+`process_mode=spray`로 시작하면 힘 제어는 false이고 ZED만 사용합니다.
+D405 장치 ID·시리얼·보정은 필요하지 않으며 D405 드라이버 요청도 false로 정규화합니다.
+`spray_motion_test`는 공정 생략 시 Spray를 선택하고 명시적인 Paint 요청은 거부합니다.
+서버 시작이나 prepare는 작업 경로를 제출하지 않습니다. `fake`의 카메라/RViz 시작 기본값은 false입니다.
+
+`POST /configuration`에 `process_mode`를 포함합니다. 예를 들어 로봇 연결 없는 설정은
+`{"profile":"fake","process_mode":"spray"}`입니다. 일반 실작업 설정은
+`{"profile":"work","process_mode":"spray"}`에 해당 현장의 모델/IP 및 ZED 장치 식별을 더합니다.
+기본값은 Paint이며 공정은 모든 launch 그룹에 전달됩니다. Spray에서 perception의
+필수 노드는 `target_selector`, `wall_projector`, `sketch_to_waypoints`이고 Paint는
+`d405_surface_refiner`를 추가로 요구합니다. ZED 장치 검사는 두 공정 모두 유지합니다.
+
+시작 공정 변경은 전체 종료 상태에서만 가능합니다. 라이브 `/painting_system/process_mode`는
+실행기가 확정한 상태이며 카메라 프로세스를 재구성하지 않습니다. 처음부터 Spray로 시작했다면
+Paint는 전체 종료 후 재시작해야 합니다. 뿜칠은 F/T 미사용, 노즐 기준 정확히 50 cm 이격,
+모델별 공구 축과 건 ON/OFF 규칙을 사용합니다. [9단계 흐름](MULTI_PLANE_SPRAY.md)을 참고하세요.
 
 설정은 전체 종료 상태에서 관리 화면 또는 `POST /configuration`으로 바꿉니다.
 **로봇 모델**에서 RB10-1300E 또는 RB20-1900ES를 선택합니다. 기본값은 RB10입니다.

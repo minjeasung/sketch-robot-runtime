@@ -1,7 +1,6 @@
 """FastAPI supervisor for the sketch robot, following SNUCEM runtime conventions."""
 import argparse
 from contextlib import asynccontextmanager
-import fcntl
 import ipaddress
 import os
 from pathlib import Path
@@ -20,6 +19,7 @@ from .outpost_camera import get_json
 class ConfigurationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     profile: str = "dry_run"
+    process_mode: str | None = None
     robot_ip: str = "10.0.2.7"
     model_id: str = "rb10_1300e_u"
     launch_rviz: StrictBool | None = None
@@ -170,7 +170,7 @@ def main():
     options = {"profile": os.environ.get("SKETCH_PROFILE", "dry_run"),
                "robot_ip": os.environ.get("SKETCH_ROBOT_IP", "10.0.2.7"),
                "model_id": os.environ.get("SKETCH_MODEL_ID", "rb10_1300e_u")}
-    for key in ('camera_backend', 'outpost_http', 'outpost_zed_hw_id', 'outpost_zed_serial',
+    for key in ('process_mode', 'camera_backend', 'outpost_http', 'outpost_zed_hw_id', 'outpost_zed_serial',
                 'outpost_d405_hw_id', 'outpost_d405_serial'):
         value = os.environ.get('SKETCH_' + key.upper())
         if value is not None:
@@ -181,6 +181,8 @@ def main():
             if value.lower() not in ("true", "false"):
                 parser.error(f"SKETCH_{key.upper()} must be true or false")
             options[key] = value.lower() == "true"
+    import fcntl
+
     with (runtime / "server.lock").open("w") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

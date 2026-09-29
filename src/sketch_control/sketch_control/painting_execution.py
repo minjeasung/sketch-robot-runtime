@@ -308,6 +308,8 @@ def real_plan_gate_blockers(
     segment_plane_generation_id: str,
     current_plane_generation_id: str,
     d405_plane_accepted: bool,
+    process_mode: str = "paint",
+    zed_plane_accepted: bool = False,
 ) -> tuple[str, ...]:
     """Check runtime identities without any receive-time heuristic."""
 
@@ -337,8 +339,12 @@ def real_plan_gate_blockers(
         and accepted_plan_path_id != segment_path_id
     ):
         blockers.append("ACCEPTED_PLAN_PATH_ID_MISMATCH")
-    if not d405_plane_accepted:
+    if process_mode == "spray" and not zed_plane_accepted:
+        blockers.append("ZED_PLANE_NOT_ACCEPTED")
+    elif process_mode == "paint" and not d405_plane_accepted:
         blockers.append("D405_PLANE_NOT_ACCEPTED")
+    elif process_mode not in {"paint", "spray"}:
+        blockers.append("PROCESS_MODE_INVALID")
     if (
         segment_work_area_id
         and current_work_area_id

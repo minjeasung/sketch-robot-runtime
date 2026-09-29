@@ -4,7 +4,7 @@ import math
 from pathlib import Path
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, RegisterEventHandler, EmitEvent
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, RegisterEventHandler, EmitEvent, SetLaunchConfiguration
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch.conditions import IfCondition
@@ -14,19 +14,24 @@ from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 from launch_ros.parameter_descriptions import ParameterValue
 from sketch_control.outpost_camera import camera_status
+from sketch_control.robot_models import validate_process_mode, process_cameras
 
 
 def _validate_camera_backend(context):
+    process_mode = validate_process_mode(LaunchConfiguration('process_mode').perform(context))
     backend = LaunchConfiguration('camera_backend').perform(context)
     if backend not in ('native', 'outpost'):
         raise ValueError('camera_backend must be native or outpost')
     if backend == 'outpost':
-        for name, kind in (('zed', 'zed'), ('d405', 'realsense')):
+        for name, kind in process_cameras(process_mode):
             if LaunchConfiguration(f'launch_{name}_driver').perform(context).lower() == 'true':
                 raise ValueError('Outpost must be the sole camera owner; disable native drivers')
             camera_status(LaunchConfiguration('outpost_http').perform(context),
                           LaunchConfiguration(f'outpost_{name}_hw_id').perform(context),
                           LaunchConfiguration(f'outpost_{name}_serial').perform(context), kind)
+    if process_mode == 'spray':
+        return [SetLaunchConfiguration('launch_d405_driver', 'false'),
+                SetLaunchConfiguration('front_view_source', 'zed')]
     return []
 
 
@@ -102,6 +107,10 @@ def _load_ft_defaults():
 def generate_launch_description():
     ft_defaults = _load_ft_defaults()
     is_outpost = PythonExpression(["'", LaunchConfiguration('camera_backend'), "' == 'outpost'"])
+    is_outpost_paint = PythonExpression([
+        "'", LaunchConfiguration('camera_backend'), "' == 'outpost' and '",
+        LaunchConfiguration('process_mode'), "' == 'paint'",
+    ])
     # One OS process per physical camera: global ZED processing cannot stall
     # D405 close-range refinement, while both retain the legacy Sketch ROS topics.
     outpost_zed_bridge = Node(
@@ -120,7 +129,7 @@ def generate_launch_description():
     outpost_d405_bridge = Node(
         package='sketch_control', executable='outpost_bridge',
         name='sketch_outpost_d405_bridge', output='screen',
-        condition=IfCondition(is_outpost),
+        condition=IfCondition(is_outpost_paint),
         parameters=[{
             'camera_name': 'd405',
             'outpost_http': ParameterValue(LaunchConfiguration('outpost_http'), value_type=str),
@@ -226,7 +235,10 @@ def generate_launch_description():
                 "rs_launch.py",
             ])
         ),
-        condition=IfCondition(launch_d405_driver),
+        condition=IfCondition(PythonExpression([
+            "'", LaunchConfiguration('process_mode'), "' == 'paint' and '",
+            launch_d405_driver, "'.lower() in ('true', '1', 'yes', 'on')",
+        ])),
         launch_arguments={
             "camera_namespace": "d405",
             "camera_name": "d405",
@@ -286,6 +298,9 @@ def generate_launch_description():
         ),
         launch_arguments={
             "painting_config_file": painting_config_file,
+            **{key: LaunchConfiguration(key) for key in
+               ('process_mode', 'model_id', 'spray_tool_axis', 'spray_footprint_width_m',
+                'spray_overlap', 'spray_speed_mps', 'spray_standoff_m')},
             "real_painting_enabled": real_painting_enabled,
             "dry_run": dry_run,
             "use_sim_depth_pointcloud": "false",
@@ -332,6 +347,13 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument('process_mode', default_value='paint', choices=['paint', 'spray']),
+        DeclareLaunchArgument('model_id', default_value='rb10_1300e_u'),
+        DeclareLaunchArgument('spray_tool_axis', default_value=''),
+        DeclareLaunchArgument('spray_footprint_width_m', default_value='0.35'),
+        DeclareLaunchArgument('spray_overlap', default_value='0.30'),
+        DeclareLaunchArgument('spray_speed_mps', default_value='0.020'),
+        DeclareLaunchArgument('spray_standoff_m', default_value='0.5'),
         DeclareLaunchArgument('camera_backend', default_value='outpost'),
         DeclareLaunchArgument('outpost_http', default_value='http://127.0.0.1:8100'),
         *[DeclareLaunchArgument(key, default_value='') for key in
@@ -666,7 +688,7 @@ def generate_launch_description():
             target_action=outpost_d405_bridge,
             on_exit=[EmitEvent(event=Shutdown(
                 reason='Outpost D405 bridge stopped; perception invalid'))],
-        )),
+        ), condition=IfCondition(is_outpost_paint)),
         outpost_zed_bridge,
         outpost_d405_bridge,
         zed_driver,

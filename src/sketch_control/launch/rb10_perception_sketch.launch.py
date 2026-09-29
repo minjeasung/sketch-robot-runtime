@@ -3,13 +3,14 @@ import os
 from pathlib import Path
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, OpaqueFunction, SetLaunchConfiguration
 from launch.conditions import IfCondition
 from launch.logging import get_logger
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
+from sketch_control.robot_models import validate_process_mode
 
 
 DEFAULT_ZED_CALIBRATION_FILE = (
@@ -49,6 +50,17 @@ def _quat_normalize(q):
 
 def _is_truthy(value):
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _configure_process(context):
+    process_mode = validate_process_mode(LaunchConfiguration('process_mode').perform(context))
+    if process_mode == 'paint':
+        return []
+    disabled = ('use_sim_d405_depth_pointcloud', 'use_d405_refinement',
+                'use_d405_mount_tf', 'use_d405_optical_tf', 'use_d405_calibration_file',
+                'use_ft_normal_controller')
+    return [SetLaunchConfiguration(key, 'false') for key in disabled] + [
+        SetLaunchConfiguration('front_view_source', 'zed')]
 
 
 def _load_zed_optical_pose(context):
@@ -226,6 +238,8 @@ def _make_zed_static_tfs(context, *args, **kwargs):
 
 
 def _make_d405_mount_static_tf(context, *args, **kwargs):
+    if LaunchConfiguration('process_mode').perform(context) == 'spray':
+        return []
     if not _is_truthy(LaunchConfiguration("use_d405_mount_tf").perform(context)):
         return []
 
@@ -360,6 +374,7 @@ def generate_launch_description():
             painting_config_file,
             {
                 "front_view_source": LaunchConfiguration("front_view_source"),
+                "process_mode": ParameterValue(LaunchConfiguration('process_mode'), value_type=str),
             },
         ],
     )
@@ -376,6 +391,11 @@ def generate_launch_description():
                     real_painting_enabled, value_type=bool
                 ),
                 "dry_run": ParameterValue(dry_run, value_type=bool),
+                "process_mode": ParameterValue(LaunchConfiguration('process_mode'), value_type=str),
+                "model_id": ParameterValue(LaunchConfiguration('model_id'), value_type=str),
+                "spray_tool_axis": ParameterValue(LaunchConfiguration('spray_tool_axis'), value_type=str),
+                **{key: ParameterValue(LaunchConfiguration(key), value_type=float) for key in
+                   ('spray_footprint_width_m', 'spray_overlap', 'spray_speed_mps', 'spray_standoff_m')},
             },
         ],
     )
@@ -395,7 +415,9 @@ def generate_launch_description():
         name="d405_surface_refiner",
         output="screen",
         condition=IfCondition(use_d405_refinement),
-        parameters=[painting_config_file],
+        parameters=[painting_config_file, {
+            'process_mode': ParameterValue(LaunchConfiguration('process_mode'), value_type=str),
+        }],
     )
 
     ft_normal_controller = Node(
@@ -427,6 +449,13 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument('process_mode', default_value='paint', choices=['paint', 'spray']),
+        DeclareLaunchArgument('model_id', default_value='rb10_1300e_u'),
+        DeclareLaunchArgument('spray_tool_axis', default_value=''),
+        DeclareLaunchArgument('spray_footprint_width_m', default_value='0.35'),
+        DeclareLaunchArgument('spray_overlap', default_value='0.30'),
+        DeclareLaunchArgument('spray_speed_mps', default_value='0.020'),
+        DeclareLaunchArgument('spray_standoff_m', default_value='0.5'),
         DeclareLaunchArgument(
             "painting_config_file",
             default_value=PathJoinSubstitution([
@@ -673,6 +702,7 @@ def generate_launch_description():
                 "또는 'zed'(기존 ZED warp, 회귀용)"
             ),
         ),
+        OpaqueFunction(function=_configure_process),
         zed_static_tfs,
         d405_mount_static_tf,
         static_d405_optical_tf,

@@ -39,6 +39,11 @@ from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import Empty, String
 from tf2_ros import Buffer, TransformListener, TransformException
 
+from sketch_control.zed_spray_projection import (
+    plane_orientation, project_target_rectangle, select_work_area, stamp_ns,
+    validate_target_lock, validate_work_area_request,
+)
+
 
 # ---- 파라미터 ----------------------------------------------------------------
 INPUT_IMAGE_TOPIC = "/zed/zed_node/rgb/color/rect/image"
@@ -56,6 +61,10 @@ WORK_AREA_CORNERS_TOPIC = "/perception/work_area_corners"
 WALL_FRONT_EXTENT_TOPIC = "/perception/wall_front_extent"
 WORK_AREA_STATE_TOPIC = "/painting_system/work_area_state"
 FILL_PREVIEW_TOPIC = "/painting_system/fill_preview_pixels"
+ZED_TARGET_LOCK_TOPIC = "/perception/zed_target_lock"
+ZED_SURFACE_STATUS_TOPIC = "/perception/zed_surface_status"
+ZED_WORK_AREA_REQUEST_TOPIC = "/painting_system/zed_work_area_request"
+PROCESS_MODE_TOPIC = "/painting_system/process_mode"
 
 # D405 (eye-in-hand) color stream — used to build an undistorted frontal view of
 # the target plane that the operator draws the work area on.
@@ -256,6 +265,14 @@ class WallProjectorNode(Node):
     def __init__(self):
         super().__init__("wall_projector_node")
 
+        self.process_mode = str(self.declare_parameter("process_mode", "paint").value)
+        if self.process_mode not in {"paint", "spray"}:
+            raise ValueError("process_mode must be paint or spray")
+        self.create_subscription(String, PROCESS_MODE_TOPIC, self._on_process_mode, LATCHED_QOS)
+        self.create_subscription(String, ZED_TARGET_LOCK_TOPIC, self._on_zed_target_lock, LATCHED_QOS)
+        self.create_subscription(
+            String, ZED_WORK_AREA_REQUEST_TOPIC, self._on_zed_work_area_request, 10)
+
         self.create_subscription(
             Image, INPUT_IMAGE_TOPIC, self._on_image, qos_profile_sensor_data)
         self.create_subscription(
@@ -309,6 +326,7 @@ class WallProjectorNode(Node):
             PoseArray, WALL_FRONT_EXTENT_TOPIC, LATCHED_QOS)
         self.work_area_state_pub = self.create_publisher(
             String, WORK_AREA_STATE_TOPIC, LATCHED_QOS)
+        self.zed_status_pub = self.create_publisher(String, ZED_SURFACE_STATUS_TOPIC, LATCHED_QOS)
 
         self.K = None
         self.d405_K = None
@@ -331,6 +349,17 @@ class WallProjectorNode(Node):
         self._warned_K_missing = False
         self._yellow_warn_count = 0
         self._d405_warn_count = 0
+        self._zed_target = None
+        self._zed_target_stamp_ns = 0
+        self._zed_selection_stamp_ns = 0
+        self._zed_front_generation = ""
+        self._zed_front_stamp_ns = 0
+        self._zed_image_stamp_ns = 0
+        self._zed_first_front_stamp_ns = 0
+        self._zed_last_status = None
+        self._zed_info_frame = ""
+        self._zed_info_size = None
+        self._invalidate_zed("startup", clear_target=True)
 
         self.get_logger().info(
             f"wall_projector_node 시작 (front_view_source={self.front_view_source})\n"
@@ -346,13 +375,264 @@ class WallProjectorNode(Node):
             f"D405 frontal / yellow / sketch work area)\n"
             f"       {WORK_AREA_TOPIC}, {WORK_AREA_CORNERS_TOPIC}")
 
+    def _on_process_mode(self, msg: String):
+        try:
+            payload = json.loads(msg.data)
+            mode = payload.get("mode") if isinstance(payload, dict) else payload
+        except (ValueError, TypeError):
+            mode = msg.data
+        if not isinstance(mode, str) or mode not in {"paint", "spray"} or mode == self.process_mode:
+            return
+        self._invalidate_zed("process mode changed", clear_target=True)
+        self._zed_target_stamp_ns = max(
+            self._zed_target_stamp_ns, self.get_clock().now().nanoseconds)
+        self.process_mode = mode
+
+    def _emit_zed_status(self, payload):
+        self._zed_last_status = payload
+        self.zed_status_pub.publish(String(data=json.dumps(payload, allow_nan=False)))
+
+    def _invalidate_zed(self, reason, *, clear_target=False, clear_front=False):
+        # Keep the revoked IDs in the atomic record so a late invalidation can
+        # be compared with the work-area selection already seen by consumers.
+        previous = self._zed_last_status or {}
+        payload = dict(previous)
+        payload.update(source="zed", accepted=False, state="invalidated", reason=reason)
+        payload.setdefault("mode", "target" if clear_target else "work_area")
+        for key in ("plane_generation_id", "work_area_id", "selection_id", "frame_id"):
+            payload.setdefault(key, "")
+        for key in ("position", "orientation", "corners", "front_extent"):
+            payload.setdefault(key, [])
+        payload.setdefault("view_width", 0)
+        payload.setdefault("view_height", 0)
+        payload.setdefault("target_stamp", {"sec": 0, "nanosec": 0})
+        self._clear_locked_work_area(reason)
+        self.latest_work_area_pixels = None
+        if clear_target or clear_front:
+            self.front_view_extent = None
+            self.front_view_size = None
+            self._zed_front_generation = ""
+            self._zed_front_stamp_ns = 0
+            self._zed_first_front_stamp_ns = 0
+        if clear_target:
+            self._zed_target = None
+            self.latest_surface = None
+        self._emit_zed_status(payload)
+
+    def _on_zed_target_lock(self, msg: String):
+        if self.process_mode != "spray":
+            return
+        try:
+            payload = json.loads(msg.data)
+            target = validate_target_lock(payload)
+        except (ValueError, TypeError, KeyError, OverflowError):
+            self._invalidate_zed("ZED target invalidated", clear_target=True)
+            return
+        current = self._zed_target
+        if current is not None and target["plane_generation_id"] == current["plane_generation_id"]:
+            same = (target["frame_id"] == current["frame_id"] and all(
+                np.array_equal(target[key], current[key]) for key in ("center", "normal", "corners")))
+            if not same:
+                self._invalidate_zed("geometry changed within ZED generation", clear_target=True)
+            return
+        if target["stamp_ns"] <= self._zed_target_stamp_ns:
+            return
+        self._invalidate_zed("new ZED target", clear_target=True)
+        self._zed_target = target
+        self._zed_target_stamp_ns = target["stamp_ns"]
+        self._zed_selection_stamp_ns = 0
+        self.latest_surface = (target["center"], target["normal"], target["frame_id"], "zed")
+        self._emit_zed_status(self._zed_surface_payload("target", target["corners"], ""))
+
+    def _zed_surface_payload(self, mode, corners, selection_id):
+        target = self._zed_target
+        corners = np.asarray(corners, dtype=float)
+        extent = self.front_view_extent
+        width, height = self.front_view_size or (0, 0)
+        return dict(
+            source="zed", mode=mode, accepted=True, state="locked",
+            plane_generation_id=target["plane_generation_id"],
+            work_area_id=self._work_area_id if mode == "work_area" else "",
+            selection_id=selection_id, frame_id=target["frame_id"],
+            position=corners.mean(axis=0).tolist(),
+            orientation=plane_orientation(corners, target["normal"]).tolist(),
+            corners=corners.tolist(), front_extent=[] if extent is None else extent.tolist(),
+            view_width=width, view_height=height, target_stamp=dict(target["stamp"]),
+        )
+
+    def _zed_camera_transform(self, image):
+        frame = self._zed_target["frame_id"]
+        optical = image.header.frame_id
+        if not optical or optical != self._zed_info_frame:
+            raise ValueError("ZED image and CameraInfo frames do not match")
+        if (image.width, image.height) != self._zed_info_size:
+            raise ValueError("ZED image and CameraInfo sizes do not match")
+        if frame == optical:
+            return np.eye(3), np.zeros(3)
+        transform = self.tf_buffer.lookup_transform(
+            optical, frame, rclpy.time.Time.from_msg(image.header.stamp),
+            timeout=Duration(seconds=0.05)).transform
+        q, t = transform.rotation, transform.translation
+        quaternion = np.asarray([q.x, q.y, q.z, q.w], dtype=float)
+        if not np.isfinite(quaternion).all() or abs(np.linalg.norm(quaternion) - 1.0) > 0.001:
+            raise ValueError("invalid ZED camera transform")
+        return _quat_to_R(quaternion), np.asarray([t.x, t.y, t.z], dtype=float)
+
+    def _on_zed_spray_image(self, msg: Image):
+        target = self._zed_target
+        if target is None or self.K is None:
+            return
+        try:
+            timestamp = stamp_ns(dict(sec=msg.header.stamp.sec, nanosec=msg.header.stamp.nanosec))
+            if timestamp <= max(target["stamp_ns"], self._zed_image_stamp_ns):
+                return
+            self._zed_image_stamp_ns = timestamp
+            age = self.get_clock().now().nanoseconds - timestamp
+            if age < -1_000_000_000 or age > 2_000_000_000:
+                raise ValueError("ZED image is not current")
+            R, t = self._zed_camera_transform(msg)
+            extent, src_pts, size = project_target_rectangle(
+                target, self.K, (msg.width, msg.height), rotation=R, translation=t)
+            if self.front_view_extent is not None and (
+                    not np.array_equal(extent, self.front_view_extent) or size != self.front_view_size):
+                raise ValueError("ZED frontal mapping changed; reselect target")
+            rgb = _decode_image(msg)
+            width, height = size
+            dst_pts = np.float32([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]])
+            homography = cv2.getPerspectiveTransform(src_pts, dst_pts)
+            if not np.isfinite(homography).all() or abs(np.linalg.det(homography)) < 1e-12:
+                raise ValueError("degenerate ZED homography")
+            front = cv2.warpPerspective(rgb, homography, size, flags=cv2.INTER_LINEAR)
+        except (ValueError, TypeError, OverflowError, TransformException, cv2.error) as exc:
+            self._invalidate_zed(str(exc), clear_front=True)
+            self.get_logger().warn(f"ZED spray front view rejected: {exc}", throttle_duration_sec=2.0)
+            return
+        if self.process_mode != "spray" or self._zed_target is not target:
+            return
+        self.front_view_extent = extent
+        self.front_view_size = size
+        self._zed_front_generation = target["plane_generation_id"]
+        self._zed_front_stamp_ns = timestamp
+        if not self._zed_first_front_stamp_ns:
+            self._zed_first_front_stamp_ns = timestamp
+        if self.locked_work_area is not None:
+            corners = self.locked_work_area["corners_3d"]
+            tl, right, w, down, h = self._front_view_uv(extent)
+            pixels = np.asarray([[(p - tl) @ right / w * (width - 1),
+                                  (p - tl) @ down / h * (height - 1)] for p in corners], dtype=np.int32)
+            cv2.polylines(front, [pixels], True, (0, 255, 0), 3)
+            if self._show_fill_preview:
+                self._draw_fill_preview(front)
+        self.front_pub.publish(_encode_rgb(front, "wall_front_view", msg.header.stamp))
+        self._publish_front_view_extent(extent, msg.header.stamp)
+
+    def _on_zed_work_area_request(self, msg: String):
+        if self.process_mode != "spray":
+            return
+        try:
+            payload = json.loads(msg.data)
+            target = self._zed_target
+            # An old generation must not revoke or advance the request ordering
+            # of a newer target, even if the old browser clock was far ahead.
+            if (target is None or isinstance(payload, dict)
+                    and payload.get("plane_generation_id") != target["plane_generation_id"]):
+                return
+            stamp, points = validate_work_area_request(payload, target["plane_generation_id"])
+        except (ValueError, TypeError, OverflowError) as exc:
+            self._invalidate_zed(str(exc))
+            return
+        pixels = PoseArray()
+        pixels.header.frame_id = "wall_front"
+        pixels.header.stamp.sec = stamp["sec"]
+        pixels.header.stamp.nanosec = stamp["nanosec"]
+        for u, v in points:
+            pose = Pose()
+            pose.position.x, pose.position.y = float(u), float(v)
+            pose.orientation.w = 1.0
+            pixels.poses.append(pose)
+        self._lock_zed_work_area(pixels, plane_generation_id=target["plane_generation_id"])
+
+    def _lock_zed_work_area(self, msg: PoseArray, *, plane_generation_id):
+        target = self._zed_target
+        if (self.process_mode != "spray" or target is None
+                or plane_generation_id != target["plane_generation_id"]):
+            return
+        try:
+            selection = stamp_ns(dict(sec=msg.header.stamp.sec, nanosec=msg.header.stamp.nanosec))
+            # Compare browser IDs only with prior browser IDs in this target
+            # generation. ROS target/image time has a separate clock domain.
+            if selection <= self._zed_selection_stamp_ns:
+                return
+            self._zed_selection_stamp_ns = selection
+            if not msg.poses:
+                self._invalidate_zed("empty work area selection")
+                return
+            if (msg.header.frame_id != "wall_front"
+                    or self.front_view_extent is None or self.front_view_size is None
+                    or self._zed_front_generation != target["plane_generation_id"]
+                    or self._zed_front_stamp_ns < target["stamp_ns"]):
+                raise ValueError("selection requires a current ZED wall_front view")
+            age = self.get_clock().now().nanoseconds - self._zed_front_stamp_ns
+            if not 0 <= age <= 2_000_000_000:
+                raise ValueError("ZED front view is stale")
+            points = [[p.position.x, p.position.y] for p in msg.poses]
+            if not all(np.isfinite(p.position.z) for p in msg.poses):
+                raise ValueError("invalid work area stroke")
+            if len({p.position.z for p in msg.poses}) != 1:
+                raise ValueError("work area must contain a single rectangle")
+            corners = select_work_area(self.front_view_extent, self.front_view_size, points)
+            payload = self._zed_surface_payload("work_area", corners, str(selection))
+        except (ValueError, TypeError, OverflowError) as exc:
+            self._invalidate_zed(str(exc))
+            return
+        if self.locked_work_area is not None:
+            self._invalidate_zed("new work area selection")
+        else:
+            # A first selection revokes no area. A target-level invalidation
+            # here would incorrectly cancel the new request in consumers.
+            self._clear_work_area_geometry_only()
+        self._zed_selection_stamp_ns = selection
+        self._work_area_invalidation_seq += 1
+        self._work_area_id = f"wa-{uuid.uuid4().hex}"
+        payload["work_area_id"] = self._work_area_id
+        self.locked_work_area = dict(
+            corners_3d=corners, normal=target["normal"].copy(), frame_id=target["frame_id"],
+            source="zed", plane_generation_id=target["plane_generation_id"],
+            work_area_id=self._work_area_id, selection_id=str(selection),
+            base_mode="zed_wall_front", mode="locked:zed_wall_front",
+        )
+        self._locked_extent = self.front_view_extent.copy()
+        self._locked_extent_size = self.front_view_size
+        self._publish_work_area_state(True, "locked", source_frame="wall_front", stamp=msg.header.stamp)
+        self._publish_corners(corners, target["frame_id"], msg.header.stamp)
+        pose = PoseStamped()
+        pose.header.stamp = msg.header.stamp
+        pose.header.frame_id = target["frame_id"]
+        pose.pose.position.x, pose.pose.position.y, pose.pose.position.z = payload["position"]
+        (pose.pose.orientation.x, pose.pose.orientation.y,
+         pose.pose.orientation.z, pose.pose.orientation.w) = payload["orientation"]
+        self.work_area_pub.publish(pose)
+        self._emit_zed_status(payload)
+
     def _on_info(self, msg: CameraInfo):
-        self.K = np.array(msg.k, dtype=float).reshape(3, 3)
+        intrinsics = np.array(msg.k, dtype=float).reshape(3, 3)
+        frame = msg.header.frame_id
+        size = (int(msg.width), int(msg.height))
+        if (getattr(self, "process_mode", "paint") == "spray" and self._zed_target is not None
+                and self.K is not None and (not np.array_equal(self.K, intrinsics)
+                    or self._zed_info_frame != frame or self._zed_info_size != size)):
+            self._invalidate_zed("ZED calibration changed", clear_target=True)
+        self.K = intrinsics
+        self._zed_info_frame, self._zed_info_size = frame, size
 
     def _on_d405_info(self, msg: CameraInfo):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         self.d405_K = np.array(msg.k, dtype=float).reshape(3, 3)
 
     def _on_wall(self, msg: PoseStamped):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         if not self.allow_wall_fallback:
             return
         if (
@@ -363,11 +643,15 @@ class WallProjectorNode(Node):
         self._cache_surface(msg, "wall")
 
     def _on_target_surface(self, msg: PoseStamped):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         self._clear_locked_work_area("target surface updated")
         self.latest_work_area_pixels = None
         self._cache_surface(msg, "target")
 
     def _on_refined_target_surface(self, msg: PoseStamped):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         self._clear_locked_work_area("target surface refined")
         self.latest_work_area_pixels = None
         self._cache_surface(msg, "target_refined")
@@ -376,6 +660,8 @@ class WallProjectorNode(Node):
             "보정 target 기준")
 
     def _on_refined_work_area(self, msg: PoseStamped):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         if (
             self.locked_work_area is not None
             and self.locked_work_area.get("d405_refined_locked", False)
@@ -452,6 +738,17 @@ class WallProjectorNode(Node):
         )
 
     def _on_work_area_pixels(self, msg: PoseArray):
+        if getattr(self, "process_mode", "paint") == "spray":
+            # Geometry is accepted exclusively from the generation-bound JSON
+            # request. Legacy nonempty pixels may arrive before or after it.
+            if not msg.poses:
+                try:
+                    selection = stamp_ns(dict(sec=msg.header.stamp.sec, nanosec=msg.header.stamp.nanosec))
+                    self._zed_selection_stamp_ns = max(self._zed_selection_stamp_ns, selection)
+                except ValueError:
+                    pass
+                self._invalidate_zed("empty work area selection")
+            return
         frame = msg.header.frame_id or ""
         if not msg.poses:
             self._clear_locked_work_area("empty work area selection")
@@ -520,6 +817,9 @@ class WallProjectorNode(Node):
             "source_frame": str(source_frame),
             "selection_stamp_ns": int(stamp_ns),
         }
+        if getattr(self, "process_mode", "paint") == "spray" and self._zed_target is not None:
+            payload["plane_generation_id"] = self._zed_target["plane_generation_id"]
+            payload["selection_id"] = str(stamp_ns) if stamp_ns > 0 else ""
         message = String()
         message.data = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -582,6 +882,8 @@ class WallProjectorNode(Node):
         return R, np.array([tr.x, tr.y, tr.z], dtype=float)
 
     def _on_d405_image(self, msg: Image):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         if self.front_view_source != "d405":
             return
         if self.d405_K is None:
@@ -892,6 +1194,9 @@ class WallProjectorNode(Node):
         self._fill_preview_strokes = []
 
     def _on_image(self, msg: Image):
+        if getattr(self, "process_mode", "paint") == "spray":
+            self._on_zed_spray_image(msg)
+            return
         if self.front_view_source != "zed":
             return
         if self.K is None:

@@ -219,8 +219,42 @@ def _publish_two_strokes(node):
         normal_world=np.array([0.0, 0.0, 1.0]),
         fallback_tangent=np.array([1.0, 0.0, 0.0]),
         path_id="1234",
-        source={"test": True},
+        source=({"test": True, "plane": "zed", "view": "wall_front", "coverage": "auto_fill"}
+                if getattr(node, "process_mode", "paint") == "spray" else {"test": True}),
     )
+
+
+def _spray_generator_stub(*, real=True):
+    from types import SimpleNamespace
+    from test_zed_spray_geometry import atomic_status
+
+    node = _generator_stub(real=real)
+    node.process_mode = "spray"
+    node.model_id, node.spray_tool_axis = "rb10_1300e_u", "-y"
+    node.spray_footprint_width_m, node.spray_overlap = .35, .30
+    node.spray_speed_mps, node.spray_standoff_m = .020, .5
+    node.eoat_segment_frame = "link0"
+    node.work_area_pixel_tolerance_px = 1.
+    node.work_area_containment_tolerance_m = .001
+    node.work_area_plane_tolerance_m = .002
+    node.zed_surface_status = atomic_status()
+    node.zed_target_lock = dict(
+        source="zed", accepted=True, state="locked", catalog_generation="catalog", plane_id="plane",
+        plane_generation_id=node.zed_surface_status["plane_generation_id"],
+        frame_id="World", center=[.5, .25, 0.], normal=[0., 0., 1.],
+        corners=node.zed_surface_status["corners"], stamp=dict(sec=1, nanosec=0))
+    node.latest_work_area_selection_id = "2000000000"
+    node.latest_work_area_pixels = PoseArray()
+    node.latest_work_area_pixels.header.frame_id = "wall_front"
+    node.latest_work_area_pixels.header.stamp = Time(sec=2, nanosec=0)
+    for u, v in ((0., 0.), (800., 0.), (800., 400.), (0., 400.)):
+        pose = Pose()
+        pose.position.x, pose.position.y = u, v
+        node.latest_work_area_pixels.poses.append(pose)
+    node.view_w, node.view_h = 801, 401
+    node.latest_work_area_rect_px = (0., 0., 800., 400.)
+    node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: Time(sec=3)))
+    return node
 
 
 def test_separate_strokes_generate_hashed_v3_contact_search_process():

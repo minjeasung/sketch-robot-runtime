@@ -94,6 +94,8 @@ class SegmentPath:
     preserve_orientation_continuity: bool = True
     raw_payload: dict[str, Any] | None = None
     process_mode: str = "paint"
+    spray_tool_axis: str = ""
+    spray_standoff_m: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -345,7 +347,7 @@ def parse_segment_path(
         ):
             if value < 0.0:
                 raise SegmentPathError(f"{field} must be non-negative")
-        if tcp_normal_axis != "+y":
+        if data.get("process_mode", "paint") != "spray" and tcp_normal_axis != "+y":
             raise SegmentPathError("tcp_normal_axis must be '+y'")
         if data.get("preserve_orientation_continuity") is not True:
             raise SegmentPathError(
@@ -489,6 +491,11 @@ def parse_segment_path(
         preserve_orientation_continuity=preserve_orientation_continuity,
         raw_payload=dict(data),
         process_mode=process_mode,
+        spray_tool_axis=str(data.get("spray_tool_axis", "")),
+        spray_standoff_m=(
+            _finite_float(data.get("spray_standoff_m"), "spray_standoff_m", 0)
+            if process_mode == "spray" else 0.0
+        ),
     )
     if process_mode == "spray":
         validate_spray_path(path)
@@ -858,13 +865,15 @@ def build_execution_steps(rows: Iterable[SegmentWaypoint]) -> tuple[ExecutionSte
 def segment_waypoint_position(
     path: SegmentPath, row: SegmentWaypoint
 ) -> tuple[float, float, float]:
-    """Return the roller-center pose used by planning and visualization."""
+    """Return the process position: spray TCP or paint roller center."""
 
     normal = np.asarray(row.normal, dtype=float)
     point = np.asarray(row.position, dtype=float)
-    position = point + normal * (
-        float(path.contact_geometry_offset_m) + float(row.offset_m)
+    offset = (
+        float(path.spray_standoff_m) if path.process_mode == "spray"
+        else float(path.contact_geometry_offset_m) + float(row.offset_m)
     )
+    position = point + normal * offset
     return tuple(float(value) for value in position)
 
 

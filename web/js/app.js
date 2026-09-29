@@ -3,7 +3,7 @@
 
 let processMode = "paint";
 let sprayMotionTest = false;
-let processModePending = false;
+let processModePending = true;
 let multiPlaneBusy = false;
 let stopRequested = false;
 
@@ -11,6 +11,9 @@ const WS_URL = `ws://${window.location.hostname || "localhost"}:9090`;
 const WORK_AREA_CORNERS_TOPIC = "/perception/work_area_corners";
 const ZED_LEFT_IMAGE_TOPIC = "/zed/zed_node/rgb/color/rect/image";
 const D405_REFINEMENT_STATUS_TOPIC = "/perception/d405_surface_refinement_status";
+const ZED_TARGET_LOCK_TOPIC = "/perception/zed_target_lock";
+const ZED_SURFACE_STATUS_TOPIC = "/perception/zed_surface_status";
+const zedSelection = new window.ZedSurfaceGate.ZedSurfaceGate();
 const PLAN_STATUS_TOPIC = "/painting_system/plan_status";
 const READINESS_TOPIC = "/painting_system/readiness";
 const EXECUTION_STATUS_TOPIC = "/painting_system/execution_status";
@@ -88,6 +91,7 @@ function dist3(a, b) {
 }
 
 function updateWorkAreaSizeFromCorners(msg) {
+  if (processMode === "spray" || processModePending) return;
   if (!msg.poses || msg.poses.length < 4) return;
   const tl = msg.poses[0].position;
   const tr = msg.poses[1].position;
@@ -113,6 +117,7 @@ const paintingState = {
   readiness: {},
   execution: {},
   d405Seq: 0,
+  zedSeq: 0,
   planSeq: 0,
   readinessSeq: 0,
   lastGeneratedPathId: "",
@@ -133,6 +138,10 @@ const paintingState = {
 };
 
 function requireFreshAuthoritativeState(reason) {
+  processModePending = true;
+  zedSelection.reset();
+  paintingState.zedSeq = 0;
+  paintingState.targetSelectionState = "rejected";
   paintingState.d405Seq = 0;
   paintingState.planSeq = 0;
   paintingState.readinessSeq = 0;
@@ -269,6 +278,7 @@ function readinessCheck(...aliases) {
 }
 
 function currentWorkAreaId() {
+  if (processMode === "spray") return textId(zedSelection.surface?.work_area_id);
   return textId(firstPresent(
     paintingState.d405.work_area_id,
     paintingState.readiness.work_area_id,
@@ -298,6 +308,90 @@ function beginD405Refresh(reason) {
   invalidatePlanLocally(reason, false);
   refreshPaintingUI();
 }
+
+function currentSurfaceStatus() {
+  return processMode === "spray" ? (zedSelection.surface || {}) : paintingState.d405;
+}
+
+function currentSurfaceSequence() {
+  return processMode === "spray" ? paintingState.zedSeq : paintingState.d405Seq;
+}
+
+function surfaceAcceptedPayload(payload) {
+  return processMode === "spray"
+    ? Boolean(zedSelection.surface && payload === zedSelection.surface)
+    : d405AcceptedPayload(payload);
+}
+
+function invalidateSelection(reason, clearTarget = true) {
+  if (clearTarget) zedSelection.reset();
+  else zedSelection.clearWorkArea();
+  paintingState.zedSeq = 0;
+  paintingState.d405 = {};
+  paintingState.d405Seq = 0;
+  paintingState.plan = {};
+  paintingState.planSeq = 0;
+  paintingState.readiness = {};
+  paintingState.readinessSeq = 0;
+  paintingState.lastGeneratedPathId = "";
+  paintingState.local.planeInvalidated = true;
+  paintingState.local.selectionIdentityPending = true;
+  paintingState.local.awaitingD405 = false;
+  paintingState.local.unsentInputEdit = true;
+  if (clearTarget) paintingState.targetSelectionState = "rejected";
+  clearTargetRefineWait();
+  waitingWorkAreaRefine = false;
+  latestWorkAreaSizeM = null;
+  strokesMap.work_area = [];
+  strokesMap.path = [];
+  resetFreeSpaceConfirmation(reason, true);
+  invalidatePlanLocally(reason);
+}
+
+function syncZedSelection(action) {
+  if (action === "ignore") return;
+  const local = paintingState.local;
+  paintingState.targetSelectionState = zedSelection.target ? "selected" : "pending";
+  if (action === "invalidated") {
+    local.planeInvalidated = true;
+    local.selectionIdentityPending = true;
+    invalidatePlanLocally("ZED selection invalidated");
+  } else if (zedSelection.surface) {
+    paintingState.zedSeq += 1;
+    local.planeInvalidated = false;
+    local.selectionIdentityPending = false;
+    local.unsentInputEdit = false;
+    if (workflowMode === "work_area") switchToPathMode();
+  } else if (zedSelection.target && workflowMode === "target") {
+    switchToWorkAreaMode();
+  }
+  reconcileValidatedPlan();
+  refreshPaintingUI();
+}
+
+new ROSLIB.Topic({ ros, name: ZED_TARGET_LOCK_TOPIC, messageType: "std_msgs/String" }).subscribe(msg => {
+  if (processMode !== "spray" || processModePending) return;
+  const payload = parseJsonStatus(ZED_TARGET_LOCK_TOPIC, msg);
+  if (!payload) { invalidateSelection("invalid ZED target lock JSON"); return; }
+  const previous = zedSelection.lock?.plane_generation_id;
+  const action = zedSelection.receiveTarget(payload);
+  if (action === "locked" && previous !== payload.plane_generation_id) {
+    paintingState.local.planeInvalidated = true;
+    paintingState.local.selectionIdentityPending = true;
+    strokesMap.work_area = [];
+    strokesMap.path = [];
+    invalidatePlanLocally("ZED plane locked; select a work area");
+    if (currentView === "wall_front") subscribeView("wall_front");
+  }
+  syncZedSelection(action);
+});
+
+new ROSLIB.Topic({ ros, name: ZED_SURFACE_STATUS_TOPIC, messageType: "std_msgs/String" }).subscribe(msg => {
+  if (processMode !== "spray" || processModePending) return;
+  const payload = parseJsonStatus(ZED_SURFACE_STATUS_TOPIC, msg);
+  if (!payload) { invalidateSelection("invalid ZED surface status JSON"); return; }
+  syncZedSelection(zedSelection.receiveSurface(payload));
+});
 
 function beginPlanRequest(reason) {
   paintingState.local.previousPlanPathId = textId(firstPresent(
@@ -333,27 +427,18 @@ function normalizedAbortReason(value) {
 
 function reconcileValidatedPlan() {
   const local = paintingState.local;
-  const d405 = paintingState.d405;
+  const surface = currentSurfaceStatus();
   const plan = paintingState.plan;
   const readiness = paintingState.readiness;
   if (local.unsentInputEdit || local.awaitingPlan || local.selectionIdentityPending ||
-      paintingState.d405Seq === 0 || paintingState.readinessSeq === 0) {
+      currentSurfaceSequence() === 0 || paintingState.readinessSeq === 0 || processModePending) {
     return;
   }
   if (!["generated", "validated"].includes(normalizedState(plan.state)) ||
-      !d405AcceptedPayload(d405)) {
+      !surfaceAcceptedPayload(surface)) {
     return;
   }
-  const identitiesMatch = Boolean(
-    textId(plan.path_id) && textId(plan.plan_hash) &&
-    textId(plan.work_area_id) && textId(plan.plane_generation_id) &&
-    textId(plan.path_id) === textId(readiness.path_id) &&
-    textId(plan.plan_hash) === textId(readiness.plan_hash) &&
-    textId(plan.work_area_id) === textId(d405.work_area_id) &&
-    textId(plan.work_area_id) === textId(readiness.work_area_id) &&
-    textId(plan.plane_generation_id) === textId(d405.plane_generation_id) &&
-    textId(plan.plane_generation_id) === textId(readiness.plane_generation_id)
-  );
+  const identitiesMatch = window.ZedSurfaceGate.matchesPlan(surface, plan, readiness, processMode);
   const backendValidated = firstBoolean(
     readiness.plan_validated,
     readinessCheck("current_plan_validated", "plan_validated", "valid_plan"),
@@ -386,6 +471,7 @@ const executionStatusSub = new ROSLIB.Topic({
 });
 
 d405StatusSub.subscribe((msg) => {
+  if (processMode === "spray" || processModePending) return;
   const payload = parseJsonStatus(D405_REFINEMENT_STATUS_TOPIC, msg);
   if (!payload) {
     paintingState.d405 = { state: "rejected", accepted: false, mode: "work_area" };
@@ -461,16 +547,18 @@ planStatusSub.subscribe((msg) => {
 
   if (["generated", "validated"].includes(state)) {
     const candidatePathId = textId(payload.path_id);
-    const candidateMatchesD405 = d405AcceptedPayload(paintingState.d405) &&
-      textId(payload.work_area_id) === textId(paintingState.d405.work_area_id) &&
-      textId(payload.plane_generation_id) === textId(paintingState.d405.plane_generation_id);
+    const surface = currentSurfaceStatus();
+    const candidateMatchesSurface = surfaceAcceptedPayload(surface) &&
+      textId(payload.work_area_id) === textId(surface.work_area_id) &&
+      textId(payload.plane_generation_id) === textId(surface.plane_generation_id) &&
+      (processMode !== "spray" || payload.process_mode === "spray");
     const candidateIsNew = Boolean(candidatePathId) &&
       (!local.previousPlanPathId || candidatePathId !== local.previousPlanPathId);
     if (candidatePathId) paintingState.lastGeneratedPathId = candidatePathId;
     const requestedCandidateArrived = local.awaitingPlan &&
       paintingState.planSeq > local.planBaselineSeq && candidateIsNew;
     const authoritativeCandidateAllowed = !local.unsentInputEdit &&
-      candidateMatchesD405 && (!local.awaitingPlan || requestedCandidateArrived);
+      !processModePending && candidateMatchesSurface && (!local.awaitingPlan || requestedCandidateArrived);
     if (!local.planInvalidated || authoritativeCandidateAllowed) {
       local.planInvalidated = false;
       local.awaitingPlan = false;
@@ -567,22 +655,22 @@ for (const topicName of [D405_REFINEMENT_STATUS_TOPIC, PLAN_STATUS_TOPIC, READIN
 }
 
 function paintingDerivedState() {
-  const d405 = paintingState.d405;
+  const surface = currentSurfaceStatus();
   const plan = paintingState.plan;
   const readiness = paintingState.readiness;
   const execution = paintingState.execution;
   const local = paintingState.local;
 
-  const workAreaId = paintingState.d405Seq > 0
-    ? textId(d405.work_area_id)
+  const workAreaId = processMode === "spray" || currentSurfaceSequence() > 0
+    ? textId(surface.work_area_id)
     : textId(readiness.work_area_id);
-  const planeGenerationId = paintingState.d405Seq > 0
-    ? textId(d405.plane_generation_id)
+  const planeGenerationId = processMode === "spray" || currentSurfaceSequence() > 0
+    ? textId(surface.plane_generation_id)
     : textId(readiness.plane_generation_id);
   const pathId = textId(firstPresent(plan.path_id, readiness.path_id));
   const planHash = textId(firstPresent(plan.plan_hash, readiness.plan_hash));
 
-  const targetSelected = firstBoolean(
+  const targetSelected = processMode === "spray" ? Boolean(zedSelection.target && !processModePending) : firstBoolean(
     readiness.target_selected,
     readinessCheck("target_selected", "active_target_selected"),
     paintingState.targetSelectionState === "selected"
@@ -591,32 +679,28 @@ function paintingDerivedState() {
     textId(readiness.active_target_id) ? true : undefined,
     workAreaId ? true : undefined,
   );
-  const workAreaSelected = firstBoolean(
+  const workAreaSelected = processMode === "spray" ? Boolean(zedSelection.surface && !local.selectionIdentityPending) : firstBoolean(
     readiness.work_area_selected,
     readinessCheck("work_area_selected", "current_work_area_selected"),
     workAreaId ? true : undefined,
   );
 
-  const d405State = normalizedState(d405.state) || (d405.accepted === true ? "accepted" : "waiting");
-  const d405IdentityComplete = Boolean(workAreaId && planeGenerationId);
-  const d405MatchesReadiness = workAreaId === textId(readiness.work_area_id) &&
+  const surfaceState = normalizedState(surface.state) || (surface.accepted === true ? "accepted" : "waiting");
+  const surfaceIdentityComplete = Boolean(workAreaId && planeGenerationId);
+  const surfaceMatchesReadiness = workAreaId === textId(readiness.work_area_id) &&
     planeGenerationId === textId(readiness.plane_generation_id);
-  const d405Accepted = paintingState.d405Seq > 0 && !local.selectionIdentityPending &&
-    d405AcceptedPayload(d405) && d405IdentityComplete &&
-    d405MatchesReadiness && !local.planeInvalidated;
+  const surfaceAccepted = currentSurfaceSequence() > 0 && !local.selectionIdentityPending &&
+    surfaceAcceptedPayload(surface) && surfaceIdentityComplete &&
+    surfaceMatchesReadiness && !local.planeInvalidated &&
+    (processMode !== "spray" || readiness.process_mode === "spray");
 
   const planState = normalizedState(plan.state) || "none";
   const generated = ["generated", "validated"].includes(planState);
-  const planIdentityComplete = Boolean(
-    textId(plan.path_id) && textId(plan.plan_hash) &&
-    textId(plan.work_area_id) && textId(plan.plane_generation_id)
-  );
-  const planIdentitiesMatch = planIdentityComplete &&
-    textId(plan.work_area_id) === workAreaId &&
-    textId(plan.plane_generation_id) === planeGenerationId &&
-    textId(plan.path_id) === textId(readiness.path_id) &&
-    textId(plan.plan_hash) === textId(readiness.plan_hash);
-  const validationCheck = firstBoolean(
+  const planIdentitiesMatch = window.ZedSurfaceGate.matchesPlan(surface, plan, readiness, processMode);
+  const validationCheck = processMode === "spray" ? firstBoolean(
+    readiness.plan_validated,
+    readinessCheck("current_plan_validated", "plan_validated", "valid_plan"),
+  ) : firstBoolean(
     plan.validated,
     readiness.plan_validated,
     readinessCheck("current_plan_validated", "plan_validated", "valid_plan"),
@@ -652,15 +736,15 @@ function paintingDerivedState() {
   // the short window before a just-published false reaches backend readiness;
   // the backend half proves that the executor's interlocked gate consumed true.
   const backendFreeSpaceConfirmed = readinessCheck("free_space_confirmed") === true;
-  const ready = readiness.ready === true && d405Accepted && planValidated &&
+  const ready = readiness.ready === true && surfaceAccepted && planValidated &&
     targetForceValid && !processModePending && (processMode === "spray" || (freeSpaceConfirmed && backendFreeSpaceConfirmed)) &&
     !running && !abortReason;
 
   return {
     targetSelected,
     workAreaSelected,
-    d405State,
-    d405Accepted,
+    surfaceState,
+    surfaceAccepted,
     workAreaId,
     planeGenerationId,
     pathId,
@@ -717,7 +801,7 @@ function backendBlockers() {
   } else if (value) {
     blockers = [textId(value)];
   }
-  if (!d405AcceptedPayload(paintingState.d405) && statusReason(paintingState.d405)) {
+  if (processMode !== "spray" && !d405AcceptedPayload(paintingState.d405) && statusReason(paintingState.d405)) {
     blockers.push(`D405: ${statusReason(paintingState.d405)}`);
   }
   if (["rejected", "invalidated", "failed"].includes(normalizedState(paintingState.plan.state)) &&
@@ -737,7 +821,7 @@ function buttonBlockReason(derived, kind) {
     if (paintingState.readinessSeq === 0) reasons.push("backend readiness status unavailable");
     if (derived.targetSelected !== true) reasons.push("target not selected");
     if (derived.workAreaSelected !== true) reasons.push("work area not selected");
-    if (!derived.d405Accepted) reasons.push("current D405 plane not accepted");
+    if (!derived.surfaceAccepted) reasons.push(`current ${processMode === "spray" ? "ZED" : "D405"} work area not accepted`);
   }
   if (kind === "run") {
     if (stopRequested) reasons.push("operator stop requested");
@@ -756,10 +840,12 @@ function buttonBlockReason(derived, kind) {
 function refreshPaintingUI() {
   const derived = paintingDerivedState();
   const local = paintingState.local;
+  const spray = processMode === "spray";
   const measuring = local.awaitingD405 || multiPlaneBusy;
-  const d405Failed = ["failed", "rejected"].includes(derived.d405State);
-  setPill("painting-d405-state", derived.d405Accepted ? "완료" : measuring ? "측정 중" : d405Failed ? "확인 필요" : "대기",
-    derived.d405Accepted ? "good" : measuring ? "pending" : d405Failed ? "bad" : "unknown");
+  const surfaceFailed = ["failed", "rejected"].includes(derived.surfaceState);
+  $("painting-surface-label").textContent = spray ? "ZED 작업영역" : "D405 평면 측정";
+  setPill("painting-d405-state", derived.surfaceAccepted ? "완료" : measuring ? (spray ? "확정 중" : "측정 중") : surfaceFailed ? "확인 필요" : "대기",
+    derived.surfaceAccepted ? "good" : measuring ? "pending" : surfaceFailed ? "bad" : "unknown");
   const planFailed = ["rejected", "failed"].includes(derived.planState);
   setPill("painting-plan-validation", derived.planValidated ? "완료" : local.awaitingPlan ? "검증 중" : planFailed ? "확인 필요" : "대기",
     derived.planValidated ? "good" : local.awaitingPlan ? "pending" : planFailed ? "bad" : "unknown");
@@ -768,7 +854,7 @@ function refreshPaintingUI() {
     freeSpaceConfirmed ? (backendConfirmed ? "good" : "pending") : "bad");
 
   const blockers = backendBlockers();
-  if (local.planeInvalidated) blockers.unshift(local.awaitingD405 ? "D405 refinement pending" : "D405 plane invalidated");
+  if (local.planeInvalidated) blockers.unshift(spray ? "ZED work area acceptance pending" : local.awaitingD405 ? "D405 refinement pending" : "D405 plane invalidated");
   if (local.planInvalidated) blockers.unshift(local.invalidationReason || "plan invalidated by local edit");
   $("painting-blockers").textContent = [...new Set(blockers)].join("\n") || "진단 항목 없음";
   $("painting-abort-reason").textContent = derived.abortReason ? `작업 중단: ${derived.abortReason}` : "";
@@ -776,21 +862,27 @@ function refreshPaintingUI() {
 
   const cs = typeof currentStrokes === "function" ? currentStrokes() : [];
   const pathContext = workflowMode === "path" && currentView === "wall_front";
-  const pathGate = rosConnected && pathContext && !derived.running &&
+  const pathGate = rosConnected && !processModePending && pathContext && !derived.running &&
     paintingState.readinessSeq > 0 &&
-    derived.targetSelected === true && derived.workAreaSelected === true && derived.d405Accepted;
-  $("btn-set-target").disabled = !rosConnected || derived.running ||
+    derived.targetSelected === true && derived.workAreaSelected === true && derived.surfaceAccepted;
+  $("btn-set-target").disabled = !rosConnected || processModePending || derived.running ||
     workflowMode !== "target" || cs.length === 0 || currentView !== "zed_raw";
-  $("btn-set-work-area").disabled = !rosConnected || derived.running ||
-    workflowMode !== "work_area" || currentView !== "wall_front" || derived.targetSelected !== true;
-  $("btn-execute").disabled = !pathGate || cs.length === 0;
+  $("btn-set-work-area").disabled = !rosConnected || processModePending || derived.running ||
+    workflowMode !== "work_area" || currentView !== "wall_front" || derived.targetSelected !== true ||
+    (spray && (zedFrameCount === 0 || !sprayRectangleReady(cs)));
+  $("btn-execute").disabled = spray || !pathGate || cs.length === 0;
+  $("btn-execute").hidden = spray;
+  $("btn-fill-work-area").textContent = spray ? "자동 도포 경로 생성" : "영역 자동 채우기";
   $("btn-fill-work-area").disabled = !pathGate;
   $("btn-run-robot").disabled = !rosConnected || !derived.ready || stopRequested;
   $("btn-clear").disabled = derived.running || cs.length === 0;
   $("btn-undo").disabled = derived.running || cs.length === 0;
   $("free-space-confirmed").disabled = !rosConnected || derived.running || Boolean(derived.abortReason);
   $("btn-stop-robot").disabled = !rosConnected;
-  document.querySelectorAll('input[name="workflow-mode"], input[name="sketch-mode"]').forEach(input => { input.disabled = derived.running; });
+  document.querySelectorAll('input[name="workflow-mode"], input[name="sketch-mode"]').forEach(input => {
+    input.disabled = derived.running || processModePending ||
+      (spray && input.name === "sketch-mode" && (workflowMode === "path" || (workflowMode === "work_area" && input.value !== "rect")));
+  });
 
   $("target-actions").hidden = workflowMode !== "target";
   $("work-area-actions").hidden = workflowMode !== "work_area";
@@ -798,9 +890,12 @@ function refreshPaintingUI() {
   $("tare-confirmation").hidden = processMode === "spray" || workflowMode !== "path";
   const hints = {
     target: "작업할 대상을 둘러 그린 뒤 평면을 추출하세요.",
-    work_area: "측정한 평면 위에 칠할 영역을 그리세요.",
-    path: "영역을 자동으로 채우거나, 원하는 경로를 직접 그리세요.",
+    work_area: spray ? "ZED Wall Front · 사각형 작업영역" : "측정한 평면 위에 칠할 영역을 그리세요.",
+    path: spray ? "자동 도포 경로 · 충돌 및 실행 검증" : "영역을 자동으로 채우거나, 원하는 경로를 직접 그리세요.",
   };
+  $("work-area-description").textContent = spray ? "ZED 평면 · 사각형 영역" : "칠할 영역을 둘러 그리세요. 그리지 않으면 정면 영상 전체를 사용합니다.";
+  $("path-actions-title").textContent = spray ? "자동 도포 경로" : "작업 경로";
+  $("view-card-title").textContent = currentView === "wall_front" && spray ? "ZED Wall Front" : VIEW_TITLES[currentView];
   $("workflow-hint").textContent = derived.running ? "로봇 작업 중에는 스케치를 수정할 수 없습니다." : hints[workflowMode];
   $("sketch-canvas").setAttribute("aria-label", hints[workflowMode]);
 
@@ -808,15 +903,15 @@ function refreshPaintingUI() {
   if (!rosConnected) summary = "로봇 연결을 기다리고 있습니다.";
   else if (derived.abortReason) summary = "작업이 중단되었습니다. 원인을 확인하세요.";
   else if (stopRequested) summary = "중단 요청을 보냈습니다. 로봇의 응답을 기다립니다.";
-  else if (multiPlaneBusy) summary = "선택한 평면에 접근하여 측정 중입니다.";
+  else if (multiPlaneBusy) summary = spray ? "ZED 평면 선택을 확인 중입니다." : "선택한 평면에 접근하여 측정 중입니다.";
   else if (derived.running) summary = "로봇이 작업 중입니다.";
   else if (processModePending) summary = "작업 방식 변경을 확인 중입니다.";
   else if (derived.ready) summary = "준비 완료. 작업을 시작할 수 있습니다.";
   else if (paintingState.readinessSeq === 0) summary = "로봇 상태를 확인하고 있습니다.";
   else if (measuring) summary = "평면 측정 결과를 기다리고 있습니다.";
-  else if (derived.targetSelected !== true) summary = "대상을 선택하고 평면을 측정하세요.";
+  else if (derived.targetSelected !== true) summary = spray ? "ZED 대상 평면을 선택·확정하세요." : "대상을 선택하고 평면을 측정하세요.";
   else if (derived.workAreaSelected !== true) summary = "칠할 작업영역을 확정하세요.";
-  else if (!derived.d405Accepted) summary = "평면 측정 상태를 확인하세요.";
+  else if (!derived.surfaceAccepted) summary = spray ? "ZED 작업영역 확인을 기다립니다." : "평면 측정 상태를 확인하세요.";
   else if (local.awaitingPlan) summary = "작업 경로를 생성·검증하고 있습니다.";
   else if (!derived.planValidated) summary = planFailed ? "경로 검증에 실패했습니다. 영역이나 경로를 확인하세요." : "작업 경로를 생성하세요.";
   else if (processMode !== "spray" && !freeSpaceConfirmed) summary = "접촉 전 F/T 영점 조정을 승인하세요.";
@@ -921,6 +1016,7 @@ function handleImageMsg(msg) {
   if (zedFrameCount === 1) {
     logEvent(`first image on ${VIEW_TOPICS[currentView]} (${msg.width}×${msg.height}, ${msg.encoding})`);
   }
+  refreshPaintingUI();
 }
 
 function subscribeView(viewName) {
@@ -939,7 +1035,9 @@ function subscribeView(viewName) {
     throttle_rate: 200,
     queue_size: 1,
   });
-  sub.subscribe(handleImageMsg);
+  sub.subscribe(msg => {
+    if (currentImageSub === sub && currentView === viewName) handleImageMsg(msg);
+  });
   currentImageSub = sub;
   // 새 view 의 첫 frame 도착 전 — stats reset 으로 fps 계산 정확하게.
   zedFrameCount = 0;
@@ -978,6 +1076,9 @@ const sketchCtx = sketchCanvas.getContext("2d");
 const strokesMap = { target: [], work_area: [], path: [] };
 let workflowMode = "target";
 function currentStrokes() { return strokesMap[workflowMode]; }
+function sprayRectangleReady(strokes) {
+  return window.ZedSurfaceGate.rectangleReady(strokes, sketchCanvas.width, sketchCanvas.height);
+}
 
 let currentStroke = null;     // 진행 중 freehand stroke (mousedown ~ mouseup)
 let pendingLine = null;       // Line 모드: 첫 점 찍힌 후 두 번째 클릭 대기 중인 stroke
@@ -1004,6 +1105,7 @@ function updateSketchStats() {
 }
 
 function rollerFootprintScale() {
+  if (processMode === "spray") return null;
   if (currentView !== "wall_front" || workflowMode !== "path") return null;
   if (sketchCanvas.width <= 0 || sketchCanvas.height <= 0) return null;
   const physicalW = latestWorkAreaSizeM ? latestWorkAreaSizeM.w : DEFAULT_WORK_AREA_W_M;
@@ -1194,7 +1296,9 @@ function redrawSketch() {
 // ---- Pointer event handlers (mouse + touch 통합) ----
 sketchCanvas.addEventListener("pointerdown", (ev) => {
   ev.preventDefault();
-  if (paintingDerivedState().running) {
+  if (paintingDerivedState().running || processModePending ||
+      (processMode === "spray" && (workflowMode === "path" ||
+        (workflowMode === "work_area" && (!zedSelection.target || currentView !== "wall_front" || zedFrameCount === 0))))) {
     logEvent("stroke ignored: execution is running");
     return;
   }
@@ -1202,6 +1306,16 @@ sketchCanvas.addEventListener("pointerdown", (ev) => {
   const c = getNativeCoords(ev);
   currentMouse = c;
   paintingState.local.unsentInputEdit = true;
+  if (processMode === "spray") {
+    if (workflowMode === "target") invalidateSelection("ZED target edited");
+    else {
+      zedSelection.clearWorkArea();
+      paintingState.local.planeInvalidated = true;
+      paintingState.local.selectionIdentityPending = true;
+      strokesMap.work_area = [];
+      sketchMode = "rect";
+    }
+  }
   invalidatePlanLocally(`${workflowMode} stroke edited`, false);
   if (sketchMode === "freehand") {
     currentStroke = { type: "freehand", points: [c] };
@@ -1300,7 +1414,11 @@ function switchWorkflow(mode) {
   pendingRect = null;
   currentMouse = null;
   workflowMode = mode;
-  // target 은 ZED 전체 scene 에서, work_area/path 는 D405 정면(wall_front) 에서.
+  if (processMode === "spray" && mode === "work_area") {
+    sketchMode = "rect";
+    document.querySelector('input[name="sketch-mode"][value="rect"]').checked = true;
+  }
+  // Work area pixels always refer to the projector's Wall Front view.
   const targetView = mode === "target" ? "zed_raw" : "wall_front";
   switchView(targetView);
   redrawSketch();
@@ -1321,6 +1439,7 @@ $("btn-clear").addEventListener("click", () => {
   pendingLine = null;
   pendingRect = null;
   currentStroke = null;
+  if (processMode === "spray") invalidateSelection("ZED selection cleared", workflowMode === "target");
   invalidatePlanLocally(`${workflowMode} cleared`, false);
   redrawSketch();
 });
@@ -1331,6 +1450,7 @@ $("btn-undo").addEventListener("click", () => {
   if (cs.length > 0) {
     cs.pop();
     paintingState.local.unsentInputEdit = true;
+    if (processMode === "spray") invalidateSelection("ZED selection undone", workflowMode === "target");
     invalidatePlanLocally(`${workflowMode} undo`, false);
     redrawSketch();
   }
@@ -1340,6 +1460,7 @@ $("btn-undo").addEventListener("click", () => {
 const TARGET_SELECTION_TOPIC = "/target_selection_pixels";
 const TARGET_REFINE_STATUS_TOPIC = "/target_refine_status";
 const WORK_AREA_PIXELS_TOPIC = "/work_area_pixels";
+const ZED_WORK_AREA_REQUEST_TOPIC = "/painting_system/zed_work_area_request";
 const REFINE_WORK_AREA_TOPIC = "/refine_work_area";
 const WORK_AREA_REFINE_STATUS_TOPIC = "/work_area_refine_status";
 const SKETCH_PIXELS_TOPIC = "/sketch_pixels";
@@ -1359,6 +1480,11 @@ const workAreaPub = new ROSLIB.Topic({
   ros: ros,
   name: WORK_AREA_PIXELS_TOPIC,
   messageType: "geometry_msgs/PoseArray",
+});
+const zedWorkAreaRequestPub = new ROSLIB.Topic({
+  ros: ros,
+  name: ZED_WORK_AREA_REQUEST_TOPIC,
+  messageType: "std_msgs/String",
 });
 const refineWorkAreaPub = new ROSLIB.Topic({
   ros: ros,
@@ -1429,6 +1555,7 @@ function switchToPathMode() {
 }
 
 targetRefineStatusSub.subscribe((msg) => {
+  if (processMode === "spray" || processModePending) return;
   let payload = {};
   try {
     payload = JSON.parse(msg.data || "{}");
@@ -1473,6 +1600,7 @@ targetRefineStatusSub.subscribe((msg) => {
 });
 
 workAreaRefineStatusSub.subscribe((msg) => {
+  if (processMode === "spray" || processModePending) return;
   let payload = {};
   try {
     payload = JSON.parse(msg.data || "{}");
@@ -1494,8 +1622,10 @@ workAreaRefineStatusSub.subscribe((msg) => {
   refreshPaintingUI();
 });
 
+let lastPixelStampMs = 0;
 function nowRosTime() {
-  const ms = Date.now();
+  const ms = Math.max(Date.now(), lastPixelStampMs + 1);
+  lastPixelStampMs = ms;
   return {
     sec: Math.floor(ms / 1000),
     nanosec: (ms % 1000) * 1_000_000,
@@ -1533,10 +1663,12 @@ function publishPixels(pub, topicName, frameId, strokes, stamp = null) {
 
 $("btn-set-target").addEventListener("click", () => {
   if (workflowMode !== "target" || currentView !== "zed_raw") return;
-  if (paintingDerivedState().running) return;
+  if (!rosConnected || processModePending || paintingDerivedState().running || !currentStrokes().length) return;
+  if (typeof clearPlaneSelection === "function") clearPlaneSelection(true);
+  if (processMode === "spray") invalidateSelection("new ZED target selected");
   paintingState.targetSelectionState = "pending";
   resetFreeSpaceConfirmation("new target selected", true);
-  beginD405Refresh("new target selected");
+  if (processMode !== "spray") beginD405Refresh("new target selected");
   // The D405 refiner arms exactly one capture only after it has received and
   // stored this new target surface.  Publishing a separate Bool here used to
   // race the target surface across two DDS topics and could refine the old
@@ -1561,8 +1693,27 @@ $("btn-set-target").addEventListener("click", () => {
 
 $("btn-set-work-area").addEventListener("click", () => {
   if (workflowMode !== "work_area" || currentView !== "wall_front") return;
-  if (paintingDerivedState().running) return;
+  if (!rosConnected || processModePending || paintingDerivedState().running) return;
   let strokes = currentStrokes();
+  if (processMode === "spray") {
+    if (!zedSelection.target || zedFrameCount === 0 || !sprayRectangleReady(strokes)) return;
+    const stamp = nowRosTime();
+    if (!zedSelection.beginWorkArea(stamp)) return;
+    paintingState.local.planeInvalidated = true;
+    paintingState.local.selectionIdentityPending = true;
+    paintingState.local.unsentInputEdit = false;
+    invalidatePlanLocally("ZED work area requested");
+    // The shared stamp is a correlation identity; the generation binds the
+    // rectangle to its plane without comparing browser and robot clocks.
+    zedWorkAreaRequestPub.publish(new ROSLIB.Message({ data: JSON.stringify({
+      source: "zed",
+      plane_generation_id: zedSelection.lock.plane_generation_id,
+      header: { frame_id: "wall_front", stamp },
+      pixels: strokes[0].points.map(({ u, v }) => [u, v]),
+    }) }));
+    publishPixels(workAreaPub, WORK_AREA_PIXELS_TOPIC, "wall_front", strokes, stamp);
+    return;
+  }
   const drawn = strokes.reduce((acc, s) => acc + s.points.length, 0) > 0;
   if (!drawn) {
     // 박스를 안 그렸으면 wall_front 전체(D405 정면 뷰)를 작업영역으로 사용.
@@ -1603,6 +1754,7 @@ $("btn-fill-work-area").addEventListener("click", () => {
 });
 
 $("btn-execute").addEventListener("click", () => {
+  if (processMode === "spray") return;
   const cs = currentStrokes();
   if (cs.length === 0) return;
   const derived = paintingDerivedState();

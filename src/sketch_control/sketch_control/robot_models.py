@@ -15,20 +15,39 @@ def validate_model(model_id):
     return model_id
 
 
-def model_calibration_files(workspace, model_id):
+def validate_process_mode(process_mode):
+    if not isinstance(process_mode, str) or process_mode not in ('paint', 'spray'):
+        raise ValueError('process_mode must be paint or spray')
+    return process_mode
+
+
+def process_cameras(process_mode='paint'):
+    validate_process_mode(process_mode)
+    return (('zed', 'zed'), ('d405', 'realsense')) if process_mode == 'paint' else (('zed', 'zed'),)
+
+
+def model_calibration_files(workspace, model_id, process_mode='paint'):
     validate_model(model_id)
+    validate_process_mode(process_mode)
     root = Path(workspace).expanduser().resolve()
     if model_id != DEFAULT_MODEL:
         root = root / 'calibration' / model_id
-    return dict(zed_calibration_file=str(root / 'zed_d405_apriltag_calibration.json'),
-                d405_calibration_file=str(root / 'd405_eyeinhand_charuco_calibration.json'))
+    paths = dict(zed_calibration_file=str(root / 'zed_d405_apriltag_calibration.json'))
+    if process_mode == 'paint':
+        paths['d405_calibration_file'] = str(root / 'd405_eyeinhand_charuco_calibration.json')
+    return paths
 
 
-def validate_calibration_files(paths):
+def validate_calibration_files(paths, process_mode='paint'):
+    validate_process_mode(process_mode)
     for name, key in (('zed_calibration_file', 'T_world_zed_optical'),
                       ('d405_calibration_file', 'T_d405_optical_to_tcp')):
-        path = paths[name]
+        if process_mode == 'spray' and name == 'd405_calibration_file':
+            continue
+        path = paths.get(name)
         try:
+            if path is None:
+                raise ValueError('Missing ' + name)
             pose = json.loads(Path(path).read_text())[key]
             translation = [float(v) for v in pose['translation']]
             rotation = [float(v) for v in pose['rotation_xyzw']]

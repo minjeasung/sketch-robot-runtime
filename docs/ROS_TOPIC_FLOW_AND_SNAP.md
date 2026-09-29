@@ -3,6 +3,29 @@
 이 문서는 실제 RB10 스케치 로봇 실행 중 어떤 노드가 어떤 토픽을 발행/구독하는지,
 그리고 웹 UI에서 하는 세 번의 스케치가 어떻게 3D 표면 위 점으로 변환되는지 정리한다.
 
+## Spray 작업영역 입력
+
+아래 번호별 D405·generic 픽셀 흐름은 기존 Paint 경로 설명이다. ZED 전용 Spray는
+자동 커버리지 경로를 사용하며 작업영역 입력은 다음과 같이 분리된다.
+
+```text
+Web UI: same wall_front pixels + same header stamp
+  |-- /painting_system/zed_work_area_request  std_msgs/String (JSON)
+  |     source="zed", plane_generation_id, header, pixels=[[u,v],...]
+  |       -> wall_projector: bind to the current ZED target
+  |       -> /perception/zed_surface_status
+  `-- /work_area_pixels  geometry_msgs/PoseArray
+          -> sketch_to_waypoints + moveit_executor: match selection identity
+```
+
+JSON은 `std_msgs/String.data`에 넣으며 `header.frame_id`는 `wall_front`, stamp는
+`{sec, nanosec}`이다. UI는 두 메시지에 동일한 좌표 순서와 stamp를 사용한다.
+generator와 executor는 메시지 쌍의 선택 식별을 ZED 표면 상태와 대조한다.
+projector는 명시적인 `plane_generation_id`로 대상을 연결하고 브라우저 `Date.now()`와
+ROS clock을 비교하지 않는다. Spray 기하는 전용 JSON envelope로만 정의하며
+기존 `/work_area_pixels`만 보내서는 정의할 수 없다.
+전체 JSON 예시는 [Spray 작업영역 입력 계약](MULTI_PLANE_SPRAY.md)을 참고한다.
+
 ## 1. 실행 단위
 
 실제 로봇 실행은 보통 아래 터미널 묶음으로 나눈다.

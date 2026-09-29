@@ -23,6 +23,14 @@ import os
 
 def generate_launch_description():
     use_sim_depth_pointcloud = LaunchConfiguration('use_sim_depth_pointcloud')
+    process_parameters = {
+        key: ParameterValue(LaunchConfiguration(key), value_type=str)
+        for key in ('process_mode', 'model_id', 'spray_tool_axis')
+    }
+    spray_parameters = {
+        key: ParameterValue(LaunchConfiguration(key), value_type=float)
+        for key in ('spray_footprint_width_m', 'spray_overlap', 'spray_speed_mps', 'spray_standoff_m')
+    }
 
     # ---- robot_description (xacro -> URDF) --------------------------------
     robot_description_content = Command([
@@ -73,6 +81,7 @@ def generate_launch_description():
         executable='moveit_executor',
         name='moveit_executor',
         output='screen',
+        parameters=[process_parameters],
     )
 
     # ---- ZED perception pipeline ------------------------------------------
@@ -103,6 +112,7 @@ def generate_launch_description():
         executable='wall_projector',
         name='wall_projector',
         output='screen',
+        parameters=[{'process_mode': process_parameters['process_mode']}],
     )
 
     sketch_to_waypoints_node = Node(
@@ -110,6 +120,7 @@ def generate_launch_description():
         executable='sketch_to_waypoints',
         name='sketch_to_waypoints',
         output='screen',
+        parameters=[process_parameters, spray_parameters],
     )
 
     environment_scanner_node = Node(
@@ -120,6 +131,13 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument('process_mode', default_value='paint', choices=['paint', 'spray']),
+        DeclareLaunchArgument('model_id', default_value='rb10_1300e_u'),
+        DeclareLaunchArgument('spray_tool_axis', default_value=''),
+        DeclareLaunchArgument('spray_footprint_width_m', default_value='0.35'),
+        DeclareLaunchArgument('spray_overlap', default_value='0.30'),
+        DeclareLaunchArgument('spray_speed_mps', default_value='0.020'),
+        DeclareLaunchArgument('spray_standoff_m', default_value='0.5'),
         DeclareLaunchArgument(
             'use_sim_depth_pointcloud',
             default_value='true',

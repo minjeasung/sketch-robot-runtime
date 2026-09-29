@@ -11,7 +11,8 @@ import signal
 import socket
 import time
 from .robot_models import (DEFAULT_MODEL, MODEL_LABELS, validate_model,
-                           model_calibration_files, validate_calibration_files)
+                           model_calibration_files, validate_calibration_files,
+                           validate_process_mode, process_cameras)
 from .outpost_camera import validate_origin, camera_status
 
 
@@ -32,7 +33,7 @@ class ProcessSpec:
 
 def build_specs(workspace, options=None):
     options = dict(options or {})
-    allowed = {"profile", "robot_ip", "model_id", "launch_rviz", "launch_zed_driver", "launch_d405_driver",
+    allowed = {"profile", "process_mode", "robot_ip", "model_id", "launch_rviz", "launch_zed_driver", "launch_d405_driver",
                "camera_backend", "outpost_http", "outpost_zed_hw_id", "outpost_zed_serial",
                "outpost_d405_hw_id", "outpost_d405_serial"}
     if set(options) - allowed:
@@ -40,6 +41,13 @@ def build_specs(workspace, options=None):
     profile = options.setdefault("profile", "dry_run")
     if profile not in ("dry_run", "work", "fake", "spray_motion_test"):
         raise SupervisorError("profile must be dry_run, work, fake or spray_motion_test", 400)
+    try:
+        process_mode = validate_process_mode(options.setdefault(
+            'process_mode', 'spray' if profile == 'spray_motion_test' else 'paint'))
+    except ValueError as exc:
+        raise SupervisorError(str(exc), 400) from None
+    if profile == 'spray_motion_test' and process_mode != 'spray':
+        raise SupervisorError('spray_motion_test requires process_mode=spray', 400)
     robot_ip = options.setdefault("robot_ip", "10.0.2.7")
     try:
         validate_model(options.setdefault("model_id", DEFAULT_MODEL))
@@ -66,21 +74,27 @@ def build_specs(workspace, options=None):
         options.setdefault(key, profile != "fake" and (key == 'launch_rviz' or backend == 'native'))
         if type(options[key]) is not bool:
             raise SupervisorError(f"{key} must be a JSON boolean", 400)
+    if process_mode == 'spray':
+        options['launch_d405_driver'] = False
     if backend == 'outpost' and (options['launch_zed_driver'] or options['launch_d405_driver']):
         raise SupervisorError('Outpost owns cameras; native camera drivers must be disabled', 400)
     common = dict(options)
     common.pop("profile")
     if profile == 'fake':
         common['camera_backend'] = 'native'
-    common.update(model_calibration_files(workspace, options['model_id']))
+    common.update(model_calibration_files(workspace, options['model_id'], process_mode))
     common.update(use_fake_hardware=profile == "fake", use_isaac_sim=False, use_sim_time=False,
                   real_painting_enabled=profile in ("work", "spray_motion_test"),
                   dry_run=profile not in ("work", "spray_motion_test"),
-                  painting_force_enabled=profile == "work",
+                  painting_force_enabled=profile == "work" and process_mode == 'paint',
                   spray_motion_test=profile == "spray_motion_test")
+    perception_nodes = ('target_selector', 'wall_projector', 'sketch_to_waypoints')
+    if process_mode == 'paint':
+        perception_nodes += ('d405_surface_refiner',)
     groups = (
         ("robot_control", MODEL_LABELS[options['model_id']] + " · MoveIt · controllers · RViz", (), ("controller_manager", "move_group")),
-        ("perception", "ZED · D405 · calibration · sketch perception", ("robot_control",), ("target_selector", "d405_surface_refiner")),
+        ("perception", ("ZED · D405" if process_mode == 'paint' else "ZED") +
+         " · calibration · sketch perception", ("robot_control",), perception_nodes),
         ("force_pipeline", "Wrench reference · force monitor", ("robot_control",), ("painting_force_monitor",)),
         ("executor", "Sketch path executor · flight recorder", ("robot_control", "perception", "force_pipeline"), ("moveit_executor",)),
         ("rosbridge", "Browser ROS WebSocket (9090)", (), ("painting_rosbridge_websocket", "rosbridge_websocket")),
@@ -170,14 +184,16 @@ class Supervisor:
         if (self.options['model_id'] != DEFAULT_MODEL
                 and self.options['profile'] != 'fake'):
             try:
-                validate_calibration_files(model_calibration_files(self.workspace, self.options['model_id']))
+                mode = self.options['process_mode']
+                validate_calibration_files(
+                    model_calibration_files(self.workspace, self.options['model_id'], mode), mode)
             except ValueError as exc:
                 raise SupervisorError(str(exc)) from None
 
     def _validate_cameras(self):
         if self.options['camera_backend'] != 'outpost' or self.options['profile'] == 'fake':
             return
-        for camera, kind in (('zed', 'zed'), ('d405', 'realsense')):
+        for camera, kind in process_cameras(self.options['process_mode']):
             try:
                 camera_status(self.options['outpost_http'], self.options[f'outpost_{camera}_hw_id'],
                               self.options[f'outpost_{camera}_serial'], kind)
@@ -199,9 +215,10 @@ class Supervisor:
                 # single-process name to prevent duplicate Outpost consumers.
                 conflicts.update({
                     'sketch_outpost_zed_bridge',
-                    'sketch_outpost_d405_bridge',
                     'sketch_outpost_bridge',
                 })
+                if self.options['process_mode'] == 'paint':
+                    conflicts.add('sketch_outpost_d405_bridge')
             if self.options["launch_zed_driver"]:
                 conflicts.add("zed_node")
             if self.options["launch_d405_driver"]:

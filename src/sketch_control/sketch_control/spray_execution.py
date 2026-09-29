@@ -22,8 +22,14 @@ class SprayExecutionMixin:
             raise ValueError('spray_motion_test must be a boolean')
         if self.spray_motion_test and self.painting_force_enabled:
             raise ValueError('spray_motion_test requires painting_force_enabled=false')
-        self.process_mode = "spray" if self.spray_motion_test else "paint"
+        self.initial_process_mode = str(self.declare_parameter(
+            "process_mode", "paint", ParameterDescriptor(read_only=True)).value)
+        if self.initial_process_mode not in {"paint", "spray"}:
+            raise ValueError("process_mode must be paint or spray")
+        self.process_mode = "spray" if self.spray_motion_test else self.initial_process_mode
         self._paint_force_configured = self.painting_force_enabled
+        if self.process_mode == "spray":
+            self.painting_force_enabled = False
         self._spray_session = str(uuid.uuid4())
         self._spray_seq = 0
         self._spray_on = False
@@ -62,6 +68,9 @@ class SprayExecutionMixin:
         if self._is_spray_motion_test() and mode != 'spray':
             self._publish_process_mode('MOTION_TEST_REQUIRES_SPRAY_MODE')
             return
+        if getattr(self, "initial_process_mode", "paint") == "spray" and mode == "paint":
+            self._publish_process_mode("PAINT_REQUIRES_D405_RELAUNCH")
+            return
         if self.executing or self._active_trajectory_goal_token is not None or self._d405_prescan_active or getattr(self, "_multi_queue", []) or getattr(self, "_multi_current", None) is not None:
             self._publish_process_mode('BUSY')
             return
@@ -74,6 +83,13 @@ class SprayExecutionMixin:
             return
         self._reset_painting_process()
         self.process_mode = mode
+        self._invalidate_zed_target("PROCESS_MODE_CHANGED")
+        self._zed_selection_generation = ""
+        self._multi_selected = []
+        self._multi_refined = {}
+        self._multi_active_id = ""
+        self._d405_plane_accepted = False
+        self._reset_d405_refined_lock("process mode changed", clear_surface=True)
         self.painting_force_enabled = self._paint_force_configured if mode == 'paint' else False
         self._execution_tare_ready = False
         self._segment_path = None
@@ -183,6 +199,6 @@ class SprayExecutionMixin:
                 else:
                     self._schedule_process_once(.05, wait_off)
                 return
-            self._transition_execution_state(step.mode, 'non-contact spray path; 0.5 m')
+            self._transition_execution_state(step.mode, 'non-contact spray path')
             self._plan_process_motion_step(step)
         wait_off()

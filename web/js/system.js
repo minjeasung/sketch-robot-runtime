@@ -6,6 +6,7 @@ const processLabels = {robot_control: "robot control"};
 const processLabel = name => processLabels[name] || name;
 function options() {
   return {profile: byId("profile").value, robot_ip: byId("robot-ip").value.trim(), model_id: byId("model-id").value,
+    process_mode: byId("profile").value === "spray_motion_test" ? "spray" : byId("process-mode").value,
     launch_zed_driver: byId("zed").checked, launch_d405_driver: byId("d405").checked,
     camera_backend: byId('camera-backend').value, outpost_http: byId('outpost-http').value.trim(),
     outpost_zed_hw_id: byId('outpost-zed-hw-id').value.trim(), outpost_zed_serial: byId('outpost-zed-serial').value.trim(),
@@ -21,6 +22,7 @@ async function api(path, method = "GET", body) {
   return payload;
 }
 function profileHelp() {
+  if (byId("profile").value === "spray_motion_test") byId("process-mode").value = "spray";
   byId("profile-help").textContent = {
     dry_run: "실제 로봇·카메라에 연결하지만 작업 경로와 힘 출력은 모의 실행합니다.",
     work: "실제 이동과 도장 힘 제어를 허용합니다. 작업 실행은 스케치 화면에서 진행합니다.",
@@ -32,12 +34,13 @@ function controls() {
   const active = latest && latest.processes.some(p => p.pid !== null);
   byId("start").disabled = pending || !latest || latest.system_prepared;
   byId("stop").disabled = pending || !latest || (!active && !latest.degraded);
-  for (const id of ["profile", "robot-ip", "model-id", "zed", "d405", "rviz", 'camera-backend',
+  for (const id of ["profile", "process-mode", "robot-ip", "model-id", "zed", "d405", "rviz", 'camera-backend',
     'outpost-http', 'outpost-zed-hw-id', 'outpost-zed-serial', 'outpost-d405-hw-id', 'outpost-d405-serial',
     'outpost-load', 'outpost-zed-select', 'outpost-d405-select']) byId(id).disabled = pending || active;
   if (byId('camera-backend').value === 'outpost') {
     for (const id of ['zed', 'd405']) { byId(id).checked = false; byId(id).disabled = true; }
   }
+  if (byId("profile").value === "spray_motion_test") byId("process-mode").disabled = true;
   byId('outpost-settings').hidden = byId('camera-backend').value !== 'outpost';
   for (const button of document.querySelectorAll(".process-row button")) button.disabled = pending || !latest;
 }
@@ -67,6 +70,7 @@ async function refresh() {
     if (!settingsLoaded) {
       const c = state.configuration;
       byId("profile").value = c.profile; byId("robot-ip").value = c.robot_ip;
+      byId("process-mode").value = c.process_mode || "paint";
       byId("model-id").value = c.model_id || "rb10_1300e_u";
       byId('camera-backend').value = c.camera_backend || 'native';
       for (const key of ['outpost_http', 'outpost_zed_hw_id', 'outpost_zed_serial', 'outpost_d405_hw_id', 'outpost_d405_serial']) {
@@ -77,7 +81,7 @@ async function refresh() {
     }
     byId("state").textContent = state.degraded ? "프로세스 오류" : state.system_prepared ? "전체 프로세스 실행 중" : "API 연결됨";
     byId("domain").textContent = `ROS domain ${state.ros_domain_id}`;
-    byId("detail").textContent = `로봇: ${state.configuration.model_id || "rb10_1300e_u"} · 서버 실행 모드: ${state.configuration.profile} · ${state.processes.filter(p => p.state === "RUNNING").length}/${state.processes.length} 실행 중`;
+    byId("detail").textContent = `로봇: ${state.configuration.model_id || "rb10_1300e_u"} · 서버 실행 모드: ${state.configuration.profile} · 작업 방식: ${state.configuration.process_mode === "spray" || state.configuration.profile === "spray_motion_test" ? "내화뿜칠" : "롤러 도장"} · ${state.processes.filter(p => p.state === "RUNNING").length}/${state.processes.length} 실행 중`;
     byId("readiness").textContent = state.ros.readiness ? JSON.stringify(state.ros.readiness) : "최신 ROS 작업 준비 상태를 기다리는 중입니다.";
     byId("status-json").textContent = JSON.stringify(state, null, 2);
     renderProcesses(state);
@@ -106,6 +110,11 @@ byId("stop").addEventListener("click", () => perform(() => api("/shutdown-system
 byId("profile").addEventListener("change", () => {
   for (const id of ["zed", "d405", "rviz"]) byId(id).checked = byId("profile").value !== "fake";
   profileHelp();
+  if (byId("process-mode").value === "spray") byId("d405").checked = false;
+  controls();
+});
+byId("process-mode").addEventListener("change", () => {
+  if (byId("process-mode").value === "spray") byId("d405").checked = false;
   controls();
 });
 byId('camera-backend').addEventListener('change', controls);

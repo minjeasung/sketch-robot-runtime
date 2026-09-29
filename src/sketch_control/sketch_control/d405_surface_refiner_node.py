@@ -110,6 +110,9 @@ def _normal_to_quaternion(normal):
 class D405SurfaceRefinerNode(Node):
     def __init__(self):
         super().__init__("d405_surface_refiner_node")
+        self.process_mode = str(self.declare_parameter("process_mode", "paint").value)
+        self.create_subscription(
+            String, "/painting_system/process_mode", self._on_process_mode, LATCHED_QOS)
 
         self.declare_parameter("cloud_topic", "/d405/d405/depth/color/points")
         self.declare_parameter("max_points", 120000)
@@ -363,7 +366,25 @@ class D405SurfaceRefinerNode(Node):
         )
 
     # ---- lifecycle inputs -------------------------------------------------
+    def _on_process_mode(self, msg):
+        try:
+            payload = json.loads(msg.data)
+            mode = payload.get("mode", "") if isinstance(payload, dict) else str(payload)
+        except (ValueError, TypeError):
+            mode = str(msg.data).strip()
+        if mode not in {"paint", "spray"} or mode == self.process_mode:
+            return
+        self.process_mode = mode
+        self._active_capture_mode = None
+        self._active_capture_reference = None
+        self._pending_cloud_capture = None
+        for name, lifecycle in self._lifecycles.items():
+            self._invalidate_lifecycle(
+                name, "process_mode_changed", token=lifecycle.invalidation_seq + 1)
+
     def _on_target_surface(self, msg):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         target_id = canonical_target_id(
             msg.header.frame_id or "zed_left_camera_frame",
             (
@@ -428,9 +449,13 @@ class D405SurfaceRefinerNode(Node):
             self._start_capture("target")
 
     def _on_work_area_plane(self, msg):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         self.latest_work_area_plane = msg
 
     def _on_work_area_corners(self, msg):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         if len(msg.poses) < 4:
             return
         points = self._corner_points(msg)
@@ -478,6 +503,8 @@ class D405SurfaceRefinerNode(Node):
         )
 
     def _on_work_area_state(self, msg):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         try:
             payload = json.loads(msg.data)
         except Exception as exc:
@@ -533,6 +560,8 @@ class D405SurfaceRefinerNode(Node):
         )
 
     def _on_refine_work_area(self, msg):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         if not msg.data:
             return
         lifecycle = self._lifecycles["work_area"]
@@ -612,6 +641,8 @@ class D405SurfaceRefinerNode(Node):
             self._start_capture("work_area")
 
     def _on_target_capture_request(self, msg):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         # Validate the complete request before changing the capture lifecycle.
         try:
             data = json.loads(msg.data)
@@ -641,6 +672,8 @@ class D405SurfaceRefinerNode(Node):
             self._start_capture("target")
 
     def _on_refine_target(self, msg):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         if not msg.data:
             return
         lifecycle = self._lifecycles["target"]
@@ -653,6 +686,8 @@ class D405SurfaceRefinerNode(Node):
         self._start_capture("target")
 
     def _start_capture(self, mode, *, reference_plane=None, roi_polygon=None):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return False
         if self._active_capture_mode is not None:
             self._publish_status(
                 False,
@@ -733,6 +768,8 @@ class D405SurfaceRefinerNode(Node):
         )
 
     def _on_cloud(self, msg):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         mode = self._active_capture_mode
         if mode is None:
             return

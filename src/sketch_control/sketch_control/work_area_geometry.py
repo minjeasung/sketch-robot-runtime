@@ -22,6 +22,69 @@ PixelRect = tuple[float, float, float, float]
 PixelStroke = tuple[PixelPoint, PixelPoint]
 
 
+def validate_zed_surface_status(payload):
+    """Validate an atomic work-area geometry message before it can be cached."""
+    if not isinstance(payload, dict) or (
+        payload.get("source") != "zed" or payload.get("mode") != "work_area"
+        or payload.get("accepted") is not True or payload.get("state") != "locked"
+    ):
+        raise WorkAreaGeometryError("accepted locked ZED work-area status is required")
+    for field in ("plane_generation_id", "work_area_id", "selection_id", "frame_id"):
+        if not isinstance(payload.get(field), str) or not payload[field].strip():
+            raise WorkAreaGeometryError(f"ZED status requires {field}")
+    if not payload["plane_generation_id"].startswith("zed:"):
+        raise WorkAreaGeometryError("ZED status has a non-ZED plane generation")
+    selection = payload["selection_id"]
+    if not selection.isdecimal() or int(selection) <= 0 or str(int(selection)) != selection:
+        raise WorkAreaGeometryError("selection_id must be a positive pixel timestamp in nanoseconds")
+    stamp = payload.get("target_stamp")
+    if (not isinstance(stamp, dict)
+            or any(type(stamp.get(key)) is not int for key in ("sec", "nanosec"))
+            or stamp["sec"] < 0 or not 0 <= stamp["nanosec"] < 1_000_000_000
+            or stamp["sec"] * 1_000_000_000 + stamp["nanosec"] <= 0):
+        raise WorkAreaGeometryError("ZED target_stamp is invalid")
+    for field in ("view_width", "view_height"):
+        if type(payload.get(field)) is not int or payload[field] <= 1:
+            raise WorkAreaGeometryError(f"ZED {field} must be an integer greater than one")
+    try:
+        position = np.asarray(payload.get("position"), dtype=float)
+        orientation = np.asarray(payload.get("orientation"), dtype=float)
+        if position.shape != (3,) or not np.all(np.isfinite(position)):
+            raise WorkAreaGeometryError("ZED position must be a finite three-vector")
+        if (orientation.shape != (4,) or not np.all(np.isfinite(orientation))
+                or abs(float(np.linalg.norm(orientation)) - 1.0) > 1e-5):
+            raise WorkAreaGeometryError("ZED orientation must be a unit quaternion")
+        x, y, z, w = orientation
+        normal = np.array([2*(x*z+y*w), 2*(y*z-x*w), 1-2*(x*x+y*y)])
+        for field in ("corners", "front_extent"):
+            quad = np.asarray(payload.get(field), dtype=float)
+            quad_size_m(quad)
+            _quad_projection(quad)
+            edges = np.roll(quad, -1, axis=0) - quad
+            turns = np.cross(edges, np.roll(edges, -1, axis=0)) @ normal
+            if not (np.all(turns > 1e-8) or np.all(turns < -1e-8)):
+                raise WorkAreaGeometryError(f"ZED {field} must be convex and nondegenerate")
+            if np.max(np.abs((quad - position) @ normal)) > 0.002:
+                raise WorkAreaGeometryError(f"ZED {field} does not lie on the accepted plane")
+        if np.linalg.norm(np.mean(payload["corners"], axis=0) - position) > 0.002:
+            raise WorkAreaGeometryError("ZED position must be the work-area center")
+        if outside_quad_3d_indices(payload["corners"], payload["front_extent"]):
+            raise WorkAreaGeometryError("ZED work area is outside its front extent")
+    except (TypeError, ValueError) as exc:
+        raise WorkAreaGeometryError(str(exc)) from exc
+    return payload
+
+
+def generate_spray_fill_strokes(rect, *, work_area_width_m, work_area_height_m,
+                               footprint_width_m, overlap):
+    """Generate coverage using the spray fan width and requested overlap."""
+    return generate_fill_strokes(
+        rect, work_area_width_m=work_area_width_m,
+        work_area_height_m=work_area_height_m,
+        roller_length_m=footprint_width_m, overlap=overlap,
+    )
+
+
 def _finite_point2(point: Sequence[float], label: str) -> PixelPoint:
     if len(point) < 2:
         raise WorkAreaGeometryError(f"{label} must have two coordinates")

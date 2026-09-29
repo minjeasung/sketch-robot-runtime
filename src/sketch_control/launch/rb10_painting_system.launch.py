@@ -19,7 +19,8 @@ from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 from sketch_control.robot_models import (DEFAULT_MODEL, validate_model,
-                                         model_calibration_files, validate_calibration_files)
+                                         model_calibration_files, validate_calibration_files,
+                                         validate_process_mode, process_cameras)
 from sketch_control.outpost_camera import camera_status
 
 
@@ -31,12 +32,19 @@ def _validate_interlock_values(
     dry_run,
     painting_force_enabled,
     spray_motion_test=False,
+    process_mode=None,
 ):
     """Reject launch combinations that could bypass the real-motion gate."""
 
     real_hardware = not bool(use_fake_hardware) and not bool(use_isaac_sim)
+    mode = validate_process_mode(process_mode if process_mode is not None else
+                                 ('spray' if spray_motion_test else 'paint'))
+    if bool(spray_motion_test) and mode != 'spray':
+        raise RuntimeError('spray_motion_test requires process_mode=spray')
     if bool(spray_motion_test) and bool(painting_force_enabled):
         raise RuntimeError("spray_motion_test requires painting_force_enabled=false")
+    if mode == 'spray' and bool(painting_force_enabled):
+        raise RuntimeError('process_mode=spray requires painting_force_enabled=false')
     if real_hardware and not bool(dry_run) and not bool(real_painting_enabled):
         raise RuntimeError(
             "real hardware with dry_run=false requires "
@@ -54,6 +62,7 @@ def _validate_interlock_values(
 def _validate_launch_interlocks(context, *args, **kwargs):
     del args, kwargs
     model = validate_model(LaunchConfiguration("model_id").perform(context))
+    process_mode = validate_process_mode(LaunchConfiguration('process_mode').perform(context))
 
     def enabled(name):
         return LaunchConfiguration(name).perform(context).strip().lower() in {
@@ -70,20 +79,25 @@ def _validate_launch_interlocks(context, *args, **kwargs):
         dry_run=enabled("dry_run"),
         painting_force_enabled=enabled("painting_force_enabled"),
         spray_motion_test=enabled("spray_motion_test"),
+        process_mode=process_mode,
     )
-    paths = model_calibration_files(os.environ.get("SKETCH_WORKSPACE", "~/sketch_robot_ws"), model)
+    paths = model_calibration_files(
+        os.environ.get("SKETCH_WORKSPACE", "~/sketch_robot_ws"), model, process_mode)
     for key in paths:
         paths[key] = LaunchConfiguration(key).perform(context).strip() or paths[key]
     if (model != DEFAULT_MODEL and enabled("launch_perception")
             and not enabled("use_fake_hardware") and not enabled("use_isaac_sim")):
-        validate_calibration_files(paths)
+        validate_calibration_files(paths, process_mode)
+    if process_mode == 'spray':
+        paths['launch_d405_driver'] = 'false'
+        paths['front_view_source'] = 'zed'
     backend = LaunchConfiguration('camera_backend').perform(context)
     if backend not in ('outpost', 'native'):
         raise ValueError('camera_backend must be outpost or native')
     if enabled('use_fake_hardware') or enabled('use_isaac_sim'):
         paths['camera_backend'] = 'native'
     elif enabled('launch_perception') and backend == 'outpost':
-        for camera, kind in (('zed', 'zed'), ('d405', 'realsense')):
+        for camera, kind in process_cameras(process_mode):
             if enabled(f'launch_{camera}_driver'):
                 raise ValueError('Outpost requires native camera drivers disabled')
             camera_status(LaunchConfiguration('outpost_http').perform(context),
@@ -108,12 +122,21 @@ def generate_launch_description():
     ])
 
     arguments = [
+        DeclareLaunchArgument('spray_tool_axis', default_value=''),
+        DeclareLaunchArgument('spray_footprint_width_m', default_value='0.35'),
+        DeclareLaunchArgument('spray_overlap', default_value='0.30'),
+        DeclareLaunchArgument('spray_speed_mps', default_value='0.020'),
+        DeclareLaunchArgument('spray_standoff_m', default_value='0.5'),
         DeclareLaunchArgument("zed_calibration_file", default_value=""),
         DeclareLaunchArgument("d405_calibration_file", default_value=""),
         DeclareLaunchArgument(
             "spray_motion_test", default_value="false",
             description="Current EOAT without gun: spray path motion only; gun output always OFF",
         ),
+        DeclareLaunchArgument('process_mode', default_value=PythonExpression([
+            "'spray' if '", LaunchConfiguration('spray_motion_test'),
+            "'.lower() in ('true', '1', 'yes', 'on') else 'paint'",
+        ]), choices=['paint', 'spray']),
         DeclareLaunchArgument(
             "painting_config_file",
             default_value=PathJoinSubstitution([
@@ -274,6 +297,9 @@ def generate_launch_description():
         launch_arguments={
             "painting_config_file": config_file,
             **{key: LaunchConfiguration(key) for key in
+               ('process_mode', 'model_id', 'spray_tool_axis', 'spray_footprint_width_m',
+                'spray_overlap', 'spray_speed_mps', 'spray_standoff_m')},
+            **{key: LaunchConfiguration(key) for key in
                ('camera_backend', 'outpost_http', 'outpost_zed_hw_id', 'outpost_zed_serial',
                 'outpost_d405_hw_id', 'outpost_d405_serial')},
             "real_painting_enabled": real_painting_enabled,
@@ -338,6 +364,8 @@ def generate_launch_description():
                 ),
                 "dry_run": ParameterValue(dry_run, value_type=bool),
                 "model_id": LaunchConfiguration("model_id"),
+                "process_mode": ParameterValue(LaunchConfiguration('process_mode'), value_type=str),
+                "spray_tool_axis": ParameterValue(LaunchConfiguration('spray_tool_axis'), value_type=str),
                 "spray_motion_test": ParameterValue(
                     LaunchConfiguration("spray_motion_test"), value_type=bool
                 ),

@@ -1,4 +1,4 @@
-"""Sequential D405 measurements of explicitly selected ZED planes."""
+"""Selected ZED plane locks for Spray, sequential D405 measurements for Paint."""
 import copy
 import json
 import time
@@ -47,6 +47,7 @@ class MultiSurfaceMixin(D405ScanSelectionMixin):
             self._multi_state = state
         self._multi_status_pub.publish(String(data=json.dumps(dict(
             generation=self._multi_catalog.get('generation',''), state=self._multi_state,
+            source='zed' if getattr(self, 'process_mode', 'paint') == 'spray' else 'd405',
             selected=self._multi_selected, measured=list(self._multi_refined),
             active_id=self._multi_active_id, error=error,
             current_id=self._multi_current['id'] if self._multi_current else '',
@@ -76,6 +77,8 @@ class MultiSurfaceMixin(D405ScanSelectionMixin):
             self._multi_status(error='INVALID_CATALOG')
             return
         self._multi_catalog = data
+        if getattr(self, "process_mode", "paint") == "spray":
+            self._invalidate_zed_target("ZED_CATALOG_CHANGED")
         self._multi_selected = []
         self._multi_refined = {}
         self._multi_active_id = ''
@@ -100,6 +103,16 @@ class MultiSurfaceMixin(D405ScanSelectionMixin):
             planes = [copy.deepcopy(catalog[p]) for p in selected]
         except (ValueError, TypeError, KeyError):
             self._multi_status(error='INVALID_SELECTION')
+            return
+        if getattr(self, "process_mode", "paint") == "spray":
+            if self._multi_catalog["generation"] != getattr(self, "_zed_selection_generation", ""):
+                self._multi_status(error="STALE_ZED_SELECTION")
+                return
+            self._multi_selected = list(selected)
+            self._multi_refined = {}
+            self._multi_queue = []
+            self._multi_current = None
+            self._multi_lock_zed_plane(selected[0])
             return
         if self.current_joint_state is None or self._current_tcp_pose_np() is None:
             self._multi_status(error='ROBOT_STATE_UNAVAILABLE')
@@ -188,6 +201,8 @@ class MultiSurfaceMixin(D405ScanSelectionMixin):
         return True
 
     def _multi_on_refined(self, msg):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         if self._multi_current is None or self._multi_capture_started <= 0:
             return
         try:
@@ -241,6 +256,9 @@ class MultiSurfaceMixin(D405ScanSelectionMixin):
             self._multi_status(error='INVALID_ACTIVE_PLANE')
 
     def _multi_activate(self, plane_id):
+        if getattr(self, "process_mode", "paint") == "spray":
+            self._multi_lock_zed_plane(plane_id)
+            return
         if plane_id not in self._multi_refined or plane_id not in self._multi_selected:
             self._multi_status(error='PLANE_NOT_MEASURED')
             return
@@ -249,6 +267,46 @@ class MultiSurfaceMixin(D405ScanSelectionMixin):
         self._multi_activation_only = True
         self._multi_queue = [copy.deepcopy(next(p for p in self._multi_catalog['planes'] if p['id'] == plane_id))]
         self._multi_start_next()
+
+    def _multi_lock_zed_plane(self, plane_id):
+        if plane_id not in self._multi_selected:
+            self._multi_status(error="PLANE_NOT_SELECTED")
+            return
+        self._invalidate_zed_target("ZED_ACTIVE_PLANE_CHANGED")
+        self._multi_active_id = ""
+        plane = next((p for p in self._multi_catalog["planes"] if p["id"] == plane_id), None)
+        if plane is None or not self._multi_catalog.get("frame_id"):
+            self._multi_status(error="INVALID_ZED_PLANE")
+            return
+        try:
+            if (int(plane["inlier_count"]) < 80
+                    or not np.isfinite(float(plane["rms_m"]))
+                    or not 0. <= float(plane["rms_m"]) <= .015):
+                raise ValueError("insufficient ZED support")
+        except (KeyError, TypeError, ValueError):
+            self._multi_status(error="ZED_PLANE_QUALITY_REJECTED")
+            return
+        self._reset_d405_refined_lock("ZED spray target", clear_surface=True)
+        pose = self._multi_pose(plane)
+        stamp = pose.header.stamp
+        generation = (
+            f"zed:{self._multi_catalog['generation']}:{plane_id}:"
+            f"{stamp.sec * 1_000_000_000 + stamp.nanosec}"
+        )
+        self._zed_target_lock = dict(
+            accepted=True, source="zed", state="locked",
+            plane_generation_id=generation,
+            catalog_generation=self._multi_catalog["generation"],
+            plane_id=plane_id, frame_id=self._multi_catalog["frame_id"],
+            center=plane["center"], normal=plane["normal"], corners=plane["corners"],
+            inlier_count=plane["inlier_count"], rms_m=plane["rms_m"],
+            stamp=dict(sec=stamp.sec, nanosec=stamp.nanosec))
+        self._multi_active_id = plane_id
+        # All selected faces already have RANSAC estimates; activation never moves the arm.
+        self._multi_refined = {pid: None for pid in self._multi_selected}
+        self._zed_target_lock_pub.publish(String(data=json.dumps(
+            self._zed_target_lock, allow_nan=False)))
+        self._multi_status("ready")
 
     def _multi_apply_active(self, plane_id):
         if plane_id not in self._multi_refined or plane_id not in self._multi_selected:
