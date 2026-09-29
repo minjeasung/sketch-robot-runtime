@@ -10,7 +10,7 @@ if [[ ! "$SKETCH_BUILD_JOBS" =~ ^[1-9][0-9]*$ ]]; then echo 'SKETCH_BUILD_JOBS m
 cd "$SKETCH_BUILD_ROOT"
 if [[ ! -f /opt/ros/jazzy/setup.bash ]]; then echo 'Install ROS 2 Jazzy first; see docs/PORTABLE_INSTALL.md' >&2; exit 1; fi
 if [[ "$SKETCH_BUILD_WITH_ZED" == true && ! -f /usr/local/zed/zed-config.cmake ]]; then
-    echo 'Install ZED SDK 5.3 with its matching CUDA toolkit first, or use --without-zed for fake hardware.' >&2
+    echo 'Install ZED SDK 5.3 with its matching CUDA toolkit first, or use --without-zed when cameras are owned by Outpost.' >&2
     exit 1
 fi
 unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH CMAKE_PREFIX_PATH PYTHONPATH LD_LIBRARY_PATH
