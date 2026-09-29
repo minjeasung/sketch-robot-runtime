@@ -326,10 +326,16 @@ CAMERA_EYE = Gf.Vec3d(
     _BOLT_TOP_Z + 0.045,                    # 1.0 (bolt top + 본체 mesh extent buffer)
 )
 CAMERA_TARGET = Gf.Vec3d(_WALL_FRONT_X, 0.0, 0.5)
-ZED_2I_USD_PATH = (
+ZED_2I_USD_PATH = os.environ.get(
+    "ZED_2I_USD_PATH",
     "/home/minjea/sketch_robot_ws/zed-isaac-sim/"
-    "exts/sl.sensor.camera/data/usd/ZED_2i.usdc"
+    "exts/sl.sensor.camera/data/usd/ZED_2i.usdc",
 )
+if not os.path.isfile(ZED_2I_USD_PATH):
+    raise RuntimeError(
+        "Official ZED_2i.usdc not found. Update stereolabs/zed-isaac-sim "
+        "or set ZED_2I_USD_PATH to exts/sl.sensor.camera/data/usd/ZED_2i.usdc"
+    )
 
 # CAMERA_PATH 를 Xform 으로 만들고 ZED_2i.usdc 를 reference. defaultPrim 이 child 가 됨.
 zed_carrier = UsdGeom.Xform.Define(stage, CAMERA_PATH)
