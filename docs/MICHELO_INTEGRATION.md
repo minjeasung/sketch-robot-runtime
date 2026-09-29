@@ -24,7 +24,9 @@ D405 → Outpost → ZMQ IPC → sketch_outpost_d405_bridge ┴→ 기존 인식
 
 ROS 런타임 설치는 `PORTABLE_INSTALL.md`를 따른다. Outpost는 기존 설치본을 사용한다.
 새 로봇 PC에서는 먼저 참고 저장소의 Outpost 설치 안내에 따라 데몬을 준비한다.
-Outpost를 사용할 때 스케치 측 ZED SDK/드라이버 빌드는 필요하지 않다:
+Outpost를 사용할 때 스케치 측 ZED SDK/드라이버 빌드는 필요하지 않다.
+ZED 2i의 3D 형상과 MoveIt collision은 SDK와 무관한 공식 `zed_description`
+패키지의 `zed2i.stl`을 사용한다:
 
 ```bash
 bash scripts/install_runtime.sh --install-deps --without-zed
@@ -136,6 +138,11 @@ ZED point cloud는 기존 `cloud_registered` 소비 노드와 맞도록 `zed_lef
 `zed_left_camera_frame_optical`을 유지한다.
 D405는 기본 15 Hz, stride 1로 SDK compact XYZ(mm)를 유효 픽셀에 복원해 미터로 변환하여
 소수 mm 정보를 보존한다.
+
+ZED 2i의 물리 형상은 카메라 데이터 경로와 분리한다. MoveIt은
+`zed_left_camera_frame` 보정 TF에 공식 `package://zed_description/meshes/zed2i.stl`
+mesh를 배치한다. mesh/TF를 사용할 수 없을 때만 기존 보수적 box로 fallback한다.
+카메라 지지대는 단순 box collision을 유지한다.
 기존 D405 광학 보정 체인 `tcp → d405_link → d405_color_optical_frame`을 발행하며,
 D405의 RGB가 깊이 격자에 정렬된다는 전제를 검사한다. URDF의 카메라 외형 위치를 변경하지 않는다.
 Windows 미리보기용 JPEG/PNG16 WebSocket 프레임을 정밀 측정 점군으로 대체하지 않는다.
