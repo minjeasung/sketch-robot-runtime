@@ -200,16 +200,21 @@ scene_obstacle_voxel_m:=0.07
 `Set Work Area`는 기존처럼 `/refine_work_area`를 요청하고, 결과는
 `/perception/work_area_plane_refined`로 들어와 실제 경로를 다시 보정한다.
 
-카메라 serial 을 고정해야 하면 아래처럼 추가한다.
+Outpost에서는 논리 ID와 **보정에 사용한 실제 시리얼을 둘 다 고정**한다.
 
 ```bash
 ros2 launch sketch_control rb10_real_perception_sketch.launch.py \
-  zed_camera_model:=zed2i \
-  zed_serial_number:=YOUR_ZED_SERIAL \
-  d405_serial_no:=YOUR_D405_SERIAL
+  camera_backend:=outpost \
+  outpost_zed_hw_id:=YOUR_ZED_HW_ID \
+  outpost_zed_serial:=YOUR_ZED2I_SERIAL \
+  outpost_d405_hw_id:=YOUR_D405_HW_ID \
+  outpost_d405_serial:=YOUR_D405_SERIAL \
+  launch_zed_driver:=false \
+  launch_d405_driver:=false
 ```
 
-이미 별도 터미널에서 ZED/D405 wrapper 를 직접 띄운 경우에만 기존 perception launch 를 사용한다.
+`camera_backend=native`로 명시해 별도 ZED/D405 wrapper를 직접 띄우는 경우에만
+기존 native perception 경로를 사용한다.
 
 ```bash
 ros2 launch sketch_control rb10_perception_sketch.launch.py \
