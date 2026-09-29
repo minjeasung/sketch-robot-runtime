@@ -13,7 +13,8 @@ Michelo 설치 파일, 카메라 데몬, 참고 Git 저장소는 수정하지 �
               └─ 스케치 작업 ↗ → :8081/sketch/ (새 탭)
                                   ├─ 시스템 관리 :8081/
                                   └─ rosbridge :9090
-ZED/D405 → Outpost → 원본 ZMQ IPC → sketch_outpost_bridge → 기존 인식·경로·실행부
+ZED → Outpost → ZMQ IPC → sketch_outpost_zed_bridge ┐
+D405 → Outpost → ZMQ IPC → sketch_outpost_d405_bridge ┴→ 기존 인식·경로·실행부
 ```
 
 화면을 열거나 링크를 누르는 동작은 로봇을 기동하거나 움직이지 않는다.
@@ -105,8 +106,11 @@ SDK `point_cloud`는 raw IPC에 제공되며 인코딩 스트림 채널 선택�
 브리지는 GET 상태 조회와 ZMQ 구독만 한다. connect/start/stop/disconnect를 보내지 않는다.
 카메라 타입·논리 ID·시리얼·내부 파라미터·해상도·generation과 IPC 접근 권한을 검사한다.
 프레임은 RGB/깊이 동일 격자, 채널 길이·단위, 타임스탬프·시퀀스를 확인한다.
-오래된/역순 프레임을 버리고 3초 동안 유효 프레임이 없으면 종료한다. 재연결/generation,
-해상도, 내부 파라미터가 바뀌어도 자동으로 작업을 이어가지 않고 인식을 다시 시작해야 한다.
+오래된/역순 프레임을 버리고 3초 동안 유효 프레임이 없으면 종료한다. ZED와 D405는
+서로 다른 ROS 프로세스로 실행되어 한 카메라의 점군 계산이 다른 카메라 처리를 지연시키지 않는다.
+동일한 보정 카메라에서 generation 또는 IPC endpoint만 바뀐 경우 ZMQ subscriber를 안전하게
+재연결하고 frame guard를 초기화한다. 반면 해상도나 intrinsics가 바뀌면 pixel-to-ray 보정이
+달라진 것이므로 fail-closed로 종료하여 perception 재시작/보정을 요구한다.
 
 브리지 종료는 perception launch 전체를 종료한다. Supervisor는 perception 종료를 감지해
 의존 executor를 중단하며 기존 abort 절차를 사용한다. 전체 시작 전 카메라 사전 검사를
@@ -124,9 +128,14 @@ Michelo의 다른 로봇 제어 기능과 스케치를 동시에 조작하지 �
 | D405 depth | `/d405/d405/depth/image_rect_raw` + `/d405/d405/depth/camera_info` |
 | D405 SDK XYZ | `/d405/d405/depth/color/points` |
 
-영상은 RGB8, 깊이는 32FC1 미터 단위다.
-ZED 점군은 광학 좌표계 `zed_left_camera_frame_optical`의 XYZ 미터로 발행한다.
-D405는 SDK compact XYZ(mm)를 유효 픽셀에 복원해 미터로 변환하여 소수 mm 정보를 보존한다.
+영상은 RGB8, 깊이는 32FC1 미터 단위다. RGB/depth/CameraInfo는 원본 해상도를 유지한다.
+ZED의 전역 point cloud는 기본 10 Hz, pixel stride 2로 생성하므로 가로·세로 점 밀도가 절반,
+전체 점 수는 약 1/4이다. depth→XYZ 계산 단계부터 stride를 적용해 계산량도 함께 줄인다.
+ZED point cloud는 기존 `cloud_registered` 소비 노드와 맞도록 `zed_left_camera_frame`
+(x forward, y left, z up)으로 발행하며, RGB/depth/CameraInfo는
+`zed_left_camera_frame_optical`을 유지한다.
+D405는 기본 15 Hz, stride 1로 SDK compact XYZ(mm)를 유효 픽셀에 복원해 미터로 변환하여
+소수 mm 정보를 보존한다.
 기존 D405 광학 보정 체인 `tcp → d405_link → d405_color_optical_frame`을 발행하며,
 D405의 RGB가 깊이 격자에 정렬된다는 전제를 검사한다. URDF의 카메라 외형 위치를 변경하지 않는다.
 Windows 미리보기용 JPEG/PNG16 WebSocket 프레임을 정밀 측정 점군으로 대체하지 않는다.
