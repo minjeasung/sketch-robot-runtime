@@ -102,10 +102,34 @@ def _load_ft_defaults():
 def generate_launch_description():
     ft_defaults = _load_ft_defaults()
     is_outpost = PythonExpression(["'", LaunchConfiguration('camera_backend'), "' == 'outpost'"])
-    outpost_bridge = Node(package='sketch_control', executable='outpost_bridge',
-        name='sketch_outpost_bridge', output='screen', condition=IfCondition(is_outpost),
-        parameters=[{key: ParameterValue(LaunchConfiguration(key), value_type=str) for key in
-            ('outpost_http', 'outpost_zed_hw_id', 'outpost_zed_serial', 'outpost_d405_hw_id', 'outpost_d405_serial')}])
+    # One OS process per physical camera: global ZED processing cannot stall
+    # D405 close-range refinement, while both retain the legacy Sketch ROS topics.
+    outpost_zed_bridge = Node(
+        package='sketch_control', executable='outpost_bridge',
+        name='sketch_outpost_zed_bridge', output='screen',
+        condition=IfCondition(is_outpost),
+        parameters=[{
+            'camera_name': 'zed',
+            'outpost_http': ParameterValue(LaunchConfiguration('outpost_http'), value_type=str),
+            'outpost_zed_hw_id': ParameterValue(LaunchConfiguration('outpost_zed_hw_id'), value_type=str),
+            'outpost_zed_serial': ParameterValue(LaunchConfiguration('outpost_zed_serial'), value_type=str),
+            'publish_hz': ParameterValue(LaunchConfiguration('outpost_zed_publish_hz'), value_type=float),
+            'point_stride': ParameterValue(LaunchConfiguration('outpost_zed_point_stride'), value_type=int),
+        }],
+    )
+    outpost_d405_bridge = Node(
+        package='sketch_control', executable='outpost_bridge',
+        name='sketch_outpost_d405_bridge', output='screen',
+        condition=IfCondition(is_outpost),
+        parameters=[{
+            'camera_name': 'd405',
+            'outpost_http': ParameterValue(LaunchConfiguration('outpost_http'), value_type=str),
+            'outpost_d405_hw_id': ParameterValue(LaunchConfiguration('outpost_d405_hw_id'), value_type=str),
+            'outpost_d405_serial': ParameterValue(LaunchConfiguration('outpost_d405_serial'), value_type=str),
+            'publish_hz': ParameterValue(LaunchConfiguration('outpost_d405_publish_hz'), value_type=float),
+            'point_stride': ParameterValue(LaunchConfiguration('outpost_d405_point_stride'), value_type=int),
+        }],
+    )
 
     painting_config_file = LaunchConfiguration("painting_config_file")
     real_painting_enabled = LaunchConfiguration("real_painting_enabled")
@@ -312,6 +336,22 @@ def generate_launch_description():
         DeclareLaunchArgument('outpost_http', default_value='http://127.0.0.1:8100'),
         *[DeclareLaunchArgument(key, default_value='') for key in
           ('outpost_zed_hw_id', 'outpost_zed_serial', 'outpost_d405_hw_id', 'outpost_d405_serial')],
+        DeclareLaunchArgument(
+            'outpost_zed_publish_hz', default_value='10.0',
+            description='ZED ROS publish rate; full RGB/depth, sparse global cloud',
+        ),
+        DeclareLaunchArgument(
+            'outpost_zed_point_stride', default_value='2',
+            description='ZED point-cloud pixel stride (2 = quarter point count)',
+        ),
+        DeclareLaunchArgument(
+            'outpost_d405_publish_hz', default_value='15.0',
+            description='D405 ROS publish rate for close-range refinement',
+        ),
+        DeclareLaunchArgument(
+            'outpost_d405_point_stride', default_value='1',
+            description='D405 point-cloud stride; keep 1 for local surface precision',
+        ),
         DeclareLaunchArgument(
             "painting_config_file",
             default_value=PathJoinSubstitution([
@@ -617,9 +657,18 @@ def generate_launch_description():
             description="Fallback calibrated tcp->d405_link qw for perception TF",
         ),
         OpaqueFunction(function=_validate_camera_backend),
-        RegisterEventHandler(OnProcessExit(target_action=outpost_bridge,
-            on_exit=[EmitEvent(event=Shutdown(reason='Outpost bridge stopped; perception invalid'))])),
-        outpost_bridge,
+        RegisterEventHandler(OnProcessExit(
+            target_action=outpost_zed_bridge,
+            on_exit=[EmitEvent(event=Shutdown(
+                reason='Outpost ZED bridge stopped; perception invalid'))],
+        )),
+        RegisterEventHandler(OnProcessExit(
+            target_action=outpost_d405_bridge,
+            on_exit=[EmitEvent(event=Shutdown(
+                reason='Outpost D405 bridge stopped; perception invalid'))],
+        )),
+        outpost_zed_bridge,
+        outpost_d405_bridge,
         zed_driver,
         d405_driver,
         aft_driver,
