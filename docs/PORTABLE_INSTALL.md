@@ -64,10 +64,13 @@ cd ~/robot-app/sketch_robot_ws
 대상 환경은 Ubuntu 24.04 x86_64 / ROS 2 Jazzy / 시스템 Python 3.12입니다.
 
 - [ROS 2 Jazzy 설치](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html)
-- 실제 ZED 사용: NVIDIA 드라이버, ZED SDK 5.3과 해당 SDK용 CUDA 개발 환경.
-  [ZED 공식 ROS 2 설치 안내](https://www.stereolabs.com/docs/integrations/ros-2)
+- 기본 Outpost 사용: Sketch Runtime에는 ZED SDK/CUDA/zed_wrapper가 필요하지 않습니다.
+  카메라를 직접 여는 **Outpost 환경**에만 ZED SDK가 필요합니다.
+- ZED 2i의 RViz/MoveIt 3D 형상은 SDK와 독립적인 공식 `zed_description`
+  (`zed2i.stl`)을 사용합니다.
+- `camera_backend=native`로 ZED를 직접 열 때만 NVIDIA 드라이버, ZED SDK와
+  `zed_wrapper`가 Sketch Runtime 쪽에도 필요합니다.
 
-GPU 드라이버·SDK는 PC의 GPU와 CUDA 조합에 맞춰 먼저 설치합니다.
 아래 설치 스크립트는 OS나 GPU 드라이버를 교체하지 않습니다.
 원격 브라우저 PC에는 이 단계가 필요 없습니다.
 
@@ -83,14 +86,15 @@ apt 설치 단계에서 sudo 권한이 필요합니다. 로봇/카메라를 시�
 기존 `config/sketch_runtime.env`는 덮어쓰지 않습니다.
 
 시스템 의존성이 이미 준비된 경우 `--install-deps`를 생략합니다.
-ZED SDK 없이 fake hardware로 설치 구조부터 확인할 때:
+**Outpost가 ZED 2i를 소유하는 현재 기본 구성**에서는 다음처럼 SDK/wrapper 빌드를 제외합니다.
 
 ```bash
 bash scripts/install_runtime.sh --without-zed --install-deps
 ```
 
-이 구성은 실제 ZED 운용용이 아닙니다. 이후 SDK 준비 후 옵션 없이 다시 설치·빌드합니다.
-이전 fake 설정은 보존되므로 실제 사용할 때 설정을 직접 바꿉니다.
+이 경우에도 `ros-jazzy-zed-description`은 설치되므로 ZED 2i의 공식 3D mesh와
+MoveIt collision은 사용할 수 있습니다. `--without-zed`는 실제 카메라 사용을 끄는
+옵션이 아니라 **Sketch Runtime의 native ZED SDK/wrapper만 제외하는 옵션**입니다.
 빌드 메모리가 부족하면 `SKETCH_BUILD_JOBS=1`을 앞에 붙입니다.
 
 ```bash
