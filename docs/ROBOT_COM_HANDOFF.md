@@ -132,16 +132,18 @@ ros2 launch sketch_control rb10_moveit_no_rviz.launch.py \
 
 ### Terminal 2: real cameras + perception/sketch
 
-실제 로봇에서는 Isaac Sim 이 depth/pointcloud 를 대신 만들지 않는다.
-`rb10_real_perception_sketch.launch.py`가 아래 실제 카메라 wrapper를 같이 띄운다.
+현재 기본 실환경 카메라 경로는 **Michelo Outpost**다. ZED 2i와 D405는 Outpost가
+SDK를 통해 직접 열고, Sketch Runtime은 raw ZMQ IPC를 ROS 토픽으로 변환한다.
+따라서 Sketch Runtime 프로세스에는 ZED SDK/`zed_wrapper`가 필요하지 않는다.
 
-- ZED: `zed_wrapper` / ZED SDK
-- D405: `realsense2_camera` / librealsense2
+- ZED 2i: Outpost → `sketch_outpost_zed_bridge` → RGB/depth/CameraInfo/PointCloud2
+- D405: Outpost → `sketch_outpost_d405_bridge` → RGB/depth/CameraInfo/SDK XYZ
+- ZED 2i 3D 형상: SDK와 독립적인 `zed_description/meshes/zed2i.stl`
 - AFT200: RB controller `SystemState.eft` -> `/aft200/ft`
 
-simulation depth 변환 노드는 자동으로 꺼진다.
-ZED는 외부 고정 카메라로만 쓰므로 wrapper의 positional tracking은 끄고,
-`depth.depth_stabilization:=0`으로 depth stabilization도 꺼서 TF 대기로 멈추지 않게 한다.
+`camera_backend=native`를 명시적으로 선택할 때만 기존 `zed_wrapper`/ZED SDK와
+`realsense2_camera` 경로를 사용한다. 같은 카메라를 Outpost와 native driver가 동시에
+열면 안 된다.
 AFT200이 로봇에 연결된 구성에서는 RB controller 가 외부 F/T 값을
 `/rbpodo_hardware/system_state`의 `eft` 필드로 제공하고, `rbpodo_eft_bridge`가
 이를 `/aft200/ft`로 변환한다. Terminal 1을 재시작해야 patched rbpodo hardware의
@@ -154,8 +156,13 @@ source ~/rb10_ws/install/setup.bash
 source ~/sketch_robot_ws/install/setup.bash
 
 ros2 launch sketch_control rb10_real_perception_sketch.launch.py \
-  zed_camera_model:=zed2i \
-  d405_cloud_topic:=/d405/d405/depth/color/points \
+  camera_backend:=outpost \
+  outpost_zed_hw_id:=YOUR_ZED_HW_ID \
+  outpost_zed_serial:=YOUR_ZED2I_SERIAL \
+  outpost_d405_hw_id:=YOUR_D405_HW_ID \
+  outpost_d405_serial:=YOUR_D405_SERIAL \
+  launch_zed_driver:=false \
+  launch_d405_driver:=false \
   use_ft_normal_controller:=true
 ```
 
