@@ -34,7 +34,7 @@ with tempfile.TemporaryDirectory(prefix='sketch-outpost-') as tmp:
  for name in sockets:params.extend([Parameter(f'outpost_{name}_hw_id',value=name),Parameter(f'outpost_{name}_serial',value='serial-'+name)])
  bridge=OutpostBridge(parameter_overrides=params);observer=rclpy.create_node('outpost_test_observer');executor=SingleThreadedExecutor();executor.add_node(observer);received={}
  subscriptions=[]
- for topic,typ in [('/zed/zed_node/depth/depth_registered',Image),('/zed/zed_node/rgb/color/rect/camera_info',CameraInfo),('/d405/d405/depth/color/points',PointCloud2),('/d405/d405/color/image_raw',Image)]:
+ for topic,typ in [('/zed/zed_node/depth/depth_registered',Image),('/zed/zed_node/rgb/color/rect/camera_info',CameraInfo),('/zed/zed_node/point_cloud/cloud_registered',PointCloud2),('/d405/d405/depth/color/points',PointCloud2),('/d405/d405/color/image_raw',Image)]:
   subscriptions.append(observer.create_subscription(typ,topic,lambda m,t=topic:received.__setitem__(t,m),10))
  def publish():
   seq=0
@@ -52,13 +52,14 @@ with tempfile.TemporaryDirectory(prefix='sketch-outpost-') as tmp:
  try:
   deadline=time.monotonic()+5
   while len(received)<4 and time.monotonic()<deadline and not errors:executor.spin_once(timeout_sec=.1)
-  assert len(received)==4,(received.keys(),errors)
+  assert len(received)==5,(received.keys(),errors)
   msg=received['/zed/zed_node/depth/depth_registered'];assert msg.encoding=='32FC1' and msg.header.frame_id=='zed_left_camera_frame_optical';assert np.frombuffer(bytes(msg.data),np.float32)[0]==1.
+  msg=received['/zed/zed_node/point_cloud/cloud_registered'];assert msg.header.frame_id=='zed_left_camera_frame';xyz=point_cloud2.read_points_numpy(msg,field_names=['x','y','z']).reshape(-1,3);np.testing.assert_allclose(xyz[0],[1.,0.,0.],atol=1e-6)
   msg=received['/d405/d405/depth/color/points'];xyz=point_cloud2.read_points_numpy(msg,field_names=['x','y','z']);assert abs(xyz.reshape(-1,3)[0,2]-1.00025)<1e-6
   assert msg.header.frame_id=='d405_color_optical_frame'
   done.set();publisher.join();worker.join(timeout=6)
   assert errors and isinstance(errors[0],TimeoutError),errors
-  print('PASS: raw IPC for both cameras -> ROS RGB/depth/CameraInfo/SDK XYZ; frame IDs and units; 3s stream-loss failure')
+  print('PASS: raw IPC -> full RGB/depth/CameraInfo + ROS-frame ZED cloud + D405 SDK XYZ; frame IDs/units; 3s stream-loss failure')
  finally:
   done.set();publisher.join();rclpy.shutdown();worker.join(3);bridge.close();bridge.destroy_node();observer.destroy_node();executor.shutdown();server.shutdown();server.server_close()
   for sock in sockets.values():sock.close(0)
