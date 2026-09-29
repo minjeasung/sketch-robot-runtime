@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from sketch_control.outpost_camera import decode_frame, FrameGuard, validate_origin, validate_status
+from sketch_control.outpost_bridge_node import sample_pointcloud_grid
 
 
 def sample(kind='zed'):
@@ -41,6 +42,34 @@ def test_d405_preserves_sdk_submillimetre_geometry():
     assert cloud[0,0,2] == pytest.approx(1.00025)
     assert cloud[1,1,2] == pytest.approx(3.00075)
     assert np.isnan(cloud[0,1]).all()
+
+
+def test_zed_stride_reduces_xyz_work_without_reducing_depth_grid():
+    status, parts = sample('zed')
+    _, _, rgb, depth, cloud = decode_frame(
+        parts, status, 'zed', point_stride=2)
+    assert rgb.shape == (2, 2, 3)
+    assert depth.shape == (2, 2)
+    assert cloud.shape == (1, 1, 3)
+    paired_cloud, paired_rgb = sample_pointcloud_grid(cloud, rgb, 2)
+    assert paired_cloud.shape == (1, 1, 3)
+    assert paired_rgb.shape == (1, 1, 3)
+    np.testing.assert_allclose(paired_cloud[0, 0], [0.0, 0.0, 1.0])
+
+
+def test_outpost_launch_splits_zed_and_d405_processes():
+    launch_file = (
+        Path(__file__).resolve().parents[1]
+        / 'launch'
+        / 'rb10_real_perception_sketch.launch.py'
+    )
+    launch = launch_file.read_text()
+    assert "name='sketch_outpost_zed_bridge'" in launch
+    assert "name='sketch_outpost_d405_bridge'" in launch
+    assert "'outpost_zed_point_stride', default_value='2'" in launch
+    assert "'outpost_d405_point_stride', default_value='1'" in launch
+    assert "'outpost_zed_publish_hz', default_value='10.0'" in launch
+    assert "'outpost_d405_publish_hz', default_value='15.0'" in launch
 
 
 @pytest.mark.parametrize('change', ['generation','identity','size','index','duplicate','encoding','timestamp','rgb-grid','missing'])
