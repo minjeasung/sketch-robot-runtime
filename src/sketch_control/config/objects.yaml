@@ -46,10 +46,18 @@ objects:
     enabled: true
 
   - name: zed_camera
+    # Static-filter fallback remains a conservative box. MoveIt uses the official
+    # ZED 2i STL in the calibrated ZED frame so camera collision follows TF.
     shape: box
-    # ChArUco T_World_ZED optical + 기존 optical->camera-box offset 유지.
     position: [-0.3130, 0.5590, 0.8816]
     size: [0.08, 0.20, 0.09]
+    moveit_shape: mesh
+    mesh_resource: package://zed_description/meshes/zed2i.stl
+    mesh_frame: zed_left_camera_frame
+    # Official zed_description: camera_center->left = [-0.01,+0.06,0],
+    # mesh origin in camera_center = [-0.01,0,0], hence left->mesh=[0,-0.06,0].
+    mesh_position: [0.0, -0.06, 0.0]
+    mesh_orientation: [0.0, 0.0, 0.0, 1.0]
     color: [0.1, 0.1, 0.1]
     enabled: true
 
