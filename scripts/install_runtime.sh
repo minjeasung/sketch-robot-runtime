@@ -44,9 +44,9 @@ bash scripts/setup_system_api.sh
 bash scripts/build_runtime.sh "${SKETCH_INSTALL_ARGS[@]}"
 # Never overwrite an existing machine profile or credentials.
 if [[ ! -e config/sketch_runtime.env ]]; then
+    # The example already defaults to Outpost + dry_run with native camera
+    # drivers disabled. --without-zed therefore remains a valid real-camera
+    # installation; it only omits the native ZED wrapper/SDK build.
     cp config/sketch_runtime.env.example config/sketch_runtime.env
-    if [[ "$SKETCH_INSTALL_WITH_ZED" == false ]]; then
-        printf '\nSKETCH_PROFILE=fake\nSKETCH_LAUNCH_ZED_DRIVER=false\nSKETCH_LAUNCH_D405_DRIVER=false\nSKETCH_LAUNCH_RVIZ=false\n' >> config/sketch_runtime.env
-    fi
 fi
 bash scripts/check_runtime.sh
