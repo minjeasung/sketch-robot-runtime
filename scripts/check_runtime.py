@@ -27,7 +27,8 @@ def main():
         check("module " + module, importlib.util.find_spec(module) is not None)
     from ament_index_python.packages import get_package_prefix, PackageNotFoundError
     packages = ["sketch_control", "rbpodo_painting_control", "admittance_controller", "rbpodo_hardware",
-                "rbpodo_description", "eoat_description", "realsense2_description", "rosbridge_server"]
+                "rbpodo_description", "eoat_description", "realsense2_description",
+                "zed_description", "rosbridge_server"]
     if args.real and args.camera_backend == 'native':
         packages += ["zed_wrapper", "realsense2_camera"]
     if args.camera_backend == 'outpost':
@@ -55,6 +56,13 @@ def main():
                 check("robot-specific camera transforms", True)
             except ValueError as exc:
                 check("robot-specific camera transforms", False, exc)
+    try:
+        zed_share = Path(get_package_prefix('zed_description'))/'share/zed_description'
+        check('ZED 2i description mesh',
+              (zed_share/'meshes/zed2i.stl').is_file(),
+              zed_share/'meshes/zed2i.stl')
+    except PackageNotFoundError:
+        check('ZED 2i description mesh', False, 'zed_description not installed')
     try:
         share = Path(get_package_prefix('rbpodo_description'))/'share/rbpodo_description'
         files = [share/'robots'/f'{args.model_id}.urdf.xacro']
