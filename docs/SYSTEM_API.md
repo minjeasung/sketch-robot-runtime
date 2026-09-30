@@ -65,6 +65,7 @@ Supervisor는 각 프로세스에 해당 그룹만 켭니다.
 | `work` | 실제 연결 | 기존 실행 인터록 통과 후 허용 | 기존 도장 제어 |
 | `spray_motion_test` | 실제 연결·현재 EOAT | 뿜칠 경로 실제 이동, 분사 항상 OFF | 꺼짐·뿜칠 모드 고정 |
 | `fake` | 가상 하드웨어 | 모의 실행 | 꺼짐 |
+| `zed_preview` | 연결 없음·가상 관절도 없음 | ZED 대상/영역 선택 및 기하 경로 미리보기만 | 힘센서/실행기 없음 |
 
 `work`의 기본 공정은 `process_mode=paint`이며 기존 통합 launch의
 `real_painting_enabled=true`, `dry_run=false`, `painting_force_enabled=true`를 전달합니다.
@@ -74,11 +75,19 @@ D405 장치 ID·시리얼·보정은 필요하지 않으며 D405 드라이버 �
 서버 시작이나 prepare는 작업 경로를 제출하지 않습니다. `fake`의 카메라/RViz 시작 기본값은 false입니다.
 
 `POST /configuration`에 `process_mode`를 포함합니다. 예를 들어 로봇 연결 없는 설정은
-`{"profile":"fake","process_mode":"spray"}`입니다. 일반 실작업 설정은
+`{"profile":"zed_preview","process_mode":"spray"}`에 Outpost ZED 장치 ID·시리얼을 더합니다.
+`fake`는 가상 로봇·MoveIt을 사용하는 기존 모의 실행 모드입니다. 일반 실작업 설정은
 `{"profile":"work","process_mode":"spray"}`에 해당 현장의 모델/IP 및 ZED 장치 식별을 더합니다.
 기본값은 Paint이며 공정은 모든 launch 그룹에 전달됩니다. Spray에서 perception의
 필수 노드는 `target_selector`, `wall_projector`, `sketch_to_waypoints`이고 Paint는
 `d405_surface_refiner`를 추가로 요구합니다. ZED 장치 검사는 두 공정 모두 유지합니다.
+
+`zed_preview`는 Outpost와 Spray만 지원합니다. 등록 프로세스는 선행 로봇 의존성이 없는
+`perception`, `rosbridge` 두 개이며 `robot_control`, `force_pipeline`, `executor` API 시작 요청은
+등록되지 않은 프로세스로 거부됩니다. `zed_preview` 노드가 평면 선택과 경로 생성 상태를 관리하며
+`planning_only=true`, `ready=false`, `current_plan_validated=false`를 유지합니다.
+`current_plan_generated=true`는 현재 영역에 일치하는 경로가 생성되었다는 뜻입니다.
+웹 화면은 실제 생성된 경로 픽셀을 표시하지만 로봇 도달성·충돌 검증이나 움직임은 수행하지 않습니다.
 
 시작 공정 변경은 전체 종료 상태에서만 가능합니다. 라이브 `/painting_system/process_mode`는
 실행기가 확정한 상태이며 카메라 프로세스를 재구성하지 않습니다. 처음부터 Spray로 시작했다면

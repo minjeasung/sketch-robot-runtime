@@ -40,7 +40,6 @@ from rclpy.qos import (
     DurabilityPolicy,
     HistoryPolicy,
     QoSProfile,
-    qos_profile_sensor_data,
 )
 
 from tf2_ros import Buffer, TransformListener, TransformException
@@ -315,7 +314,7 @@ class SketchToWaypointsNode(Node):
             PoseArray, WALL_FRONT_EXTENT_TOPIC, self._on_front_extent, LATCHED_QOS)
         self.create_subscription(
             Image, WALL_FRONT_IMAGE_TOPIC, self._on_wall_front_image,
-            qos_profile_sensor_data)
+            QoSProfile(depth=1))
         self.create_subscription(
             PoseArray, SKETCH_PIXELS_TOPIC, self._on_sketch, 10)
         self.create_subscription(
@@ -1112,6 +1111,9 @@ class SketchToWaypointsNode(Node):
         if path is None:
             self._publish_fill_preview((), stamp=fill_msg.header.stamp)
             return
+        # Generation has its own timestamp after geometry/TF processing. Bind
+        # the preview to that resulting path, not to the earlier fill request.
+        fill_msg.header.stamp.sec, fill_msg.header.stamp.nanosec = divmod(int(path.path_id), 1_000_000_000)
         self._publish_fill_preview(strokes, stamp=fill_msg.header.stamp)
 
     def _publish_fill_preview(self, strokes, stamp=None):

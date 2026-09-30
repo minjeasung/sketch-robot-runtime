@@ -20,11 +20,11 @@ const readiness = {
   work_area_id: "wa-1", plane_generation_id: lock.plane_generation_id,
 };
 
-async function selectTarget(browserTimeMs) {
+async function selectTarget(browserTimeMs, planningOnly = false) {
   const ui = loadUI();
   if (browserTimeMs !== undefined) ui.evaluate(`Date.now = () => ${browserTimeMs}`);
   ui.ros.emit("connection");
-  ui.emit("/painting_system/process_mode", { mode: "spray" });
+  ui.emit("/painting_system/process_mode", { mode: "spray", planning_only: planningOnly });
   ui.frame("/zed/zed_node/rgb/color/rect/image");
   await ui.rectangle();
   await ui.element("btn-set-target").fire("click");
@@ -151,6 +151,30 @@ test("raw target to ZED lock to frontal rectangle to generated and validated cov
   assert.equal(ui.published.some(entry => entry.name === "/refine_work_area" || entry.name === "/sketch_pixels"), false);
   ui.emit("/perception/zed_surface_status", { ...area, state: "invalidated", accepted: false });
   assert.equal(ui.element("btn-run-robot").disabled, true);
+});
+
+test("ZED-only workflow generates a current preview but cannot publish robot execution", async () => {
+  const ui = await selectTarget(undefined, true);
+  const area = await selectArea(ui);
+  assert.equal(ui.element("process-mode").disabled, true);
+  await ui.element("btn-fill-work-area").fire("click");
+  assert.equal(ui.published.at(-1).name, "/fill_work_area");
+  const plan = { ...readiness, state: "generated", path_id: "13000000000", plan_hash: "preview-hash" };
+  ui.emit("/painting_system/plan_status", plan);
+  ui.emit("/painting_system/readiness", { ...plan, planning_only: true,
+    checks: { current_plan_generated: true, current_plan_validated: false } });
+  assert.equal(ui.evaluate("paintingDerivedState().planGenerated"), true);
+  assert.equal(ui.evaluate("paintingDerivedState().planValidated"), false);
+  assert.match(ui.element("execution-summary").textContent, /경로 생성 완료/);
+  assert.equal(ui.element("btn-run-robot").disabled, true);
+  await ui.element("btn-run-robot").fire("click");
+  // Even a conflicting executor status cannot enable execution in preview mode.
+  ui.emit("/painting_system/readiness", { ...plan, ready: true, plan_validated: true });
+  assert.equal(ui.element("btn-run-robot").disabled, true);
+  await ui.element("btn-run-robot").fire("click");
+  assert.equal(ui.published.some(entry => entry.name === "/sketch_execute"), false);
+  ui.emit("/perception/zed_surface_status", { ...area, state: "invalidated", accepted: false });
+  assert.equal(ui.evaluate("paintingDerivedState().planGenerated"), false);
 });
 
 test("mode switches clear selections and require matching acknowledgement and new ZED identities", async () => {

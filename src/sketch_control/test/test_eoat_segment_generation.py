@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -492,11 +493,12 @@ def test_fill_preview_matches_candidate_after_final_path_acceptance():
             "Now", (), {"to_msg": lambda self: Time(sec=1, nanosec=2)}
         )()}
     )()
-    node._on_sketch = lambda _message: object()
+    node._on_sketch = lambda _message: SimpleNamespace(path_id='2000000007')
 
     node._on_fill_work_area(object())
 
     assert len(node.fill_preview_pub.messages[-1].poses) > 0
+    assert node.fill_preview_pub.messages[-1].header.stamp == Time(sec=2, nanosec=7)
 
 
 def test_new_work_area_pixels_invalidate_previous_refined_plane_and_markers():

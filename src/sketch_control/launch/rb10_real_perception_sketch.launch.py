@@ -308,6 +308,7 @@ def generate_launch_description():
             "launch_wall_detector": launch_wall_detector,
             "launch_environment_scanner": launch_environment_scanner,
             "front_view_source": LaunchConfiguration("front_view_source"),
+            "zed_image_reliable": PythonExpression(["'true' if '", LaunchConfiguration('camera_backend'), "' == 'outpost' else 'false'"]),
             "use_d405_refinement": "true",
             "use_ft_normal_controller": use_ft_normal_controller,
             "use_d405_mount_tf": "true",

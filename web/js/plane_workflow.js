@@ -24,7 +24,7 @@ function renderPlaneList() {
   const spray = processMode === "spray";
   const running = paintingDerivedState().running;
   const blocked = !rosConnected || running || processModePending;
-  const signature = JSON.stringify([planeCatalog, planeState, [...selectedPlaneIds], blocked, processMode, sprayMotionTest]);
+  const signature = JSON.stringify([planeCatalog, planeState, [...selectedPlaneIds], blocked, processMode, sprayMotionTest, planningOnly]);
   if (signature === lastPlaneRender) return;
   lastPlaneRender = signature;
   const list = $("plane-candidates");
@@ -69,7 +69,7 @@ function renderPlaneList() {
   select.value = planeState.active_id || "";
   select.disabled = blocked || !measured.length;
   $("active-plane-field").hidden = !measured.length;
-  $("process-mode").disabled = blocked || sprayMotionTest;
+  $("process-mode").disabled = blocked || sprayMotionTest || planningOnly;
 }
 
 function drawPlaneCandidates() {
@@ -171,7 +171,7 @@ $("active-plane").addEventListener("change", event => {
 });
 
 $("process-mode").addEventListener("change", event => {
-  if (!rosConnected || processModePending || paintingDerivedState().running || sprayMotionTest) return;
+  if (!rosConnected || processModePending || paintingDerivedState().running || sprayMotionTest || planningOnly) return;
   requestedProcessMode = event.target.value;
   if (!["paint", "spray"].includes(requestedProcessMode)) return;
   processModePending = true;
@@ -186,15 +186,16 @@ new ROSLIB.Topic({ ros, name: "/painting_system/process_mode", messageType: "std
   const payload = parseJsonStatus("/painting_system/process_mode", msg);
   if (!payload || !["paint", "spray"].includes(payload.mode)) return;
   if (requestedProcessMode && payload.mode !== requestedProcessMode && !payload.error) return;
-  const changed = processMode !== payload.mode || sprayMotionTest !== (payload.spray_motion_test === true);
+  const changed = processMode !== payload.mode || sprayMotionTest !== (payload.spray_motion_test === true) || planningOnly !== (payload.planning_only === true);
   const wasPending = processModePending;
   processMode = payload.mode;
   sprayMotionTest = payload.spray_motion_test === true;
+  planningOnly = payload.planning_only === true;
   zedSelection.setMode(processMode);
   processModePending = false;
   requestedProcessMode = "";
   $("process-mode").value = processMode;
-  $("process-mode-state").textContent = payload.error || (sprayMotionTest
+  $("process-mode-state").textContent = payload.error || (planningOnly ? "ZED만 · 대상/영역/경로 미리보기 · 로봇 연결 안 함" : sprayMotionTest
     ? "EOAT 이동 검증 · 실제 로봇 이동 · 50 cm 이격 · 분사 항상 OFF"
     : processMode === "spray" ? "ZED 평면 · 50 cm 이격 · 도포 경로에서 분사" : "작업면에 접촉하여 도장합니다.");
   if (changed || wasPending) {

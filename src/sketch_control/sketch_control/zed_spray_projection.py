@@ -1,5 +1,6 @@
 """ROS-independent validation and metric rectification of selected ZED planes."""
 import numpy as np
+import cv2
 
 from sketch_control.rotation_utils import quat_from_matrix
 from sketch_control.work_area_geometry import bilinear_quad_point
@@ -107,8 +108,10 @@ def plane_orientation(corners, normal):
 def project_target_rectangle(target, intrinsics, image_size, *, rotation=None, translation=None):
     """Project bounded plane support into ZED RGB, keeping a true metric rectangle.
 
-    The transform maps the target frame into the RGB optical frame. Entire
-    support must be visible; extrapolated image borders are never selectable.
+    The transform maps the target frame into the RGB optical frame. A metric
+    envelope can extend beyond the image even when every selected pixel is
+    visible. Retain its geometry and render missing image regions as borders;
+    validate_visible_work_area rejects selections touching those unseen areas.
     """
     K = _array(intrinsics, (3, 3), "camera intrinsics")
     if (K[0, 0] <= 0 or K[1, 1] <= 0 or not np.allclose(K[2], [0, 0, 1])
@@ -130,9 +133,12 @@ def project_target_rectangle(target, intrinsics, image_size, *, rotation=None, t
         raise ValueError("plane is behind, back-facing or grazing the camera")
     homogeneous = camera @ K.T
     pixels = homogeneous[:, :2] / homogeneous[:, 2:]
-    if (not np.isfinite(pixels).all() or np.any(pixels < 0)
-            or np.any(pixels[:, 0] > image_width - 1)
-            or np.any(pixels[:, 1] > image_height - 1)):
+    if not np.isfinite(pixels).all():
+        raise ValueError("invalid projected plane support")
+    image_bounds = np.float32([[0, 0], [image_width - 1, 0],
+                               [image_width - 1, image_height - 1], [0, image_height - 1]])
+    visible_area, _ = cv2.intersectConvexConvex(pixels.astype(np.float32), image_bounds)
+    if visible_area < 100.0:
         raise ValueError("catalog support is outside ZED image")
     # Catalog axes may have either sign. Keep right/down aligned with the RGB
     # camera without replacing the metric support by a raw-image bounding box.
@@ -150,6 +156,25 @@ def project_target_rectangle(target, intrinsics, image_size, *, rotation=None, t
     if min(size) < 32:
         raise ValueError("plane aspect ratio is too extreme")
     return points, pixels.astype(np.float32), size
+
+
+def validate_visible_work_area(corners, intrinsics, rotation, translation, image_size):
+    """Require the whole selected quad to lie in the observed camera image.
+
+    Perspective projection of a planar convex quad with positive depth remains
+    convex, so testing all four vertices also bounds every generated interior
+    point. Use the exact camera geometry that produced the displayed front view.
+    """
+    camera = np.asarray(corners) @ rotation.T + translation
+    if not np.isfinite(camera).all() or np.any(camera[:, 2] <= 0.05):
+        raise ValueError("work area is outside ZED image")
+    homogeneous = camera @ intrinsics.T
+    pixels = homogeneous[:, :2] / homogeneous[:, 2:]
+    width, height = image_size
+    if (not np.isfinite(pixels).all() or np.any(pixels < -1e-6)
+            or np.any(pixels[:, 0] > width - 1 + 1e-6)
+            or np.any(pixels[:, 1] > height - 1 + 1e-6)):
+        raise ValueError("work area is outside ZED image; select within the visible region")
 
 
 def select_work_area(extent, view_size, pixels):

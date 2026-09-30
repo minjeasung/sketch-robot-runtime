@@ -41,7 +41,7 @@ from tf2_ros import Buffer, TransformListener, TransformException
 
 from sketch_control.zed_spray_projection import (
     plane_orientation, project_target_rectangle, select_work_area, stamp_ns,
-    validate_target_lock, validate_work_area_request,
+    validate_target_lock, validate_work_area_request, validate_visible_work_area,
 )
 
 
@@ -273,8 +273,12 @@ class WallProjectorNode(Node):
         self.create_subscription(
             String, ZED_WORK_AREA_REQUEST_TOPIC, self._on_zed_work_area_request, 10)
 
+        # Outpost publishes reliable multi-megabyte frames; best-effort DDS
+        # drops fragmented images on this host. Keep native-driver compatibility.
+        zed_qos = QoSProfile(depth=1) if self.declare_parameter(
+            "zed_image_reliable", False).value else qos_profile_sensor_data
         self.create_subscription(
-            Image, INPUT_IMAGE_TOPIC, self._on_image, qos_profile_sensor_data)
+            Image, INPUT_IMAGE_TOPIC, self._on_image, zed_qos)
         self.create_subscription(
             CameraInfo, INPUT_INFO_TOPIC, self._on_info, qos_profile_sensor_data)
         self.declare_parameter("allow_wall_fallback", False)
@@ -356,6 +360,7 @@ class WallProjectorNode(Node):
         self._zed_front_stamp_ns = 0
         self._zed_image_stamp_ns = 0
         self._zed_first_front_stamp_ns = 0
+        self._zed_front_camera = None
         self._zed_last_status = None
         self._zed_info_frame = ""
         self._zed_info_size = None
@@ -409,6 +414,7 @@ class WallProjectorNode(Node):
         self._clear_locked_work_area(reason)
         self.latest_work_area_pixels = None
         if clear_target or clear_front:
+            self._zed_front_camera = None
             self.front_view_extent = None
             self.front_view_size = None
             self._zed_front_generation = ""
@@ -511,10 +517,14 @@ class WallProjectorNode(Node):
             return
         self.front_view_extent = extent
         self.front_view_size = size
+        self._zed_front_camera = (self.K.copy(), R.copy(), t.copy(), (msg.width, msg.height))
         self._zed_front_generation = target["plane_generation_id"]
         self._zed_front_stamp_ns = timestamp
         if not self._zed_first_front_stamp_ns:
             self._zed_first_front_stamp_ns = timestamp
+            # A transient frame/TF failure revokes the work area, not the target
+            # lock. A fresh valid image must make that target selectable again.
+            self._emit_zed_status(self._zed_surface_payload("target", extent, ""))
         if self.locked_work_area is not None:
             corners = self.locked_work_area["corners_3d"]
             tl, right, w, down, h = self._front_view_uv(extent)
@@ -581,6 +591,9 @@ class WallProjectorNode(Node):
             if len({p.position.z for p in msg.poses}) != 1:
                 raise ValueError("work area must contain a single rectangle")
             corners = select_work_area(self.front_view_extent, self.front_view_size, points)
+            if self._zed_front_camera is None:
+                raise ValueError("selection requires current ZED camera geometry")
+            validate_visible_work_area(corners, *self._zed_front_camera)
             payload = self._zed_surface_payload("work_area", corners, str(selection))
         except (ValueError, TypeError, OverflowError) as exc:
             self._invalidate_zed(str(exc))

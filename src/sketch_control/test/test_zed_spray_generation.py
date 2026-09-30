@@ -128,13 +128,18 @@ def test_backend_rebuilds_coverage_and_discards_caller_strokes(generator):
 
 def test_auto_fill_callback_publishes_matching_hashed_path_and_preview(generator):
     previews = []
-    generator._publish_fill_preview = lambda strokes, **kwargs: previews.append(strokes)
+    stamps = iter(range(3, 100))
+    generator.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(
+        to_msg=lambda: SimpleNamespace(sec=next(stamps), nanosec=123456789)))
+    generator._publish_fill_preview = lambda strokes, **kwargs: previews.append((strokes, kwargs))
     generator._on_fill_work_area(None)
     assert len(generator.segment_pub.messages) == 1
     payload = json.loads(generator.segment_pub.messages[0].data)
     assert payload["plan_hash"] == segment_path.compute_plan_hash(payload)
     assert payload["source"]["coverage"] == "auto_fill"
-    assert len(previews[-1]) == 4
+    assert len(previews[-1][0]) == 4
+    preview_stamp = previews[-1][1]['stamp']
+    assert generator._stamp_path_id(preview_stamp) == payload['path_id']
     assert len(generator.pub.messages) == 1
     assert len(generator.pub.messages[0].poses) == len(payload["rows"])
     assert all(pose.position.z == pytest.approx(.5) for pose in generator.pub.messages[0].poses)

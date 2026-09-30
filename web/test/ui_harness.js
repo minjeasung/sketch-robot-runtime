@@ -101,7 +101,7 @@ function loadUI(page = "index.html", fetch) {
   context.window = context;
   for (const [, src] of html.matchAll(/<script src="([^"]+)"/g)) {
     if (src.endsWith("roslib.min.js")) continue;
-    const name = src.replace(/^\/sketch\//, "");
+    const name = src.replace(/^\/sketch\//, "").split("?")[0];
     vm.runInContext(fs.readFileSync(path.join(__dirname, "..", name), "utf8"), context, { filename: name });
   }
   return {

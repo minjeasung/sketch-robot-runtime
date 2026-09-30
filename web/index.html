@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>스케치 작업</title>
   <link rel="stylesheet" href="style.css" />
-  <link rel="stylesheet" href="sketch.css" />
+  <link rel="stylesheet" href="sketch.css?v=fit-view-1" />
   <script src="js/roslib.min.js"></script>
 </head>
 <body class="sketch-page">
@@ -74,7 +74,7 @@
         <h2>실행</h2>
         <div class="execution-checks">
           <div><span id="painting-surface-label">D405 평면 측정</span><span id="painting-d405-state" class="state-pill unknown">대기</span></div>
-          <div><span>경로 검증</span><span id="painting-plan-validation" class="state-pill unknown">대기</span></div>
+          <div><span id="painting-plan-label">경로 검증</span><span id="painting-plan-validation" class="state-pill unknown">대기</span></div>
         </div>
         <div class="free-space-panel" id="tare-confirmation" hidden>
           <label for="free-space-confirmed"><input id="free-space-confirmed" type="checkbox" /><span>접촉 전 F/T 영점 조정 승인<small>계획 간격 10 mm · 실측 최소 7 mm</small></span></label>
@@ -97,7 +97,8 @@
   </details>
   <script src="js/target_refine_gate.js"></script>
   <script src="js/zed_surface_gate.js"></script>
-  <script src="js/app.js"></script>
+  <script src="js/image_topic.js?v=front-view-3"></script>
+  <script src="js/app.js?v=front-view-3"></script>
   <script src="js/plane_workflow.js"></script>
 </body>
 </html>

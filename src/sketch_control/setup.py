@@ -22,6 +22,7 @@ setup(
     entry_points={
         'console_scripts': [
             'outpost_bridge = sketch_control.outpost_bridge_node:main',
+            'zed_preview = sketch_control.zed_preview_node:main',
             'sketch_ui = sketch_control.sketch_ui:main',
             'moveit_executor = sketch_control.moveit_executor:main',
             'joint_calibrator = sketch_control.joint_calibrator:main',

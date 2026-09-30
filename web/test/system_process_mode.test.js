@@ -55,3 +55,22 @@ test("paint remains the startup default and active processes lock the menu", asy
   await ui.evaluate("refresh()");
   assert.equal(ui.element("process-mode").disabled, true);
 });
+
+test("ZED preview start config excludes native drivers and robot controls", async () => {
+  const { ui, requests } = await supervisor();
+  ui.element("profile").value = "zed_preview";
+  await ui.element("profile").fire("change");
+  assert.equal(ui.element("process-mode").value, "spray");
+  assert.equal(ui.element("process-mode").disabled, true);
+  assert.equal(ui.element("robot-ip").disabled, true);
+  assert.equal(ui.element("camera-backend").value, "outpost");
+  for (const id of ["zed", "d405", "rviz"]) {
+    assert.equal(ui.element(id).disabled, true);
+    assert.equal(ui.element(id).checked, false);
+  }
+  await ui.element("start").fire("click");
+  const config = JSON.parse(requests.find(request => request.url === "/configuration").body);
+  assert.equal(config.profile, "zed_preview");
+  assert.equal(config.camera_backend, "outpost");
+  assert.equal(config.launch_rviz, false);
+});

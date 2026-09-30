@@ -31,8 +31,11 @@
 .canvas-heading { display: flex; align-items: center; justify-content: space-between; padding: 21px 24px 12px; gap: 10px; }
 .sketch-page h2 { color: var(--text); font-size: 13px; letter-spacing: 0; margin: 0; text-transform: none; }
 .canvas-heading > span { font-size: 11px; color: var(--muted); }
-.sketch-page .zed-wrap { width: calc(100% - 48px); max-width: none; margin: 0 24px; border-radius: 10px; overflow: hidden; background: #161d25; }
-.sketch-page .zed-wrap canvas { border-radius: 0; }
+.sketch-page .zed-wrap { width: calc(100% - 48px); max-width: none; height: clamp(220px, calc(100dvh - 320px), 560px); display: grid; grid-template: minmax(0, 1fr) / minmax(0, 1fr); place-items: center; margin: 0 24px; border-radius: 10px; overflow: hidden; background: #161d25; }
+/* Fit both native canvases to the same viewport without stretching or cropping.
+   Pointer coordinates continue to use the displayed canvas's bounding box. */
+.sketch-page .zed-wrap canvas { width: auto; height: auto; max-width: 100%; max-height: 100%; border-radius: 0; }
+.sketch-page #sketch-canvas { inset: 0; margin: auto; }
 .sketch-page #zed-canvas { background: #161d25; }
 .camera-empty { position: absolute; inset: 0; display: flex; justify-content: center; align-items: center; flex-direction: column; gap: 8px; color: #778694; pointer-events: none; text-align: center; padding: 20px; }
 .camera-empty .camera-icon { color: #6c7f8b; font-size: 34px; line-height: 1.2; margin-bottom: 6px; }

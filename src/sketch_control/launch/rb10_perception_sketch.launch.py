@@ -363,6 +363,8 @@ def generate_launch_description():
         executable="target_selector",
         name="target_selector",
         output="screen",
+        parameters=[{"zed_image_reliable": ParameterValue(
+            LaunchConfiguration("zed_image_reliable"), value_type=bool)}],
     )
 
     wall_projector = Node(
@@ -374,6 +376,7 @@ def generate_launch_description():
             painting_config_file,
             {
                 "front_view_source": LaunchConfiguration("front_view_source"),
+                "zed_image_reliable": ParameterValue(LaunchConfiguration("zed_image_reliable"), value_type=bool),
                 "process_mode": ParameterValue(LaunchConfiguration('process_mode'), value_type=str),
             },
         ],
@@ -449,6 +452,8 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument('zed_image_reliable', default_value='false',
+                              description='Reliable image transport for the Outpost bridge'),
         DeclareLaunchArgument('process_mode', default_value='paint', choices=['paint', 'spray']),
         DeclareLaunchArgument('model_id', default_value='rb10_1300e_u'),
         DeclareLaunchArgument('spray_tool_axis', default_value=''),

@@ -3,6 +3,8 @@
 
 let processMode = "paint";
 let sprayMotionTest = false;
+let planningOnly = false;
+let backendPreview = null;
 let processModePending = true;
 let multiPlaneBusy = false;
 let stopRequested = false;
@@ -42,12 +44,28 @@ function logEvent(line) {
 // ---- ROS 연결 ----
 const ros = new ROSLIB.Ros({ url: WS_URL });
 let rosConnected = false;
+let zedImageReliable = false;
+
+async function refreshImageTransport() {
+  if (typeof fetch !== "function") return;
+  try {
+    const response = await fetch(new URL("/status", window.location.href));
+    if (!response.ok) return;
+    const {configuration} = await response.json();
+    const reliable = configuration?.camera_backend === "outpost" && configuration?.profile !== "fake";
+    if (zedImageReliable !== reliable) {
+      zedImageReliable = reliable;
+      if (currentView === "zed_raw") subscribeView(currentView);
+    }
+  } catch (_) { /* Standalone web hosting keeps native-driver defaults. */ }
+}
 
 ros.on("connection", () => {
   rosConnected = true;
   requireFreshAuthoritativeState("ROS connected; awaiting fresh backend status");
   setStatus("connected", "connected");
   logEvent("connection opened");
+  refreshImageTransport();
   // A browser reconnect must never retain a prior operator safety assertion.
   resetFreeSpaceConfirmation("ROS reconnected", true);
   refreshPaintingUI();
@@ -577,6 +595,7 @@ planStatusSub.subscribe((msg) => {
   logEvent(`plan status: ${state || "unknown"}${statusReason(payload) ? ` (${statusReason(payload)})` : ""}`);
   reconcileValidatedPlan();
   refreshPaintingUI();
+  redrawSketch();
 });
 
 let previousAbortReason = "";
@@ -632,6 +651,7 @@ readinessSub.subscribe((msg) => {
   reconcileValidatedPlan();
   handleRunAndAbortTransition();
   refreshPaintingUI();
+  redrawSketch();
 });
 
 executionStatusSub.subscribe((msg) => {
@@ -736,7 +756,8 @@ function paintingDerivedState() {
   // the short window before a just-published false reaches backend readiness;
   // the backend half proves that the executor's interlocked gate consumed true.
   const backendFreeSpaceConfirmed = readinessCheck("free_space_confirmed") === true;
-  const ready = readiness.ready === true && surfaceAccepted && planValidated &&
+  const planGenerated = !local.planInvalidated && window.ZedSurfaceGate.previewPlanGenerated(surface, plan, readiness);
+  const ready = !planningOnly && window.ZedSurfaceGate.executionAllowed(readiness.ready, readiness) && surfaceAccepted && planValidated &&
     targetForceValid && !processModePending && (processMode === "spray" || (freeSpaceConfirmed && backendFreeSpaceConfirmed)) &&
     !running && !abortReason;
 
@@ -751,6 +772,7 @@ function paintingDerivedState() {
     planHash,
     planState,
     planValidated,
+    planGenerated,
     ready,
     running,
     abortReason,
@@ -824,6 +846,7 @@ function buttonBlockReason(derived, kind) {
     if (!derived.surfaceAccepted) reasons.push(`current ${processMode === "spray" ? "ZED" : "D405"} work area not accepted`);
   }
   if (kind === "run") {
+    if (planningOnly) reasons.push("ZED preview only; robot execution unavailable");
     if (stopRequested) reasons.push("operator stop requested");
     if (!derived.planValidated) reasons.push("current plan not validated");
     if (processMode !== "spray" && (!Number.isFinite(Number(derived.targetForce)) || Number(derived.targetForce) <= 0.0)) {
@@ -847,8 +870,10 @@ function refreshPaintingUI() {
   setPill("painting-d405-state", derived.surfaceAccepted ? "완료" : measuring ? (spray ? "확정 중" : "측정 중") : surfaceFailed ? "확인 필요" : "대기",
     derived.surfaceAccepted ? "good" : measuring ? "pending" : surfaceFailed ? "bad" : "unknown");
   const planFailed = ["rejected", "failed"].includes(derived.planState);
-  setPill("painting-plan-validation", derived.planValidated ? "완료" : local.awaitingPlan ? "검증 중" : planFailed ? "확인 필요" : "대기",
-    derived.planValidated ? "good" : local.awaitingPlan ? "pending" : planFailed ? "bad" : "unknown");
+  $("painting-plan-label").textContent = planningOnly ? "경로 생성" : "경로 검증";
+  const planComplete = planningOnly ? derived.planGenerated : derived.planValidated;
+  setPill("painting-plan-validation", planComplete ? "완료" : local.awaitingPlan ? (planningOnly ? "생성 중" : "검증 중") : planFailed ? "확인 필요" : "대기",
+    planComplete ? "good" : local.awaitingPlan ? "pending" : planFailed ? "bad" : "unknown");
   const backendConfirmed = readinessCheck("free_space_confirmed") === true;
   setPill("free-space-state", freeSpaceConfirmed ? (backendConfirmed ? "승인됨" : "확인 중") : "미승인",
     freeSpaceConfirmed ? (backendConfirmed ? "good" : "pending") : "bad");
@@ -874,11 +899,12 @@ function refreshPaintingUI() {
   $("btn-execute").hidden = spray;
   $("btn-fill-work-area").textContent = spray ? "자동 도포 경로 생성" : "영역 자동 채우기";
   $("btn-fill-work-area").disabled = !pathGate;
-  $("btn-run-robot").disabled = !rosConnected || !derived.ready || stopRequested;
+  $("btn-run-robot").disabled = planningOnly || !rosConnected || !derived.ready || stopRequested;
   $("btn-clear").disabled = derived.running || cs.length === 0;
   $("btn-undo").disabled = derived.running || cs.length === 0;
   $("free-space-confirmed").disabled = !rosConnected || derived.running || Boolean(derived.abortReason);
-  $("btn-stop-robot").disabled = !rosConnected;
+  $("btn-stop-robot").disabled = planningOnly || !rosConnected;
+  $("btn-stop-robot").hidden = planningOnly;
   document.querySelectorAll('input[name="workflow-mode"], input[name="sketch-mode"]').forEach(input => {
     input.disabled = derived.running || processModePending ||
       (spray && input.name === "sketch-mode" && (workflowMode === "path" || (workflowMode === "work_area" && input.value !== "rect")));
@@ -891,7 +917,7 @@ function refreshPaintingUI() {
   const hints = {
     target: "작업할 대상을 둘러 그린 뒤 평면을 추출하세요.",
     work_area: spray ? "ZED Wall Front · 사각형 작업영역" : "측정한 평면 위에 칠할 영역을 그리세요.",
-    path: spray ? "자동 도포 경로 · 충돌 및 실행 검증" : "영역을 자동으로 채우거나, 원하는 경로를 직접 그리세요.",
+    path: planningOnly ? "자동 도포 경로 미리보기 · 로봇 도달성·충돌 검증 전" : spray ? "자동 도포 경로 · 충돌 및 실행 검증" : "영역을 자동으로 채우거나, 원하는 경로를 직접 그리세요.",
   };
   $("work-area-description").textContent = spray ? "ZED 평면 · 사각형 영역" : "칠할 영역을 둘러 그리세요. 그리지 않으면 정면 영상 전체를 사용합니다.";
   $("path-actions-title").textContent = spray ? "자동 도포 경로" : "작업 경로";
@@ -900,25 +926,26 @@ function refreshPaintingUI() {
   $("sketch-canvas").setAttribute("aria-label", hints[workflowMode]);
 
   let summary = "실행 조건을 확인 중입니다. 연결·진단에서 상세 내용을 확인하세요.";
-  if (!rosConnected) summary = "로봇 연결을 기다리고 있습니다.";
+  if (!rosConnected) summary = "영상·작업 서버 연결을 기다리고 있습니다.";
   else if (derived.abortReason) summary = "작업이 중단되었습니다. 원인을 확인하세요.";
   else if (stopRequested) summary = "중단 요청을 보냈습니다. 로봇의 응답을 기다립니다.";
   else if (multiPlaneBusy) summary = spray ? "ZED 평면 선택을 확인 중입니다." : "선택한 평면에 접근하여 측정 중입니다.";
   else if (derived.running) summary = "로봇이 작업 중입니다.";
   else if (processModePending) summary = "작업 방식 변경을 확인 중입니다.";
   else if (derived.ready) summary = "준비 완료. 작업을 시작할 수 있습니다.";
-  else if (paintingState.readinessSeq === 0) summary = "로봇 상태를 확인하고 있습니다.";
+  else if (paintingState.readinessSeq === 0) summary = planningOnly ? "ZED 작업 서버 상태를 확인하고 있습니다." : "로봇 상태를 확인하고 있습니다.";
   else if (measuring) summary = "평면 측정 결과를 기다리고 있습니다.";
   else if (derived.targetSelected !== true) summary = spray ? "ZED 대상 평면을 선택·확정하세요." : "대상을 선택하고 평면을 측정하세요.";
   else if (derived.workAreaSelected !== true) summary = "칠할 작업영역을 확정하세요.";
   else if (!derived.surfaceAccepted) summary = spray ? "ZED 작업영역 확인을 기다립니다." : "평면 측정 상태를 확인하세요.";
-  else if (local.awaitingPlan) summary = "작업 경로를 생성·검증하고 있습니다.";
+  else if (local.awaitingPlan) summary = planningOnly ? "작업 경로를 생성하고 있습니다." : "작업 경로를 생성·검증하고 있습니다.";
+  else if (planningOnly && derived.planGenerated) summary = "경로 생성 완료. 로봇 도달성·충돌 검증은 연결 후 진행하세요.";
   else if (!derived.planValidated) summary = planFailed ? "경로 검증에 실패했습니다. 영역이나 경로를 확인하세요." : "작업 경로를 생성하세요.";
   else if (processMode !== "spray" && !freeSpaceConfirmed) summary = "접촉 전 F/T 영점 조정을 승인하세요.";
   else if (processMode !== "spray" && !backendConfirmed) summary = "영점 조정 승인을 확인 중입니다.";
   $("execution-summary").textContent = summary;
   $("execution-summary").classList.toggle("is-running", derived.running);
-  $("btn-run-robot").textContent = derived.running ? "작업 진행 중" : "작업 시작";
+  $("btn-run-robot").textContent = planningOnly ? "ZED 미리보기 · 로봇 실행 안 함" : derived.running ? "작업 진행 중" : "작업 시작";
 
   const pathReasons = buttonBlockReason(derived, "path");
   $("btn-execute").title = pathReasons.length ? pathReasons.join("; ") : "그린 경로를 생성하고 검증합니다";
@@ -1025,15 +1052,16 @@ function subscribeView(viewName) {
     currentImageSub = null;
   }
   const topic = VIEW_TOPICS[viewName];
-  const sub = new ROSLIB.Topic({
+  const sub = createImageTopic({
     ros: ros,
     name: topic,
+    reliable: viewName === "zed_raw" && zedImageReliable,
     messageType: "sensor_msgs/Image",
     // Raw ZED/D405 frames are several megabytes as rosbridge JSON.  Five Hz
     // is responsive enough for target/path drawing without starving the
     // controller and F/T watchdog callbacks on the commissioning workstation.
     throttle_rate: 200,
-    queue_size: 1,
+    queue_length: 1,
   });
   sub.subscribe(msg => {
     if (currentImageSub === sub && currentView === viewName) handleImageMsg(msg);
@@ -1237,6 +1265,21 @@ function redrawSketch() {
   sketchCtx.clearRect(0, 0, sketchCanvas.width, sketchCanvas.height);
   if (typeof drawPlaneCandidates === "function") drawPlaneCandidates();
   drawRollerFootprints();
+  const derived = paintingDerivedState();
+  if (currentView === "wall_front" && workflowMode === "path" &&
+      (derived.planGenerated || derived.planValidated)) {
+    const lines = window.ZedSurfaceGate.previewStrokes(backendPreview, derived.pathId);
+    sketchCtx.save();
+    sketchCtx.strokeStyle = "#22d3ee";
+    sketchCtx.lineWidth = 3;
+    for (const points of lines) {
+      sketchCtx.beginPath();
+      sketchCtx.moveTo(points[0].u, points[0].v);
+      for (const point of points.slice(1)) sketchCtx.lineTo(point.u, point.v);
+      sketchCtx.stroke();
+    }
+    sketchCtx.restore();
+  }
   sketchCtx.lineCap = "round";
   sketchCtx.lineJoin = "round";
   sketchCtx.lineWidth = STROKE_WIDTH;
@@ -1748,8 +1791,7 @@ $("btn-fill-work-area").addEventListener("click", () => {
   }
   beginPlanRequest("backend fill requested");
   fillWorkAreaPub.publish(new ROSLIB.Message({}));
-  // Browser-side fill geometry is deliberately absent. Backend/RViz markers
-  // are the preview, so preview and executable canonical segments stay equal.
+  // The overlay uses only the backend-generated pixels for this path ID.
   logEvent("published /fill_work_area; waiting for backend plan_status before Run is enabled");
 });
 
@@ -1813,3 +1855,10 @@ $("btn-stop-robot").addEventListener("click", () => {
 
 updateSketchStats();
 logEvent("sketch overlay ready (mode=freehand)");
+
+// Backend pixels share the generated path timestamp; stale frames never draw.
+new ROSLIB.Topic({ros, name: "/painting_system/fill_preview_pixels",
+  messageType: "geometry_msgs/PoseArray"}).subscribe(msg => {
+  backendPreview = msg;
+  redrawSketch();
+});

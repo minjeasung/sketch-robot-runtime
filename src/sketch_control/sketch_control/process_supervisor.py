@@ -39,15 +39,15 @@ def build_specs(workspace, options=None):
     if set(options) - allowed:
         raise SupervisorError("Unknown configuration options", 400)
     profile = options.setdefault("profile", "dry_run")
-    if profile not in ("dry_run", "work", "fake", "spray_motion_test"):
-        raise SupervisorError("profile must be dry_run, work, fake or spray_motion_test", 400)
+    if profile not in ("dry_run", "work", "fake", "spray_motion_test", "zed_preview"):
+        raise SupervisorError("profile must be dry_run, work, fake, spray_motion_test or zed_preview", 400)
     try:
         process_mode = validate_process_mode(options.setdefault(
-            'process_mode', 'spray' if profile == 'spray_motion_test' else 'paint'))
+            'process_mode', 'spray' if profile in ('spray_motion_test', 'zed_preview') else 'paint'))
     except ValueError as exc:
         raise SupervisorError(str(exc), 400) from None
-    if profile == 'spray_motion_test' and process_mode != 'spray':
-        raise SupervisorError('spray_motion_test requires process_mode=spray', 400)
+    if profile in ('spray_motion_test', 'zed_preview') and process_mode != 'spray':
+        raise SupervisorError(profile + ' requires process_mode=spray', 400)
     robot_ip = options.setdefault("robot_ip", "10.0.2.7")
     try:
         validate_model(options.setdefault("model_id", DEFAULT_MODEL))
@@ -78,6 +78,26 @@ def build_specs(workspace, options=None):
         options['launch_d405_driver'] = False
     if backend == 'outpost' and (options['launch_zed_driver'] or options['launch_d405_driver']):
         raise SupervisorError('Outpost owns cameras; native camera drivers must be disabled', 400)
+    if profile == 'zed_preview':
+        if backend != 'outpost':
+            raise SupervisorError('zed_preview requires camera_backend=outpost', 400)
+        options['launch_rviz'] = False
+        calibration = model_calibration_files(workspace, options['model_id'], 'spray')
+        flags = {key: options[key] for key in
+                 ('model_id', 'outpost_http', 'outpost_zed_hw_id', 'outpost_zed_serial')}
+        flags['zed_calibration_file'] = calibration['zed_calibration_file']
+        command = ('ros2', 'launch', 'sketch_control', 'zed_preview.launch.py') + tuple(
+            f'{key}:={value}' for key, value in flags.items())
+        return options, [
+            ProcessSpec('perception', 'ZED · 대상/작업영역 · 경로 미리보기', (), command,
+                        ('target_selector', 'wall_projector', 'sketch_to_waypoints',
+                         'zed_preview')),
+            ProcessSpec('rosbridge', 'Browser ROS WebSocket (9090)', (),
+                        ('ros2', 'run', 'rosbridge_server', 'rosbridge_websocket',
+                         '--ros-args', '-r', '__node:=painting_rosbridge_websocket',
+                         '-p', 'max_message_size:=10000000'),
+                        ('painting_rosbridge_websocket', 'rosbridge_websocket')),
+        ]
     common = dict(options)
     common.pop("profile")
     if profile == 'fake':
@@ -209,6 +229,8 @@ class Supervisor:
         if not graph["graph_fresh"]:
             raise SupervisorError("ROS discovery is not ready; retry shortly")
         conflicts = set(r["spec"].nodes)
+        if self.options['profile'] == 'zed_preview':
+            conflicts.add('moveit_executor')
         if name == "perception":
             if self.options['camera_backend'] == 'outpost':
                 # Reject both the current split bridge nodes and the legacy

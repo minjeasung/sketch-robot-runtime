@@ -158,5 +158,26 @@
     const [a, b, c, d] = points;
     return b.u - a.u > 3 && d.v - a.v > 3 && a.v === b.v && b.u === c.u && c.v === d.v && d.u === a.u;
   }
-  return { ZedSurfaceGate, stampPathId, matchesPlan, rectangleReady };
+  function previewPlanGenerated(surface, plan, readiness) {
+    return readiness?.planning_only === true && plan?.state === "generated" &&
+      readiness.checks?.current_plan_generated === true && matchesPlan(surface, plan, readiness, "spray");
+  }
+  function executionAllowed(ready, readiness) {
+    return ready === true && readiness?.planning_only !== true;
+  }
+  function previewStrokes(message, pathId) {
+    if (!pathId || message?.header?.frame_id !== "wall_front" ||
+        stampPathId(message.header.stamp) !== pathId || !Array.isArray(message.poses)) return [];
+    const strokes = new Map();
+    for (const pose of message.poses) {
+      const p = pose?.position;
+      if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y) ||
+          p.x < 0 || p.y < 0 || !Number.isInteger(p.z) || p.z < 0) return [];
+      if (!strokes.has(p.z)) strokes.set(p.z, []);
+      strokes.get(p.z).push({u: p.x, v: p.y});
+    }
+    return [...strokes.values()].filter(points => points.length >= 2);
+  }
+  return { ZedSurfaceGate, stampPathId, matchesPlan, rectangleReady,
+    previewPlanGenerated, executionAllowed, previewStrokes };
 });

@@ -225,3 +225,28 @@ def test_pages_and_stopped_configuration(client):
     result = client.post('/configuration', json={'profile': 'fake'})
     assert result.status_code == 200
     assert result.json()['launch_zed_driver'] is False
+
+
+def test_zed_preview_registry_has_no_robot_or_force_process(tmp_path):
+    options, specs = build_specs(tmp_path, {'profile': 'zed_preview'})
+    assert options['process_mode'] == 'spray'
+    assert options['camera_backend'] == 'outpost'
+    assert options['launch_rviz'] is False
+    assert [s.name for s in specs] == ['perception', 'rosbridge']
+    assert all(not s.dependencies for s in specs)
+    assert 'zed_preview.launch.py' in specs[0].command
+    assert not any('robot_ip:=' in arg for s in specs for arg in s.command)
+    assert not any(n in {'move_group', 'controller_manager', 'moveit_executor',
+                        'painting_force_monitor'} for s in specs for n in s.nodes)
+
+
+def test_zed_preview_rejects_contact_mode(tmp_path):
+    with pytest.raises(SupervisorError, match='requires process_mode=spray'):
+        build_specs(tmp_path, {'profile': 'zed_preview', 'process_mode': 'paint'})
+
+
+def test_zed_preview_cannot_start_robot_process_via_api(client):
+    result = client.post('/configuration', json={'profile': 'zed_preview'})
+    assert result.status_code == 200, result.text
+    for name in ('robot_control', 'force_pipeline', 'executor'):
+        assert client.post(f'/processes/{name}/start').status_code == 404

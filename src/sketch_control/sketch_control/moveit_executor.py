@@ -3535,6 +3535,10 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
             "즉시 중단")
         self._motion_abort_requested = True
         safety_reason = str(self._safety_status.get("reason", "")).strip()
+        # A Boolean stop carries no source. In non-contact spray, the force
+        # monitor's diagnostic latch is not evidence that it caused this stop.
+        if getattr(self, "process_mode", "paint") == "spray":
+            safety_reason = ""
         if not self._execution_abort_reason:
             self._execution_abort_reason = (
                 safety_reason

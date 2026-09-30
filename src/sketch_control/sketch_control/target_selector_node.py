@@ -82,8 +82,10 @@ class TargetSelectorNode(Node):
 
         self.create_subscription(
             CameraInfo, CAMERA_INFO_TOPIC, self._on_info, qos_profile_sensor_data)
+        depth_qos = QoSProfile(depth=1) if self.declare_parameter(
+            "zed_image_reliable", False).value else qos_profile_sensor_data
         self.create_subscription(
-            Image, DEPTH_TOPIC, self._on_depth, qos_profile_sensor_data)
+            Image, DEPTH_TOPIC, self._on_depth, depth_qos)
         self.create_subscription(
             PoseArray, TARGET_SELECTION_TOPIC, self._on_selection, 10)
 

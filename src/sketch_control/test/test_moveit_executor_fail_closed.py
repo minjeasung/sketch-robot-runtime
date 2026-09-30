@@ -4142,3 +4142,47 @@ def test_force_lease_survives_paint_result_gap_and_aborts_on_stale_guard(
     timers[0].callback()
     assert len(aborts) == 1
     assert "FORCE_LEASE_GUARD_LOST" in aborts[0]
+
+
+@pytest.mark.parametrize(
+    "process_mode,explicit_reason,expected",
+    [
+        ("spray", "", "motion_abort"),
+        ("spray", "HARDWARE_MOTION_INHIBITED", "HARDWARE_MOTION_INHIBITED"),
+        ("paint", "", "FT_STALE"),
+    ],
+)
+def test_external_spray_stop_does_not_attribute_unrelated_force_diagnostic(
+    process_mode, explicit_reason, expected
+):
+    """A Boolean stop has no F/T provenance when spray does not use force."""
+    statuses = []
+    commands = []
+    executor = SimpleNamespace(
+        process_mode=process_mode,
+        _motion_abort_requested=False,
+        _execution_abort_reason=explicit_reason,
+        _safety_status={"reason": "FT_STALE", "abort_latched": True},
+        executing=True,
+        get_logger=lambda: _Logger(),
+        _publish_execution_status=lambda *args: statuses.append(args),
+        _publish_painting_command=lambda *args, **kwargs: commands.append((args, kwargs)),
+    )
+    # No live ROS timers, action server, planning scene, or camera in this test.
+    for name in (
+        "_cancel_joint_command_timer", "_cancel_active_follow_joint_goal",
+        "_cancel_stage1_scene_wait_timer", "_invalidate_stage1_orientation_candidates",
+        "_cancel_process_timer", "_cancel_runtime_tare", "_cancel_d405_prescan_timer",
+        "_invalidate_d405_prescan_callbacks", "_cancel_work_area_refine_wait_timer",
+        "_publish_free_space_confirmation", "_set_contact_collision_allowed",
+        "_publish_work_area_refine_status",
+    ):
+        setattr(executor, name, lambda *args, **kwargs: None)
+
+    moveit_executor.MoveItExecutor.on_motion_abort(executor, Bool(data=True))
+
+    assert executor._motion_abort_requested is True
+    assert executor.executing is False
+    assert executor._execution_abort_reason == expected
+    assert statuses[-1] == ("ABORT", expected)
+    assert commands == [(("ABORT", 0.0), {"enable": False})]

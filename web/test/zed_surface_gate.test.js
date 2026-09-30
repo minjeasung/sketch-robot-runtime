@@ -156,3 +156,24 @@ test("plan matching requires all accepted surface identities, mode, path, and ha
   assert.equal(matchesPlan({ ...area, accepted: false }, plan, plan, "spray"), false);
   assert.equal(matchesPlan({ ...area, source: "d405" }, plan, plan, "spray"), false);
 });
+
+test("camera-only generated plans never become robot execution approval", () => {
+  const { previewPlanGenerated, executionAllowed } = require('../js/zed_surface_gate.js');
+  const plan = { state: 'generated', process_mode: 'spray', path_id: '42', plan_hash: 'hash',
+    work_area_id: area.work_area_id, plane_generation_id: area.plane_generation_id };
+  const readiness = { ...plan, planning_only: true, ready: true, checks: { current_plan_generated: true } };
+  assert.equal(previewPlanGenerated(area, plan, readiness), true);
+  assert.equal(executionAllowed(true, readiness), false);
+  assert.equal(previewPlanGenerated(area, { ...plan, path_id: 'old' }, readiness), false);
+  assert.equal(executionAllowed(true, { ready: true }), true);
+});
+
+test("backend preview pixels require matching plan identity and finite geometry", () => {
+  const { previewStrokes } = require('../js/zed_surface_gate.js');
+  const message = { header: { frame_id: 'wall_front', stamp: { sec: 0, nanosec: 42 } },
+    poses: [{ position: { x: 10, y: 20, z: 0 } }, { position: { x: 80, y: 20, z: 0 } }] };
+  assert.deepEqual(previewStrokes(message, '42'), [[{u: 10, v: 20}, {u: 80, v: 20}]]);
+  assert.deepEqual(previewStrokes(message, '41'), []);
+  message.poses[0].position.x = NaN;
+  assert.deepEqual(previewStrokes(message, '42'), []);
+});

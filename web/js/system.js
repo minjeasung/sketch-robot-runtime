@@ -6,7 +6,7 @@ const processLabels = {robot_control: "robot control"};
 const processLabel = name => processLabels[name] || name;
 function options() {
   return {profile: byId("profile").value, robot_ip: byId("robot-ip").value.trim(), model_id: byId("model-id").value,
-    process_mode: byId("profile").value === "spray_motion_test" ? "spray" : byId("process-mode").value,
+    process_mode: ["spray_motion_test", "zed_preview"].includes(byId("profile").value) ? "spray" : byId("process-mode").value,
     launch_zed_driver: byId("zed").checked, launch_d405_driver: byId("d405").checked,
     camera_backend: byId('camera-backend').value, outpost_http: byId('outpost-http').value.trim(),
     outpost_zed_hw_id: byId('outpost-zed-hw-id').value.trim(), outpost_zed_serial: byId('outpost-zed-serial').value.trim(),
@@ -22,8 +22,9 @@ async function api(path, method = "GET", body) {
   return payload;
 }
 function profileHelp() {
-  if (byId("profile").value === "spray_motion_test") byId("process-mode").value = "spray";
+  if (["spray_motion_test", "zed_preview"].includes(byId("profile").value)) byId("process-mode").value = "spray";
   byId("profile-help").textContent = {
+    zed_preview: "로봇 없이 ZED에서 대상·작업영역·도포 경로를 생성합니다. 로봇 도달성·충돌 검증과 이동 실행은 하지 않습니다.",
     dry_run: "실제 로봇·카메라에 연결하지만 작업 경로와 힘 출력은 모의 실행합니다.",
     work: "실제 이동과 도장 힘 제어를 허용합니다. 작업 실행은 스케치 화면에서 진행합니다.",
     spray_motion_test: "현재 EOAT로 실제 이동합니다. 뿜칠건 미장착 전용이며 분사 출력은 항상 OFF, 힘 제어는 사용하지 않습니다.",
@@ -40,7 +41,12 @@ function controls() {
   if (byId('camera-backend').value === 'outpost') {
     for (const id of ['zed', 'd405']) { byId(id).checked = false; byId(id).disabled = true; }
   }
-  if (byId("profile").value === "spray_motion_test") byId("process-mode").disabled = true;
+  if (["spray_motion_test", "zed_preview"].includes(byId("profile").value)) byId("process-mode").disabled = true;
+  if (byId("profile").value === "zed_preview") {
+    byId('camera-backend').value = 'outpost';
+    for (const id of ['robot-ip', 'rviz', 'zed', 'd405', 'camera-backend']) byId(id).disabled = true;
+    for (const id of ['rviz', 'zed', 'd405']) byId(id).checked = false;
+  }
   byId('outpost-settings').hidden = byId('camera-backend').value !== 'outpost';
   for (const button of document.querySelectorAll(".process-row button")) button.disabled = pending || !latest;
 }
@@ -62,7 +68,10 @@ function renderProcesses(state) {
     box.append(row);
   }
   const select = byId("log-process");
-  if (!select.options.length) for (const p of state.processes) select.add(new Option(processLabel(p.name), p.name));
+  const previousLog = select.value;
+  select.replaceChildren();
+  for (const p of state.processes) select.add(new Option(processLabel(p.name), p.name));
+  if (state.processes.some(p => p.name === previousLog)) select.value = previousLog;
 }
 async function refresh() {
   try {
@@ -108,7 +117,7 @@ byId("start").addEventListener("click", () => perform(async () => {
 }));
 byId("stop").addEventListener("click", () => perform(() => api("/shutdown-system", "POST")));
 byId("profile").addEventListener("change", () => {
-  for (const id of ["zed", "d405", "rviz"]) byId(id).checked = byId("profile").value !== "fake";
+  for (const id of ["zed", "d405", "rviz"]) byId(id).checked = !["fake", "zed_preview"].includes(byId("profile").value);
   profileHelp();
   if (byId("process-mode").value === "spray") byId("d405").checked = false;
   controls();

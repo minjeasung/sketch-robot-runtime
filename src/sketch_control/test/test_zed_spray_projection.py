@@ -282,6 +282,7 @@ def _ready(node, target_sec=10):
     node._zed_front_generation = target["plane_generation_id"]
     node._zed_front_stamp_ns = (target_sec + 1) * 1_000_000_000
     node._zed_first_front_stamp_ns = (target_sec + 1) * 1_000_000_000
+    node._zed_front_camera = (K.copy(), np.eye(3), np.zeros(3), (640, 480))
 
 
 def _clock(node, sec):
@@ -617,6 +618,62 @@ def test_duplicate_request_does_not_replace_active_area(node):
     node._on_zed_work_area_request(request)
     assert len(node.zed_status_pub.messages) == before
     assert node.locked_work_area["work_area_id"] == accepted["work_area_id"]
+
+
+def _partial_target():
+    data = _target()
+    data["center"][0] = 0.8
+    data["corners"] = (np.asarray(data["corners"]) + [0.8, 0, 0]).tolist()
+    return data
+
+
+def test_partially_visible_plane_preserves_full_metric_extent():
+    data = _partial_target()
+    extent, pixels, size = project_target_rectangle(validate_target_lock(data), K, (640, 480))
+    assert pixels[:, 0].max() > 639
+    assert extent == pytest.approx(np.asarray(data["corners"]))
+    assert size == (900, 540)
+
+
+def test_plane_larger_than_camera_frame_can_still_show_its_visible_interior():
+    data = _target()
+    data["corners"] = [[-2, -2, 2], [2, -2, 2], [2, 2, 2], [-2, 2, 2]]
+    extent, pixels, size = project_target_rectangle(validate_target_lock(data), K, (640, 480))
+    assert size == (900, 900)
+    assert extent == pytest.approx(np.asarray(data["corners"]))
+    assert pixels[:, 0].min() < 0 and pixels[:, 0].max() > 639
+    assert pixels[:, 1].min() < 0 and pixels[:, 1].max() > 479
+
+
+def test_partial_front_view_displays_but_unseen_border_cannot_be_work_area(node):
+    data = _partial_target()
+    node._on_zed_target_lock(String(data=json.dumps(data)))
+    node._on_image(_image())
+    assert len(node.front_pub.messages) == 1
+    front = node.front_pub.messages[-1]
+    rgb = np.frombuffer(front.data, dtype=np.uint8).reshape(front.height, front.width, 3)
+    assert rgb[:, :100].any()
+    assert not rgb[:, -100:].any()
+    node._on_zed_work_area_request(_request())
+    assert node.locked_work_area is None
+    assert "outside ZED image" in json.loads(node.zed_status_pub.messages[-1].data)["reason"]
+    node._on_zed_work_area_request(_request(_area(points=((20, 20), (500, 500)), sec=13)))
+    assert node.locked_work_area is not None
+
+
+def test_front_view_recovers_from_transient_image_error_without_restoring_old_area(node):
+    _ready(node)
+    node._on_zed_work_area_request(_request())
+    bad = _image(sec=12)
+    bad.header.frame_id = "wrong_camera"
+    node._on_image(bad)
+    assert not json.loads(node.zed_status_pub.messages[-1].data)["accepted"]
+    _clock(node, 13)
+    node._on_image(_image(sec=13))
+    status = json.loads(node.zed_status_pub.messages[-1].data)
+    assert status["accepted"] is True and status["mode"] == "target"
+    assert status["view_width"] == 900
+    assert node.locked_work_area is None
 
 
 def test_atomic_zed_requests_do_not_change_paint(node):
