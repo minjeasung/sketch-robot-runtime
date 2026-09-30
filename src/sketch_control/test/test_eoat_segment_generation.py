@@ -225,12 +225,13 @@ def _publish_two_strokes(node):
     )
 
 
-def _spray_generator_stub(*, real=True):
+def _spray_generator_stub(*, real=True, spray_eoat_profile=""):
     from types import SimpleNamespace
     from test_zed_spray_geometry import atomic_status
 
     node = _generator_stub(real=real)
     node.process_mode = "spray"
+    node.spray_eoat_profile = str(spray_eoat_profile)
     node.model_id, node.spray_tool_axis = "rb10_1300e_u", "-y"
     node.spray_footprint_width_m, node.spray_overlap = .35, .30
     node.spray_speed_mps, node.spray_standoff_m = .020, .5

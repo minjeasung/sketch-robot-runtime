@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "model_id": "rb20_1900es",
+  "spray_tool_axis": "+z",
+  "mesh_file": "REPLACE_WITH_VERIFIED_FULL_EOAT.stl",
+  "mesh_scale_to_m": 0.001,
+  "mesh_to_tcp": {
+    "translation_m": [0, 0, 0],
+    "quaternion_xyzw": [0, 0, 0, 1]
+  },
+  "endpoint_confirmed": false
+}

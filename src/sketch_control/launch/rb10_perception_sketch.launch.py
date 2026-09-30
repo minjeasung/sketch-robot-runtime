@@ -397,6 +397,7 @@ def generate_launch_description():
                 "process_mode": ParameterValue(LaunchConfiguration('process_mode'), value_type=str),
                 "model_id": ParameterValue(LaunchConfiguration('model_id'), value_type=str),
                 "spray_tool_axis": ParameterValue(LaunchConfiguration('spray_tool_axis'), value_type=str),
+                "spray_eoat_profile": ParameterValue(LaunchConfiguration('spray_eoat_profile'), value_type=str),
                 **{key: ParameterValue(LaunchConfiguration(key), value_type=float) for key in
                    ('spray_footprint_width_m', 'spray_overlap', 'spray_speed_mps', 'spray_standoff_m')},
             },
@@ -457,6 +458,7 @@ def generate_launch_description():
         DeclareLaunchArgument('process_mode', default_value='paint', choices=['paint', 'spray']),
         DeclareLaunchArgument('model_id', default_value='rb10_1300e_u'),
         DeclareLaunchArgument('spray_tool_axis', default_value=''),
+        DeclareLaunchArgument('spray_eoat_profile', default_value=''),
         DeclareLaunchArgument('spray_footprint_width_m', default_value='0.35'),
         DeclareLaunchArgument('spray_overlap', default_value='0.30'),
         DeclareLaunchArgument('spray_speed_mps', default_value='0.020'),

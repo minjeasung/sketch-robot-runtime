@@ -25,7 +25,7 @@ def generate_launch_description():
     use_sim_depth_pointcloud = LaunchConfiguration('use_sim_depth_pointcloud')
     process_parameters = {
         key: ParameterValue(LaunchConfiguration(key), value_type=str)
-        for key in ('process_mode', 'model_id', 'spray_tool_axis')
+        for key in ('process_mode', 'model_id', 'spray_tool_axis', 'spray_eoat_profile')
     }
     spray_parameters = {
         key: ParameterValue(LaunchConfiguration(key), value_type=float)
@@ -134,6 +134,7 @@ def generate_launch_description():
         DeclareLaunchArgument('process_mode', default_value='paint', choices=['paint', 'spray']),
         DeclareLaunchArgument('model_id', default_value='rb10_1300e_u'),
         DeclareLaunchArgument('spray_tool_axis', default_value=''),
+        DeclareLaunchArgument('spray_eoat_profile', default_value=''),
         DeclareLaunchArgument('spray_footprint_width_m', default_value='0.35'),
         DeclareLaunchArgument('spray_overlap', default_value='0.30'),
         DeclareLaunchArgument('spray_speed_mps', default_value='0.020'),

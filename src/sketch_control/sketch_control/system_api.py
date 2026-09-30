@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, StrictBool
+from pydantic import BaseModel, ConfigDict, StrictBool, StrictStr
 
 from .process_supervisor import Supervisor, SupervisorError
 from .outpost_camera import get_json
@@ -20,6 +20,7 @@ class ConfigurationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     profile: str = "dry_run"
     process_mode: str | None = None
+    spray_eoat_profile: StrictStr | None = None
     robot_ip: str = "10.0.2.7"
     model_id: str = "rb10_1300e_u"
     launch_rviz: StrictBool | None = None
@@ -170,7 +171,7 @@ def main():
     options = {"profile": os.environ.get("SKETCH_PROFILE", "dry_run"),
                "robot_ip": os.environ.get("SKETCH_ROBOT_IP", "10.0.2.7"),
                "model_id": os.environ.get("SKETCH_MODEL_ID", "rb10_1300e_u")}
-    for key in ('process_mode', 'camera_backend', 'outpost_http', 'outpost_zed_hw_id', 'outpost_zed_serial',
+    for key in ('process_mode', 'spray_eoat_profile', 'camera_backend', 'outpost_http', 'outpost_zed_hw_id', 'outpost_zed_serial',
                 'outpost_d405_hw_id', 'outpost_d405_serial'):
         value = os.environ.get('SKETCH_' + key.upper())
         if value is not None:

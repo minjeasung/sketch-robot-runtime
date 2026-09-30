@@ -123,6 +123,7 @@ def generate_launch_description():
 
     arguments = [
         DeclareLaunchArgument('spray_tool_axis', default_value=''),
+        DeclareLaunchArgument('spray_eoat_profile', default_value=''),
         DeclareLaunchArgument('spray_footprint_width_m', default_value='0.35'),
         DeclareLaunchArgument('spray_overlap', default_value='0.30'),
         DeclareLaunchArgument('spray_speed_mps', default_value='0.020'),
@@ -297,7 +298,7 @@ def generate_launch_description():
         launch_arguments={
             "painting_config_file": config_file,
             **{key: LaunchConfiguration(key) for key in
-               ('process_mode', 'model_id', 'spray_tool_axis', 'spray_footprint_width_m',
+               ('process_mode', 'model_id', 'spray_tool_axis', 'spray_eoat_profile', 'spray_footprint_width_m',
                 'spray_overlap', 'spray_speed_mps', 'spray_standoff_m')},
             **{key: LaunchConfiguration(key) for key in
                ('camera_backend', 'outpost_http', 'outpost_zed_hw_id', 'outpost_zed_serial',
@@ -366,6 +367,7 @@ def generate_launch_description():
                 "model_id": LaunchConfiguration("model_id"),
                 "process_mode": ParameterValue(LaunchConfiguration('process_mode'), value_type=str),
                 "spray_tool_axis": ParameterValue(LaunchConfiguration('spray_tool_axis'), value_type=str),
+                "spray_eoat_profile": ParameterValue(LaunchConfiguration('spray_eoat_profile'), value_type=str),
                 "spray_motion_test": ParameterValue(
                     LaunchConfiguration("spray_motion_test"), value_type=bool
                 ),

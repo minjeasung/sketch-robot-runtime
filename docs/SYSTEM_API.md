@@ -59,6 +59,14 @@ Supervisor는 각 프로세스에 해당 그룹만 켭니다.
 
 ## 실행 모드와 설정
 
+**Spray EOAT 프로파일** 입력란에서 서버 PC의 JSON 경로를 설정합니다.
+절대 경로를 권장하며 상대 경로는 supervisor workspace 기준 절대 경로로 정규화됩니다.
+`SKETCH_SPRAY_EOAT_PROFILE`은 서버 시작 시 초기값입니다.
+`POST /configuration`의 선택 필드 `spray_eoat_profile`은 생략 시 현재 값을 유지하고,
+빈 문자열이면 지웁니다. 실행 중에는 변경할 수 없습니다.
+프로파일이 없더라도 카메라 기동은 허용하지만 Spray 경로 생성은 차단됩니다.
+[EOAT 프로파일 계약과 보정](SPRAY_EOAT_PROFILE.md)을 참고하세요.
+
 | profile | 로봇 | 경로 실행 | 힘 제어 허용 |
 |---|---|---|---|
 | `dry_run` (기본) | 실제 연결 | 모의 실행 | 꺼짐 |

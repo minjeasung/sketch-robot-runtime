@@ -865,7 +865,11 @@ def build_execution_steps(rows: Iterable[SegmentWaypoint]) -> tuple[ExecutionSte
 def segment_waypoint_position(
     path: SegmentPath, row: SegmentWaypoint
 ) -> tuple[float, float, float]:
-    """Return the process position: spray TCP or paint roller center."""
+    """Return the spray nozzle endpoint or paint roller center.
+
+    Spray standoff is measured from the nozzle, not the TCP. Callers building
+    TCP poses must subtract the rotated spray_endpoint_tcp_m from this point.
+    """
 
     normal = np.asarray(row.normal, dtype=float)
     point = np.asarray(row.position, dtype=float)

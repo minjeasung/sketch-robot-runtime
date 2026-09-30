@@ -62,6 +62,9 @@ from rbpodo_painting_control.spray_path import (
     make_spray_rows, resolve_spray_tool_axis, rotation_from_spray_path,
     spray_spacing_m,
 )
+from rbpodo_painting_control.spray_eoat import (
+    load_spray_eoat_profile, compensate_spray_endpoint,
+)
 from sketch_control.rotation_utils import quat_from_matrix, quat_to_matrix
 from sketch_control.zed_spray_projection import validate_target_lock
 from sketch_control.work_area_geometry import (
@@ -143,6 +146,7 @@ class SketchToWaypointsNode(Node):
         self.spray_overlap = float(self.declare_parameter("spray_overlap", 0.30, startup_only).value)
         self.spray_speed_mps = float(self.declare_parameter("spray_speed_mps", 0.020, startup_only).value)
         self.spray_standoff_m = float(self.declare_parameter("spray_standoff_m", 0.5, startup_only).value)
+        self.spray_eoat_profile = str(self.declare_parameter("spray_eoat_profile", "", startup_only).value)
         spray_spacing_m(self.spray_footprint_width_m, self.spray_overlap)
         if any(not math.isfinite(v) or v <= 0 for v in (self.spray_speed_mps, self.spray_standoff_m)):
             raise ValueError("spray speed and standoff must be finite and positive")
@@ -1253,6 +1257,17 @@ class SketchToWaypointsNode(Node):
                 self._publish_plan_status("rejected", reason="SPRAY_AUTO_COVERAGE_REQUIRED")
                 return None
             try:
+                spray_profile = load_spray_eoat_profile(
+                    self.spray_eoat_profile, self.model_id, self.spray_tool_axis)
+            except (OSError, TypeError, ValueError) as exc:
+                self.segment_pub.publish(String(data=""))
+                self.pub.publish(PoseArray())
+                self._publish_fill_preview(())
+                self._publish_marker_clear(self.eoat_segment_frame or WORLD_FRAME)
+                self._publish_plan_status(
+                    "rejected", reason="SPRAY_EOAT_PROFILE_INVALID", detail=str(exc))
+                return None
+            try:
                 strokes, normal_world, fallback_tangent = self._spray_coverage_world()
             except (ValueError, TransformException) as exc:
                 self._publish_plan_status("rejected", reason="SPRAY_COVERAGE_INVALID", detail=str(exc))
@@ -1414,6 +1429,7 @@ class SketchToWaypointsNode(Node):
                 if source.get("plane") != "zed" or source.get("view") != "wall_front":
                     raise ValueError("spray path source must be ZED wall_front")
                 spray_metadata = {
+                    **spray_profile.metadata(),
                     "model_id": self.model_id,
                     "spray_tool_axis": resolve_spray_tool_axis(self.model_id, self.spray_tool_axis),
                     "spray_footprint_width_m": float(self.spray_footprint_width_m),
@@ -1607,6 +1623,8 @@ class SketchToWaypointsNode(Node):
                 rotation = rotation_from_spray_path(
                     row.normal, row.tangent, path.spray_tool_axis,
                     previous_tcp_x=previous_tcp_x)
+                position = compensate_spray_endpoint(
+                    position, rotation, path.raw_payload["spray_endpoint_tcp_m"])
             else:
                 rotation = rotation_from_surface_path(
                     row.normal, row.tangent, previous_tcp_x=previous_tcp_x)
@@ -1652,6 +1670,13 @@ class SketchToWaypointsNode(Node):
             f"{path.plane_generation_id}"
         )
         marker_id = 0
+        spray_positions = {}
+        if path.process_mode == "spray":
+            poses = self._compat_pose_array_from_segment(path, stamp).poses
+            spray_positions = {
+                row.row_number: (pose.position.x, pose.position.y, pose.position.z)
+                for row, pose in zip(path.rows, poses)
+            }
 
         # Stage 1 is a real, hashed part of execution even though it is not a
         # process row.  Display it explicitly so the first commanded pose and
@@ -1666,6 +1691,8 @@ class SketchToWaypointsNode(Node):
             )
             safety_position = segment_waypoint_position(path, safety_row)
             precontact_position = segment_waypoint_position(path, first_motion)
+            if path.process_mode == "spray":
+                safety_position = precontact_position = spray_positions[first_motion.row_number]
             safety_line = Marker()
             safety_line.header.frame_id = path.frame_id
             safety_line.header.stamp = stamp
@@ -1698,7 +1725,8 @@ class SketchToWaypointsNode(Node):
             points = [
                 Point(x=position[0], y=position[1], z=position[2])
                 for position in (
-                    segment_waypoint_position(path, row) for row in rows
+                    (spray_positions[row.row_number] if path.process_mode == "spray"
+                     else segment_waypoint_position(path, row)) for row in rows
                 )
             ]
 

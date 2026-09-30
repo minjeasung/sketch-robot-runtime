@@ -1,5 +1,6 @@
 """Non-contact spraying contract. Positions are measured from the surface."""
 import math
+import re
 import numpy as np
 
 from rbpodo_painting_control.spray_geometry import (
@@ -13,6 +14,7 @@ STANDOFF_M = 0.5
 SPRAY_METADATA_FIELDS = (
     "model_id", "spray_tool_axis", "spray_footprint_width_m", "spray_overlap",
     "spray_spacing_m", "spray_speed_mps", "spray_standoff_m",
+    "spray_eoat_profile_sha256", "spray_endpoint_tcp_m",
 )
 
 
@@ -55,7 +57,15 @@ def validate_spray_path(path):
         axis = resolve_spray_tool_axis(payload["model_id"], payload["spray_tool_axis"])
         if axis != payload["spray_tool_axis"]:
             reject("spray_tool_axis must be an explicit resolved signed TCP axis")
-        numeric = SPRAY_METADATA_FIELDS[2:]
+        digest = payload["spray_eoat_profile_sha256"]
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            reject("spray_eoat_profile_sha256 must be a SHA-256 digest")
+        endpoint = payload["spray_endpoint_tcp_m"]
+        if (not isinstance(endpoint, list) or len(endpoint) != 3
+                or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                       or not math.isfinite(v) for v in endpoint)):
+            reject("spray_endpoint_tcp_m must contain three finite numbers")
+        numeric = SPRAY_METADATA_FIELDS[2:7]
         if any(isinstance(payload[field], bool) or not isinstance(payload[field], (int, float))
                or not math.isfinite(payload[field]) for field in numeric):
             reject("spray metadata must contain finite numbers")
@@ -87,6 +97,11 @@ def validate_spray_path(path):
         reject("spray selection_id must be a positive pixel timestamp in nanoseconds")
     if any(path.source.get(field) != payload[field] for field in SPRAY_METADATA_FIELDS):
         reject("spray source metadata does not match the plan")
+    source_endpoint = path.source["spray_endpoint_tcp_m"]
+    if (not isinstance(source_endpoint, list)
+            or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                   or not math.isfinite(v) for v in source_endpoint)):
+        reject("spray source endpoint must contain finite numbers")
     if not path.rows or path.rows[0].mode != "SPRAY_APPROACH" or path.rows[-1].mode != "SPRAY_FINISH":
         reject("spray plan must begin OFF and finish OFF")
     if any(not math.isfinite(v) or abs(v-standoff) > 1e-9 for v in

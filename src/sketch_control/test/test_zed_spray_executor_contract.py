@@ -27,12 +27,15 @@ from rbpodo_painting_control.segment_path import (
     validate_segment_path_for_real_execution,
 )
 from rbpodo_painting_control.spray_path import rotation_from_spray_path
+from rbpodo_painting_control.spray_eoat import load_spray_eoat_profile
 from sketch_control.rotation_utils import quat_apply, quat_to_matrix
 from sketch_control.d405_view_geometry import support_coordinates
 from sketch_control.zed_spray_projection import validate_target_lock
 
 
 _METHODS = (
+    "_spray_eoat_load", "_spray_eoat_blocker", "_spray_endpoint_to_tcp",
+    "_spray_eoat_reject", "_defer_candidate_invalidation",
     "_execution_snapshot_updates_locked", "_execution_surface_geometry",
     "on_eoat_segments", "_segment_tip_pose", "_validate_segment_path_geometry",
     "_build_segment_orientation_candidate", "_apply_segment_orientation_candidate",
@@ -123,6 +126,7 @@ def _load_executor():
         String=NS,
     )
     pure_modules = {
+        "rbpodo_painting_control.spray_eoat",
         "rbpodo_painting_control.segment_path", "rbpodo_painting_control.spray_path",
         "sketch_control.rotation_utils", "sketch_control.work_area_geometry",
     }
@@ -262,7 +266,8 @@ def _spray_payload(model="rb20_1900es", axis="+z", standoff=.65):
     metadata = dict(model_id=model, spray_tool_axis=axis,
                     spray_footprint_width_m=.35, spray_overlap=.30,
                     spray_spacing_m=.245, spray_speed_mps=.02,
-                    spray_standoff_m=standoff)
+                    spray_standoff_m=standoff,
+                    **load_spray_eoat_profile(_TEST_PROFILES[model], model, axis).metadata())
     return attach_plan_hash(dict(
         version=3, process_mode="spray", frame_id="link0", path_id="123",
         work_area_id="area-1", plane_generation_id="zed:catalog:plane:1000000000",
@@ -301,9 +306,24 @@ def _parse(payload):
     return validate_segment_path_for_real_execution(path)
 
 
-def _executor(mode="spray"):
+_TEST_PROFILES = {}
+
+
+@pytest.fixture(autouse=True)
+def _verified_tools(tmp_path):
+    from test_zed_spray_generation import write_profile
+    for model, axis in (("rb20_1900es", "+z"), ("rb10_1300e_u", "-y")):
+        directory = tmp_path / model
+        directory.mkdir()
+        _TEST_PROFILES[model] = str(write_profile(directory, model=model, axis=axis))
+    yield
+    _TEST_PROFILES.clear()
+
+
+def _executor(mode="spray", model="rb20_1900es", axis="+z"):
     logger = _Logger()
     node = NS(
+        model_id=model, spray_tool_axis=axis, spray_eoat_profile=_TEST_PROFILES[model],
         process_mode=mode, executing=False, real_painting_enabled=True, dry_run=False,
         painting_force_enabled=False, segment_contact_offset_m=.026,
         contact_geometry_offset_m=.026, minimum_travel_clearance_m=.005,
@@ -348,7 +368,7 @@ def _executor(mode="spray"):
 
 
 def _prepare(model="rb20_1900es", axis="+z"):
-    node = _executor()
+    node = _executor(model=model, axis=axis)
     node._active_segment_path = _parse(_spray_payload(model, axis))
     assert node._prepare_segment_process() is not None, node.get_logger().errors
     return node
@@ -364,7 +384,7 @@ def _ik_response(value=.1, error=1):
 
 @pytest.mark.parametrize("model,axis", [("rb20_1900es", "+z"), ("rb10_1300e_u", "-y")])
 def test_real_spray_accepts_zero_geometry_and_custom_standoff(model, axis):
-    node = _executor()
+    node = _executor(model=model, axis=axis)
     payload = _spray_payload(model, axis)
     expected = _parse(payload)
     node.on_eoat_segments(executor_module.String(data=json.dumps(payload)))
@@ -385,7 +405,7 @@ def test_real_paint_accepts_its_commissioned_geometry():
 
 @pytest.mark.parametrize("model,axis", [("rb20_1900es", "+z"), ("rb10_1300e_u", "-y")])
 def test_spray_preparation_preserves_preview_roll_when_current_tcp_x_is_opposite(model, axis):
-    node = _executor()
+    node = _executor(model=model, axis=axis)
     node._current_tcp_pose_np = lambda: (np.zeros(3), np.array([0., 0., 1., 0.]))
     node._active_segment_path = _parse(_spray_payload(model, axis))
     preview_rotation = rotation_from_spray_path([0., 0., 1.], [0., 1., 0.], axis)
@@ -459,12 +479,12 @@ def test_single_spray_candidate_installs_poses_on_ik_completion(model, axis, noz
     for number, expected_y in [(1, 0.), (2, 0.), (3, .4), (4, .4)]:
         pose = node._process_row_tcp_poses[number]
         np.testing.assert_allclose([pose.position.x, pose.position.y, pose.position.z],
-                                   [0., expected_y, .65], atol=1e-9)
+                                   [-.02, expected_y + .03, .83], atol=1e-8)
         q = pose.orientation
         np.testing.assert_allclose(quat_apply([q.x, q.y, q.z, q.w], nozzle),
                                    [0., 0., -1.], atol=1e-9)
-    assert node._retreat_tcp_pose.position.z == pytest.approx(.65)
-    assert node._process_last_tcp_pose.position.z == pytest.approx(.65)
+    assert node._retreat_tcp_pose.position.z == pytest.approx(.83)
+    assert node._process_last_tcp_pose.position.z == pytest.approx(.83)
     for timer in node.timers:
         timer.callback()
     assert len(node.move_action_client.goals) == 1 and node.failures == []

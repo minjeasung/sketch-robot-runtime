@@ -16,7 +16,7 @@ setup(
         (os.path.join("share", package_name, "config"), glob("config/*")),
         (os.path.join("share", package_name, "launch"), glob("launch/*.launch.py")),
     ],
-    install_requires=["setuptools"],
+    install_requires=["setuptools", "scipy", "trimesh"],
     zip_safe=True,
     maintainer="Minjea",
     maintainer_email="minjea@example.com",

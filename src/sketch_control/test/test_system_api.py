@@ -1,6 +1,7 @@
 """Supervisor tests use disposable Python subprocesses, never ROS/hardware."""
 import asyncio
 from dataclasses import replace
+from pathlib import Path
 import signal
 import sys
 import time
@@ -67,6 +68,76 @@ def test_group_commands_preserve_interlocks(tmp_path, profile, fake, dry, force)
 def test_reject_arbitrary_configuration(tmp_path, options):
     with pytest.raises(SupervisorError):
         build_specs(tmp_path, options)
+
+
+@pytest.mark.parametrize('profile', ['dry_run', 'work', 'fake', 'spray_motion_test', 'zed_preview'])
+def test_eoat_profile_path_forwarding(tmp_path, profile):
+    path = str((tmp_path / 'profiles' / 'nozzle outlet.json').resolve())
+    options, specs = build_specs(tmp_path, {
+        'profile': profile, 'spray_eoat_profile': 'profiles/../profiles/nozzle outlet.json'})
+    assert options['spray_eoat_profile'] == path
+    launches = [s for s in specs if s.command[:2] == ('ros2', 'launch')]
+    assert launches
+    assert all('spray_eoat_profile:=' + path in s.command for s in launches)
+    options, specs = build_specs(tmp_path, {'profile': profile})
+    assert options['spray_eoat_profile'] == ''
+    assert all('spray_eoat_profile:=' in s.command for s in specs
+               if s.command[:2] == ('ros2', 'launch'))
+
+
+@pytest.mark.parametrize('profile', ['dry_run', 'work', 'fake', 'spray_motion_test', 'zed_preview'])
+def test_eoat_profile_expands_home_before_workspace(tmp_path, profile):
+    expected = str(Path.home() / 'tools' / 'tool.json')
+    options, specs = build_specs(tmp_path, {
+        'profile': profile, 'spray_eoat_profile': '~/tools/tool.json'})
+    assert options['spray_eoat_profile'] == expected
+    assert all('spray_eoat_profile:=' + expected in spec.command for spec in specs
+               if spec.command[:2] == ('ros2', 'launch'))
+
+
+@pytest.mark.parametrize('value', [True, 123, None, [], 'a\n.json', 'a\x00.json',
+                                  'a\x7f.json', 'a\x85.json', 'x' * 4097])
+def test_eoat_profile_rejects_invalid_paths(tmp_path, value):
+    with pytest.raises(SupervisorError, match='spray_eoat_profile'):
+        build_specs(tmp_path, {'spray_eoat_profile': value})
+
+
+def test_eoat_profile_api_roundtrip_preserve_clear_and_lock(client, supervisor, tmp_path):
+    path = str((tmp_path / 'unconfirmed nozzle.json').resolve())
+    response = client.post('/configuration', json={'profile': 'zed_preview', 'spray_eoat_profile': path})
+    assert response.status_code == 200, response.text
+    assert response.json()['spray_eoat_profile'] == path
+    assert client.get('/configuration').json()['spray_eoat_profile'] == path
+    assert client.get('/status').json()['configuration']['spray_eoat_profile'] == path
+    assert client.post('/configuration', json={'profile': 'fake'}).json()['spray_eoat_profile'] == path
+    supervisor.records['executor']['process'] = object()
+    try:
+        assert client.post('/configuration', json={'spray_eoat_profile': ''}).status_code == 409
+    finally:
+        supervisor.records['executor']['process'] = None
+    assert client.post('/configuration', json={'spray_eoat_profile': ''}).json()['spray_eoat_profile'] == ''
+
+
+@pytest.mark.parametrize('value,status', [(False, 422), (123, 422), ('bad\npath', 400), ('x' * 4097, 400)])
+def test_eoat_profile_api_rejects_invalid_values(client, value, status):
+    assert client.post('/configuration', json={'spray_eoat_profile': value}).status_code == status
+
+
+def test_eoat_profile_environment_initializes_server(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from sketch_control import system_api
+    (tmp_path / 'web').mkdir()
+    captured = {}
+    monkeypatch.setenv('SKETCH_SPRAY_EOAT_PROFILE', 'profiles/nozzle.json')
+    monkeypatch.setattr(sys, 'argv', ['system-api', '--workspace', str(tmp_path), '--host', '127.0.0.1'])
+    monkeypatch.setitem(sys.modules, 'fcntl', SimpleNamespace(LOCK_EX=1, LOCK_NB=2, flock=lambda *a: None))
+    monkeypatch.setitem(sys.modules, 'sketch_control.system_ros_monitor',
+                        SimpleNamespace(RosMonitor=lambda: SimpleNamespace(close=lambda: None)))
+    monkeypatch.setitem(sys.modules, 'uvicorn',
+                        SimpleNamespace(run=lambda app, **kwargs: captured.update(app=app)))
+    system_api.main()
+    assert captured['app'].state.supervisor.options['spray_eoat_profile'] == str(
+        (tmp_path / 'profiles/nozzle.json').resolve())
 
 
 def test_api_model_selection_is_explicit_and_locked_while_running(client, supervisor):

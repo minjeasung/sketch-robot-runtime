@@ -1,5 +1,9 @@
 # Sketch Robot
 
+Spray requires a confirmed, calibrated EOAT mesh profile. Set the same
+`spray_eoat_profile` path for generation and execution; the empty default blocks
+Spray while Paint is unchanged. See [EOAT profile setup](docs/SPRAY_EOAT_PROFILE.md).
+
 Michelo Outpost의 ZED/D405 데이터로 작업 평면을 측정하고 웹 스케치로 RB10/RB20의 도장·내화뿜칠 경로를 제어합니다.
 
 도장(Paint)은 기존 ZED+D405 구성을 유지합니다. 뿜칠(Spray)은 시작 설정

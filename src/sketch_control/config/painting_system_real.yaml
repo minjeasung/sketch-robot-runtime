@@ -187,6 +187,7 @@ moveit_executor:
     model_id: rb10_1300e_u
     # Empty resolves to RB10 -y / RB20 +z in the application TCP frame.
     spray_tool_axis: ""
+    spray_eoat_profile: ""  # Read-only path; empty blocks Spray, not Paint.
     execution_backend: follow_joint_trajectory
     follow_joint_trajectory_action: /joint_trajectory_controller/follow_joint_trajectory
     use_eoat_segments: true
@@ -273,6 +274,7 @@ sketch_to_waypoints:
     process_mode: paint
     model_id: rb10_1300e_u
     spray_tool_axis: ""
+    spray_eoat_profile: ""  # Same profile file as moveit_executor.
     spray_footprint_width_m: 0.35
     spray_overlap: 0.30
     spray_speed_mps: 0.020

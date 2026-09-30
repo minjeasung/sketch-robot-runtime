@@ -16,7 +16,9 @@ from rbpodo_painting_control.spray_path import (
 def spray_payload():
     metadata = dict(model_id="rb10_1300e_u", spray_tool_axis="-y",
                     spray_footprint_width_m=.35, spray_overlap=.30,
-                    spray_spacing_m=.245, spray_speed_mps=.02, spray_standoff_m=.5)
+                    spray_spacing_m=.245, spray_speed_mps=.02, spray_standoff_m=.5,
+                    spray_eoat_profile_sha256="a" * 64,
+                    spray_endpoint_tcp_m=[.02, -.18, .03])
     rows = []
     for mode, y in (("SPRAY_APPROACH", 0.), ("SPRAY", 0.),
                     ("SPRAY", .4), ("SPRAY_FINISH", .4)):
@@ -120,7 +122,9 @@ def test_wrong_source_identity_or_metadata_rejected(field, value):
 @pytest.mark.parametrize("field", SPRAY_METADATA_FIELDS)
 def test_spray_metadata_changes_are_bound_to_hash(field):
     payload = copy.deepcopy(spray_payload())
-    payload[field] = "changed" if isinstance(payload[field], str) else payload[field] + .01
+    value = payload[field]
+    payload[field] = "changed" if isinstance(value, str) else (
+        [value[0] + .01, *value[1:]] if isinstance(value, list) else value + .01)
     with pytest.raises(SegmentPathError, match="plan_hash mismatch"):
         parse(payload)
 
@@ -145,3 +149,46 @@ def test_nondefault_standoff_is_exact_and_roller_geometry_rejected():
 def test_invalid_spacing_rejected(width, overlap):
     with pytest.raises(ValueError):
         spray_spacing_m(width, overlap)
+
+
+@pytest.mark.parametrize("field", ["spray_eoat_profile_sha256", "spray_endpoint_tcp_m"])
+def test_eoat_contract_rejects_old_plans_and_source_mismatch(field):
+    payload = spray_payload()
+    del payload[field]
+    with pytest.raises(SegmentPathError):
+        parse(attach_plan_hash(payload))
+    payload = spray_payload()
+    del payload["source"][field]
+    with pytest.raises(SegmentPathError):
+        parse(attach_plan_hash(payload))
+
+
+@pytest.mark.parametrize("field,value", [
+    ("spray_eoat_profile_sha256", ""), ("spray_eoat_profile_sha256", "g" * 64),
+    ("spray_eoat_profile_sha256", 123),
+    ("spray_endpoint_tcp_m", [0., 0.]), ("spray_endpoint_tcp_m", [0., 0., 0., 0.]),
+    ("spray_endpoint_tcp_m", [False, 0., 0.]),
+    ("spray_endpoint_tcp_m", ["0", 0., 0.]), ("spray_endpoint_tcp_m", None),
+])
+def test_invalid_eoat_metadata_cannot_be_authorized_by_rehash(field, value):
+    payload = spray_payload()
+    payload[field] = payload["source"][field] = value
+    with pytest.raises(SegmentPathError):
+        parse(attach_plan_hash(payload))
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_endpoint_rejected_even_without_hash_verification(bad):
+    payload = spray_payload()
+    payload["spray_endpoint_tcp_m"] = payload["source"]["spray_endpoint_tcp_m"] = [0., bad, 0.]
+    with pytest.raises(SegmentPathError, match="finite"):
+        parse_segment_path(payload, default_contact_offset_m=.026, max_force_n=20.,
+                           minimum_clearance_m=.005, allow_legacy=False, verify_plan_hash=False)
+
+
+def test_source_endpoint_bool_cannot_equal_a_numeric_zero():
+    payload = spray_payload()
+    payload["spray_endpoint_tcp_m"] = [0., -.18, .03]
+    payload["source"]["spray_endpoint_tcp_m"] = [False, -.18, .03]
+    with pytest.raises(SegmentPathError):
+        parse(attach_plan_hash(payload))

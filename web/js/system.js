@@ -7,6 +7,7 @@ const processLabel = name => processLabels[name] || name;
 function options() {
   return {profile: byId("profile").value, robot_ip: byId("robot-ip").value.trim(), model_id: byId("model-id").value,
     process_mode: ["spray_motion_test", "zed_preview"].includes(byId("profile").value) ? "spray" : byId("process-mode").value,
+    spray_eoat_profile: byId("spray-eoat-profile").value,
     launch_zed_driver: byId("zed").checked, launch_d405_driver: byId("d405").checked,
     camera_backend: byId('camera-backend').value, outpost_http: byId('outpost-http').value.trim(),
     outpost_zed_hw_id: byId('outpost-zed-hw-id').value.trim(), outpost_zed_serial: byId('outpost-zed-serial').value.trim(),
@@ -35,7 +36,7 @@ function controls() {
   const active = latest && latest.processes.some(p => p.pid !== null);
   byId("start").disabled = pending || !latest || latest.system_prepared;
   byId("stop").disabled = pending || !latest || (!active && !latest.degraded);
-  for (const id of ["profile", "process-mode", "robot-ip", "model-id", "zed", "d405", "rviz", 'camera-backend',
+  for (const id of ["profile", "process-mode", "spray-eoat-profile", "robot-ip", "model-id", "zed", "d405", "rviz", 'camera-backend',
     'outpost-http', 'outpost-zed-hw-id', 'outpost-zed-serial', 'outpost-d405-hw-id', 'outpost-d405-serial',
     'outpost-load', 'outpost-zed-select', 'outpost-d405-select']) byId(id).disabled = pending || active;
   if (byId('camera-backend').value === 'outpost') {
@@ -80,6 +81,7 @@ async function refresh() {
       const c = state.configuration;
       byId("profile").value = c.profile; byId("robot-ip").value = c.robot_ip;
       byId("process-mode").value = c.process_mode || "paint";
+      byId("spray-eoat-profile").value = c.spray_eoat_profile || "";
       byId("model-id").value = c.model_id || "rb10_1300e_u";
       byId('camera-backend').value = c.camera_backend || 'native';
       for (const key of ['outpost_http', 'outpost_zed_hw_id', 'outpost_zed_serial', 'outpost_d405_hw_id', 'outpost_d405_serial']) {

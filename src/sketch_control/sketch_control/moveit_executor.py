@@ -402,6 +402,12 @@ D405_COLLISION_CENTER = (0.0, -0.06870, 0.04375)
 # EOAT links.
 PUBLISH_EOAT_ATTACHED_OBJECT = False
 EOAT_TOUCH_LINKS = ["tcp", "link6"]
+# Only duplicate fixed tool bodies may overlap the selected full assembly.
+# Both representations still collide with the world and every other arm link.
+SPRAY_EOAT_TOUCH_LINKS = EOAT_TOUCH_LINKS + [
+    "aft200_link", "aft200_cable_guard_link", "paint_eoat_no_camera_link",
+    "paint_eoat_no_camera_roller_contact_link", "paint_d405_link",
+]
 
 
 def _cylinder_axis_quat(axis):
@@ -532,6 +538,9 @@ def _load_static_collision_mesh(resource):
 from sketch_control.spray_execution import SprayExecutionMixin
 from sketch_control.zed_spray_execution import ZedSprayExecutionMixin
 from rbpodo_painting_control.spray_path import resolve_spray_tool_axis, rotation_from_spray_path
+from rbpodo_painting_control.spray_eoat import (
+    load_spray_eoat_profile, compensate_spray_endpoint,
+)
 from sketch_control.multi_surface_execution import MultiSurfaceMixin
 from sketch_control.d405_view_geometry import measurement_samples, camera_view
 
@@ -1279,6 +1288,8 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
             self.model_id, str(self.declare_parameter(
                 "spray_tool_axis", "", ParameterDescriptor(read_only=True)).value))
         self._init_zed_spray()
+        self.spray_eoat_profile = str(self.declare_parameter(
+            "spray_eoat_profile", "", ParameterDescriptor(read_only=True)).value)
         self._init_multi_surface()
         self.create_timer(0.5, self._update_and_publish_readiness)
 
@@ -1359,11 +1370,172 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         executor._execution_candidate_invalidated = True
         executor._execution_candidate_invalidation_reason = str(reason)
 
+    def _spray_eoat_load(self, path=None):
+        """Read the selected profile afresh; never substitute legacy geometry."""
+        try:
+            if path is None:
+                snapshot = getattr(self, "_execution_snapshot", None)
+                path = (snapshot.get("segment_path") if isinstance(snapshot, dict)
+                        else getattr(self, "_segment_path", None))
+            filename = getattr(self, "spray_eoat_profile", "")
+            if not filename:
+                raise ValueError("selected profile is missing")
+            profile = load_spray_eoat_profile(
+                filename, self.model_id, self.spray_tool_axis)
+            if path is not None:
+                for label, payload in (("payload", path.raw_payload),
+                                       ("source", path.source)):
+                    if not isinstance(payload, dict):
+                        raise ValueError(f"{label} metadata missing")
+                    if (payload.get("model_id") != self.model_id
+                            or payload.get("spray_tool_axis") != self.spray_tool_axis):
+                        raise ValueError(f"{label} robot/tool axis mismatch")
+                    offset = np.asarray(payload.get("spray_endpoint_tcp_m"), dtype=float)
+                    if (payload.get("spray_eoat_profile_sha256") != profile.sha256
+                            or offset.shape != (3,)
+                            or not np.all(np.isfinite(offset))
+                            or not np.allclose(offset, profile.endpoint_tcp_m,
+                                               rtol=0.0, atol=1e-9)):
+                        raise ValueError(f"{label} profile hash/endpoint mismatch")
+            old = getattr(self, "_spray_eoat_loaded_hash", "")
+            if old != profile.sha256:
+                if old and isinstance(getattr(self, "_execution_snapshot", None), dict):
+                    raise ValueError("profile changed during execution")
+                MoveItExecutor._mark_scene_dirty(self)
+                self._spray_eoat_loaded_hash = profile.sha256
+            self._spray_eoat_error = ""
+            return profile
+        except Exception as exc:
+            raise SegmentPathError(f"SPRAY_EOAT_INVALID:{exc}") from exc
+
+    def _spray_eoat_blocker(self, path=None, *, require_scene=False):
+        if getattr(self, "process_mode", "paint") != "spray":
+            return ""
+        if path is None:
+            snapshot = getattr(self, "_execution_snapshot", None)
+            path = (snapshot.get("segment_path") if isinstance(snapshot, dict)
+                    else getattr(self, "_segment_path", None))
+        try:
+            profile = self._spray_eoat_load(path)
+            if require_scene and (
+                path is None
+                or not getattr(self, "scene_confirmed", False)
+                or getattr(self, "_scene_confirmed_revision", -1) != self._scene_revision
+                or getattr(self, "_spray_eoat_scene_hash", "") != profile.sha256
+            ):
+                return "SPRAY_EOAT_SCENE_UNCONFIRMED"
+            return ""
+        except SegmentPathError as exc:
+            return self._spray_eoat_reject(str(exc))
+
+    def _spray_eoat_reject(self, reason):
+        if getattr(self, "_spray_eoat_error", "") != reason:
+            MoveItExecutor._mark_scene_dirty(self)
+        self._spray_eoat_error = reason
+        self._spray_eoat_scene_hash = ""
+        self._accepted_plan_hash = ""
+        self._accepted_plan_path_id = ""
+        MoveItExecutor._defer_candidate_invalidation(self, reason)
+        self._spray_off()
+        if (getattr(self, "executing", False)
+                or getattr(self, "_active_trajectory_goal_token", None) is not None):
+            self._request_motion_abort(reason)
+        return reason
+
+    def _spray_tick(self):
+        # Validate before the base implementation can renew an ON lease.
+        if getattr(self, "process_mode", "paint") == "spray" and (
+            getattr(self, "executing", False)
+            or getattr(self, "_spray_dispatch", False)
+            or getattr(self, "_active_trajectory_goal_token", None) is not None
+        ):
+            active = getattr(self, "_active_trajectory_goal_token", None) is not None
+            reason = self._spray_eoat_blocker(require_scene=active)
+            if reason:
+                if getattr(self, "_spray_eoat_error", "") != reason:
+                    self._spray_eoat_reject(reason)
+                return
+        SprayExecutionMixin._spray_tick(self)
+
+    def _spray_endpoint_to_tcp(self, endpoint_pose, profile):
+        tcp = copy.deepcopy(endpoint_pose)
+        q = endpoint_pose.orientation
+        p = endpoint_pose.position
+        xyz = compensate_spray_endpoint(
+            [p.x, p.y, p.z], quat_to_matrix([q.x, q.y, q.z, q.w]),
+            profile.endpoint_tcp_m)
+        tcp.position.x, tcp.position.y, tcp.position.z = map(float, xyz)
+        return tcp
+
+    def _spray_eoat_collision_object(self, profile):
+        attached = AttachedCollisionObject()
+        attached.link_name = EE_LINK
+        attached.object.id = "spray_eoat"
+        attached.object.header.frame_id = EE_LINK
+        mesh = Mesh()
+        for xyz in profile.vertices_tcp_m:
+            vertex = Point()
+            vertex.x, vertex.y, vertex.z = map(float, xyz)
+            mesh.vertices.append(vertex)
+        for indices in profile.faces:
+            triangle = MeshTriangle()
+            triangle.vertex_indices = [int(index) for index in indices]
+            mesh.triangles.append(triangle)
+        origin = Pose()
+        origin.orientation.w = 1.0
+        attached.object.meshes.append(mesh)
+        attached.object.mesh_poses.append(origin)
+        attached.object.operation = CollisionObject.ADD
+        attached.touch_links = list(SPRAY_EOAT_TOUCH_LINKS)
+        return attached
+
+    def _spray_eoat_reconcile_paint_startup(self):
+        """Discover our previous attachment when only the executor restarted."""
+        self.scene_confirmed = False
+        pending = getattr(self, "_spray_eoat_inventory_pending", None)
+        if pending is not None and time.monotonic() - pending[1] < 8.0:
+            return
+        client = self.get_planning_scene_client
+        if not client.service_is_ready():
+            return
+        token = (object(), time.monotonic())
+        self._spray_eoat_inventory_pending = token
+        request = GetPlanningScene.Request()
+        request.components.components = PlanningSceneComponents.ROBOT_STATE_ATTACHED_OBJECTS
+        try:
+            future = client.call_async(request)
+        except Exception as exc:
+            self._spray_eoat_inventory_pending = None
+            self.get_logger().warn(f"Spray attachment inventory unavailable: {exc}")
+            return
+
+        def done(result):
+            if getattr(self, "_spray_eoat_inventory_pending", None) is not token:
+                return
+            self._spray_eoat_inventory_pending = None
+            if (getattr(self, "process_mode", "paint") != "paint"
+                    or hasattr(self, "_spray_eoat_published")):
+                return
+            try:
+                objects = result.result().scene.robot_state.attached_collision_objects
+                present = any(obj.object.id == "spray_eoat" for obj in objects)
+            except Exception as exc:
+                self.get_logger().warn(f"Spray attachment inventory failed: {exc}")
+                return
+            self._spray_eoat_published = present
+            MoveItExecutor._mark_scene_dirty(self)
+
+        future.add_done_callback(done)
+
     def _capture_execution_snapshot(self, path):
         """Freeze the accepted v3 plan and its link0 geometry for this Run."""
 
         if path is None or getattr(path, "version", 0) < 3:
             return "immutable v3 segment path unavailable"
+        if getattr(self, "process_mode", "paint") == "spray":
+            reason = self._spray_eoat_blocker(path)
+            if reason:
+                return reason
         if str(getattr(path, "frame_id", "")) != BASE_FRAME:
             return f"segment frame must be {BASE_FRAME}"
         try:
@@ -1531,6 +1703,10 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
             )
             if path.process_mode != getattr(self, "process_mode", "paint"):
                 raise SegmentPathError("path process mode differs from executor")
+            if path.process_mode == "spray":
+                reason = self._spray_eoat_blocker(path)
+                if reason:
+                    raise SegmentPathError(reason)
             if path.frame_id != BASE_FRAME:
                 frame = self._canonical_world_frame(path.frame_id)
                 transform = self._lookup_transform_to_base(frame, timeout_s=0.5)
@@ -2382,6 +2558,10 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
                 )
             except SegmentPathError as exc:
                 blockers.append(f"EXECUTION_SNAPSHOT_INVALID:{exc}")
+            if getattr(self, "process_mode", "paint") == "spray":
+                reason = self._spray_eoat_blocker(path)
+                if reason:
+                    blockers.append(reason)
             return tuple(blockers)
 
         path = self._segment_path
@@ -2408,6 +2588,9 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         if path is not None and path.process_mode != getattr(self, "process_mode", "paint"):
             blockers.append("PROCESS_MODE_MISMATCH")
         if path is not None and path.process_mode == "spray":
+            reason = self._spray_eoat_blocker(path)
+            if reason:
+                blockers.append(reason)
             if path.raw_payload.get("spray_tool_axis") != getattr(self, "spray_tool_axis", ""):
                 blockers.append("SPRAY_TOOL_AXIS_MISMATCH")
             if path.raw_payload.get("model_id") != getattr(self, "model_id", DEFAULT_MODEL):
@@ -2580,6 +2763,10 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
     def _stage1_pre_motion_blockers(self):
         """Revalidate real-hardware approach dependencies after async waits."""
 
+        if getattr(self, "process_mode", "paint") == "spray":
+            reason = self._spray_eoat_blocker(require_scene=True)
+            if reason:
+                return (reason,)
         if not self.real_painting_enabled:
             return ()
         blockers = [
@@ -5564,6 +5751,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
 
         row_tip_poses = {}
         row_tcp_poses = {}
+        profile = self._spray_eoat_load(path) if path.process_mode == "spray" else None
         previous_tcp_x = np.asarray(initial_tcp_x, dtype=float).copy()
         motion_tip_poses = []
         motion_tcp_poses = []
@@ -5571,7 +5759,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
             tip_pose, previous_tcp_x = self._segment_tip_pose(
                 path, row, previous_tcp_x
             )
-            tcp_pose = copy.deepcopy(tip_pose) if path.process_mode == "spray" else self._brush_tip_to_tcp(tip_pose)
+            tcp_pose = self._spray_endpoint_to_tcp(tip_pose, profile) if profile is not None else self._brush_tip_to_tcp(tip_pose)
             row_tip_poses[row.row_number] = tip_pose
             row_tcp_poses[row.row_number] = tcp_pose
             if row.mode in MOTION_MODES:
@@ -5610,8 +5798,8 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
             "row_tcp_poses": row_tcp_poses,
             "motion_tip_poses": motion_tip_poses,
             "motion_tcp_poses": motion_tcp_poses,
-            "safety_tcp_pose": copy.deepcopy(safety_tip) if path.process_mode == "spray" else self._brush_tip_to_tcp(safety_tip),
-            "retreat_tcp_pose": copy.deepcopy(retreat_tip) if path.process_mode == "spray" else self._brush_tip_to_tcp(retreat_tip),
+            "safety_tcp_pose": self._spray_endpoint_to_tcp(safety_tip, profile) if profile is not None else self._brush_tip_to_tcp(safety_tip),
+            "retreat_tcp_pose": self._spray_endpoint_to_tcp(retreat_tip, profile) if profile is not None else self._brush_tip_to_tcp(retreat_tip),
         }
 
     def _apply_segment_orientation_candidate(self, candidate):
@@ -9722,6 +9910,20 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
 
     # ---- PlanningScene (물체들 + EoAT AttachedCollisionObject) ----------------
     def publish_scene_periodic(self):
+        spray_profile = None
+        if getattr(self, "process_mode", "paint") == "spray":
+            try:
+                spray_profile = self._spray_eoat_load()
+            except SegmentPathError as exc:
+                self._spray_eoat_reject(str(exc))
+                return
+        mode = getattr(self, "process_mode", "paint")
+        if mode == "paint" and not hasattr(self, "_spray_eoat_published"):
+            self._spray_eoat_reconcile_paint_startup()
+            return
+        if getattr(self, "_scene_eoat_mode", mode) != mode:
+            MoveItExecutor._mark_scene_dirty(self)
+        self._scene_eoat_mode = mode
         if (
             getattr(self, "_acm_update_pending", None) is not None
             or getattr(self, "_contact_collision_allowed", False)
@@ -9868,6 +10070,57 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
                 return
             ps.world.collision_objects.extend(objects)
 
+        if spray_profile is not None:
+            ps.robot_state.attached_collision_objects.append(
+                self._spray_eoat_collision_object(spray_profile))
+        else:
+            eoat_aco = self._paint_eoat_collision_object()
+            if PUBLISH_EOAT_ATTACHED_OBJECT:
+                ps.robot_state.attached_collision_objects.append(eoat_aco)
+            if getattr(self, "_spray_eoat_published", False):
+                removal = AttachedCollisionObject()
+                removal.link_name = EE_LINK
+                removal.object.id = "spray_eoat"
+                removal.object.header.frame_id = EE_LINK
+                removal.object.operation = CollisionObject.REMOVE
+                ps.robot_state.attached_collision_objects.append(removal)
+        ps.robot_state.is_diff = True
+
+        # publish 도 유지 (RViz 시각화 용)
+        if spray_profile is not None:
+            self._spray_eoat_published = True
+        self.scene_pub.publish(ps)
+
+        # ApplyPlanningScene service 로 진짜 등록 (MoveIt 의 collision detection 에 반영)
+        if self.apply_scene_client.wait_for_service(timeout_sec=1.0):
+            req = ApplyPlanningScene.Request()
+            req.scene = ps
+            self._scene_apply_inflight_revision = revision
+            try:
+                future = self.apply_scene_client.call_async(req)
+            except Exception as exc:
+                self._scene_apply_inflight_revision = None
+                self.get_logger().warn(
+                    f"ApplyPlanningScene request 실패: {exc}"
+                )
+                return
+            future.add_done_callback(
+                lambda done, requested_revision=revision,
+                spray_hash=(spray_profile.sha256 if spray_profile is not None else None):
+                self._apply_scene_done(done, requested_revision, spray_hash)
+            )
+        else:
+            self.get_logger().warn("/apply_planning_scene service 없음")
+
+        if not self.scene_initialized:
+            self.get_logger().info(
+                "PlanningScene: 물체 publish + apply 시도 "
+                + (f"(Spray selected mesh {spray_profile.sha256})"
+                   if spray_profile is not None
+                   else "(EOAT collision 은 robot_description 고정 링크)"))
+            self.scene_initialized = True
+
+    def _paint_eoat_collision_object(self):
         # --- EoAT (tcp -> AFT200 -> EOAT no-camera mesh -> D405, tcp 에 attached) ---
         eoat_aco = AttachedCollisionObject()
         eoat_aco.link_name = EE_LINK  # "tcp"
@@ -9956,38 +10209,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         eoat_aco.object.operation = CollisionObject.ADD
         # 장착 플랜지 쪽 접촉만 허용. link5 는 손목 충돌을 잡기 위해 제외.
         eoat_aco.touch_links = list(EOAT_TOUCH_LINKS)
-        if PUBLISH_EOAT_ATTACHED_OBJECT:
-            ps.robot_state.attached_collision_objects.append(eoat_aco)
-        ps.robot_state.is_diff = True
-
-        # publish 도 유지 (RViz 시각화 용)
-        self.scene_pub.publish(ps)
-
-        # ApplyPlanningScene service 로 진짜 등록 (MoveIt 의 collision detection 에 반영)
-        if self.apply_scene_client.wait_for_service(timeout_sec=1.0):
-            req = ApplyPlanningScene.Request()
-            req.scene = ps
-            self._scene_apply_inflight_revision = revision
-            try:
-                future = self.apply_scene_client.call_async(req)
-            except Exception as exc:
-                self._scene_apply_inflight_revision = None
-                self.get_logger().warn(
-                    f"ApplyPlanningScene request 실패: {exc}"
-                )
-                return
-            future.add_done_callback(
-                lambda done, requested_revision=revision:
-                self._apply_scene_done(done, requested_revision)
-            )
-        else:
-            self.get_logger().warn("/apply_planning_scene service 없음")
-
-        if not self.scene_initialized:
-            self.get_logger().info(
-                "PlanningScene: 물체 publish + apply 시도 "
-                "(EOAT collision 은 robot_description 고정 링크)")
-            self.scene_initialized = True
+        return eoat_aco
 
     def _dynamic_target_collision_object(self, obj):
         """Perception 기반 활성 target collision slab 생성.
@@ -10159,7 +10381,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         v_axis /= np.linalg.norm(v_axis) + 1e-12
         return u_axis, v_axis
 
-    def _apply_scene_done(self, future, requested_revision=None):
+    def _apply_scene_done(self, future, requested_revision=None, spray_hash=None):
         """ApplyPlanningScene service 응답 처리. 성공 시 scene_confirmed."""
         if requested_revision is None:
             requested_revision = int(getattr(self, "_scene_revision", 0))
@@ -10174,6 +10396,16 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         except Exception as e:
             self.get_logger().warn(f"ApplyPlanningScene 실패: {e}")
             return
+        if getattr(self, "process_mode", "paint") == "spray":
+            if self._spray_eoat_blocker():
+                return
+            if not spray_hash or spray_hash != getattr(self, "_spray_eoat_loaded_hash", ""):
+                self.scene_confirmed = False
+                return
+        elif spray_hash is not None:
+            # A Spray acknowledgement cannot confirm a later Paint scene.
+            self.scene_confirmed = False
+            return
         current_revision = int(getattr(self, "_scene_revision", 0))
         pending = getattr(self, "_multi_scene_pending_ids", None)
         if resp.success and pending is not None and pending[0] == requested_revision:
@@ -10187,9 +10419,16 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         if resp.success and not self.scene_confirmed:
             self.scene_confirmed = True
             self._scene_confirmed_revision = requested_revision
+            if spray_hash is not None:
+                self._spray_eoat_scene_hash = spray_hash
+            else:
+                self._spray_eoat_published = False
+                self._spray_eoat_scene_hash = ""
             self.get_logger().info(
                 "[OK] PlanningScene apply 성공 "
-                "(wall/obstacles 등록, EOAT 는 robot_description 고정 링크)")
+                + (f"(Spray selected mesh {spray_hash}, revision {requested_revision})"
+                   if spray_hash is not None
+                   else "(wall/obstacles 등록, EOAT 는 robot_description 고정 링크)"))
         elif not resp.success:
             self.get_logger().warn("ApplyPlanningScene 실패 (success=False)")
 
@@ -10342,6 +10581,12 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         # joint-command backend is allowed to receive a command.
         self._last_dispatch_inhibit_reason = ""
         self._last_trajectory_failure_phase = ""
+        if getattr(self, "process_mode", "paint") == "spray":
+            reason = self._spray_eoat_blocker(require_scene=True)
+            if reason:
+                self._last_dispatch_inhibit_reason = reason
+                self._spray_off()
+                return False
         dispatch_inhibit = MoveItExecutor._motion_dispatch_inhibited_reason(
             self,
             requires_contact_acm=bool(requires_contact_acm),
@@ -11229,6 +11474,12 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
             self.executing = False
             return False
 
+        if getattr(self, "process_mode", "paint") == "spray":
+            reason = self._spray_eoat_blocker(require_scene=True)
+            if reason:
+                self._last_dispatch_inhibit_reason = reason
+                self._spray_off()
+                return False
         goal = FollowJointTrajectory.Goal()
         goal.trajectory = traj.joint_trajectory  # trajectory_msgs/JointTrajectory 그대로
         # path/goal tolerances 는 비워둠 (controller 디폴트 사용).

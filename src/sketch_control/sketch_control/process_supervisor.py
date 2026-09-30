@@ -35,9 +35,19 @@ def build_specs(workspace, options=None):
     options = dict(options or {})
     allowed = {"profile", "process_mode", "robot_ip", "model_id", "launch_rviz", "launch_zed_driver", "launch_d405_driver",
                "camera_backend", "outpost_http", "outpost_zed_hw_id", "outpost_zed_serial",
-               "outpost_d405_hw_id", "outpost_d405_serial"}
+               "outpost_d405_hw_id", "outpost_d405_serial", "spray_eoat_profile"}
     if set(options) - allowed:
         raise SupervisorError("Unknown configuration options", 400)
+    eoat_profile = options.setdefault('spray_eoat_profile', '')
+    if (not isinstance(eoat_profile, str) or len(eoat_profile) > 4096
+            or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in eoat_profile)):
+        raise SupervisorError('spray_eoat_profile must be a path string of at most 4096 characters without control characters', 400)
+    if eoat_profile:
+        # Resolve against the workspace without requiring the profile to exist.
+        eoat_profile = os.path.abspath(os.path.join(workspace, os.path.expanduser(eoat_profile)))
+        if len(eoat_profile) > 4096:
+            raise SupervisorError('spray_eoat_profile normalized path exceeds 4096 characters', 400)
+        options['spray_eoat_profile'] = eoat_profile
     profile = options.setdefault("profile", "dry_run")
     if profile not in ("dry_run", "work", "fake", "spray_motion_test", "zed_preview"):
         raise SupervisorError("profile must be dry_run, work, fake, spray_motion_test or zed_preview", 400)
@@ -84,7 +94,7 @@ def build_specs(workspace, options=None):
         options['launch_rviz'] = False
         calibration = model_calibration_files(workspace, options['model_id'], 'spray')
         flags = {key: options[key] for key in
-                 ('model_id', 'outpost_http', 'outpost_zed_hw_id', 'outpost_zed_serial')}
+                 ('model_id', 'outpost_http', 'outpost_zed_hw_id', 'outpost_zed_serial', 'spray_eoat_profile')}
         flags['zed_calibration_file'] = calibration['zed_calibration_file']
         command = ('ros2', 'launch', 'sketch_control', 'zed_preview.launch.py') + tuple(
             f'{key}:={value}' for key, value in flags.items())
@@ -195,6 +205,8 @@ class Supervisor:
         async with self.lock:
             if any(r["process"] is not None for r in self.records.values()):
                 raise SupervisorError("Shutdown the system before changing configuration")
+            options = dict(options)
+            options.setdefault('spray_eoat_profile', self.options['spray_eoat_profile'])
             options, specs = build_specs(self.workspace, options)
             self.options = options
             self._set_specs(specs)

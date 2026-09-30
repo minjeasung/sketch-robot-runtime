@@ -12,11 +12,12 @@ setup(
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', glob('launch/*.py')),
         ('share/' + package_name + '/config', glob('config/*.yaml')),
+        ('share/' + package_name + '/config', glob('config/*.json')),
         ('share/' + package_name + '/config', glob('config/*.rviz')),
         ('share/' + package_name + '/config', glob('config/*.srdf')),
         ('share/' + package_name + '/urdf', glob('urdf/*.xacro')),
     ],
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'trimesh'],
     tests_require=['pytest'],
     zip_safe=True,
     entry_points={

@@ -110,7 +110,7 @@ Paint는 기존 TCP +Y 법선 정렬을 유지한다. Spray는 선택한 공구�
 ## 도장과 뿜칠
 
 - 도장: 기존 접촉 탐색, 힘 증가/감소, 20–30 N 힘 밴드, 획 사이 10 mm 후퇴, 마지막 80 mm 후퇴를 유지한다. 기존 롤러 토크 제어 기본 OFF 설정도 유지한다.
-- 뿜칠: 바깥쪽 법선 방향으로 **노즐 기준점에서 표면까지 정확히 0.500 m** 이격한다. 롤러 반지름이나 접촉 기하 오프셋 0.026 m를 더하지 않는다. 경로의 공구 기준점과 실제 노즐/TCP 변환은 현장에서 일치시켜야 한다. 새 뿜칠건 URDF/mesh는 추가하지 않았다.
+- 뿜칠: 바깥쪽 법선 방향으로 **확인된 EOAT 노즐 끝점에서 표면까지 기본 0.500 m** 이격한다. 롤러 반지름이나 접촉 기하 오프셋 0.026 m를 더하지 않는다. [EOAT 프로파일](SPRAY_EOAT_PROFILE.md)의 mesh 단위·장착 변환·실제 노즐 끝점을 실측하고 확인해야 한다. 빈 경로, 누락 또는 미확인 프로파일은 Spray 생성·실행을 차단한다. 실제 장비 mesh는 제공하지 않으며, 충돌 검사는 마운트와 가드를 포함한 전체 변환 mesh를 사용한다.
 - 뿜칠 도포 구간은 `SPRAY`, 획 사이 이동은 `SPRAY_TRAVEL`이다. 획 사이 추가 후퇴 없이 동일 이격면에서 이동한다. 시작/종료/접근/이동/계획 대기에서는 OFF이다.
 - 뿜칠 자동 채우기는 350 mm 폭, 30% 겹침으로 기본 행 간격 245 mm를 사용한다. 도포 경로 속도는 20 mm/s, OFF 이동은 30 mm/s이다. 도장 롤러의 175 mm 폭 설정과 분리되어 있다. 실제 뿜칠 폭·분사량·밸브 지연에 대한 공정 보정은 현장 검증 대상이다.
 - 뿜칠 모드에서는 힘 요청과 compliance를 OFF로 고정하고, F/T tare·접촉 탐색·힘/토크 보정을 사용하지 않는다. 반력과 F/T 유효성만으로 경로를 정지시키지 않는다. 컨트롤러 오류, 충돌 검사, 로봇 자체 인터록, 비상정지와 뿜칠 장치 통신 감시는 유지한다.
@@ -123,6 +123,7 @@ Paint는 기존 TCP +Y 법선 정렬을 유지한다. Spray는 선택한 공구�
 | `process_mode` | `paint` | executor, projector, generator, D405 refiner의 시작 공정 |
 | `model_id` | `rb10_1300e_u` | 로봇 모델 및 공구 축 선택 |
 | `spray_tool_axis` | 빈 문자열 | RB10 `-y`, RB20 `+z`; executor와 generator에 동일하게 전달 |
+| `spray_eoat_profile` | 빈 문자열 | Read-only JSON path shared by generator/executor; empty blocks Spray. See [EOAT profile](SPRAY_EOAT_PROFILE.md). |
 | `spray_footprint_width_m` | `0.35` | generator의 분사 폭 |
 | `spray_overlap` | `0.30` | generator의 겹침 비율 |
 | `spray_speed_mps` | `0.020` | generator의 도포 속도 |

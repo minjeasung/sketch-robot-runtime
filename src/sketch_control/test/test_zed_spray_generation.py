@@ -7,6 +7,7 @@ import json
 import math
 from pathlib import Path
 import time
+from itertools import groupby
 from types import SimpleNamespace
 
 import numpy as np
@@ -35,8 +36,15 @@ class Publisher:
         self.messages.append(message)
 
 
+class Marker(Message):
+    DELETEALL, ADD, LINE_STRIP, SPHERE_LIST = 3, 0, 4, 7
+
+    def __init__(self):
+        super().__init__(scale=SimpleNamespace(x=0., y=0., z=0.), points=[])
+
+
 @pytest.fixture
-def generator():
+def generator(tmp_path):
     # Load the real class unchanged, omitting only imports and ROS startup.
     # This harness does not claim to exercise ROS transport or message typing.
     path = Path(__file__).parents[1] / "sketch_control" / "sketch_to_waypoints_node.py"
@@ -46,9 +54,12 @@ def generator():
     module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
                              node_class], type_ignores=[])
     namespace = {}
-    for dependency in (segment_path, spray_path, work_area_geometry):
+    from rbpodo_painting_control import spray_eoat
+    for dependency in (segment_path, spray_path, work_area_geometry, spray_eoat):
         namespace.update({key: value for key, value in vars(dependency).items() if not key.startswith("__")})
     namespace.update(Node=object, np=np, math=math, time=time, json=json, replace=replace,
+                     groupby=groupby, Marker=Marker, Point=SimpleNamespace, ColorRGBA=SimpleNamespace,
+                     MarkerArray=lambda: SimpleNamespace(markers=[]),
                      WORLD_FRAME="World", CAM_FRAME="camera", String=Message, PoseStamped=Message,
                      PoseArray=Message, Pose=lambda: Message().pose, quat_from_matrix=quat_from_matrix,
                      validate_target_lock=validate_target_lock,
@@ -57,6 +68,7 @@ def generator():
     node = namespace["SketchToWaypointsNode"].__new__(namespace["SketchToWaypointsNode"])
     node.process_mode = "spray"
     node.model_id, node.spray_tool_axis = "rb10_1300e_u", "-y"
+    node.spray_eoat_profile = str(write_profile(tmp_path))
     node.spray_footprint_width_m, node.spray_overlap = .35, .30
     node.spray_speed_mps, node.spray_standoff_m = .02, .5
     node.real_painting_enabled, node.dry_run = True, False
@@ -94,6 +106,20 @@ def generator():
     node.latest_work_area_rect_px = (0., 0., 800., 400.)
     node.current_work_area_id = "work-1"
     return node
+
+
+def write_profile(tmp_path, *, model="rb10_1300e_u", axis="-y"):
+    import trimesh
+    mesh = trimesh.creation.box(extents=[.04, .06, .18])
+    mesh.apply_translation([.02, .03, .09])
+    (tmp_path / "tool.stl").write_bytes(mesh.export(file_type="stl"))
+    data = dict(schema_version=1, model_id=model, spray_tool_axis=axis,
+                mesh_file="tool.stl", mesh_scale_to_m=1., endpoint_confirmed=True,
+                mesh_to_tcp=dict(translation_m=[0., 0., 0.], quaternion_xyzw=(
+                    [2**-.5, 0., 0., 2**-.5] if axis == "-y" else [0., 0., 0., 1.])))
+    path = tmp_path / "tool.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
 
 
 def pixels(sec=2):
@@ -142,7 +168,7 @@ def test_auto_fill_callback_publishes_matching_hashed_path_and_preview(generator
     assert generator._stamp_path_id(preview_stamp) == payload['path_id']
     assert len(generator.pub.messages) == 1
     assert len(generator.pub.messages[0].poses) == len(payload["rows"])
-    assert all(pose.position.z == pytest.approx(.5) for pose in generator.pub.messages[0].poses)
+    assert all(pose.position.z == pytest.approx(.68) for pose in generator.pub.messages[0].poses)
 
 
 @pytest.mark.parametrize("source", [dict(plane="zed", view="wall_front"),
@@ -278,10 +304,11 @@ def test_pixel_rectangle_must_match_atomic_geometry(generator):
     assert generate(generator) is None
 
 
-def test_standoff_speed_and_axis_change_hash_and_execution_geometry(generator):
+def test_standoff_speed_and_axis_change_hash_and_execution_geometry(generator, tmp_path):
     before = generate(generator)
     generator.spray_standoff_m, generator.spray_speed_mps = .65, .025
     generator.model_id, generator.spray_tool_axis = "rb20_1900es", "+z"
+    write_profile(tmp_path, model=generator.model_id, axis=generator.spray_tool_axis)
     after = generate(generator)
     assert after.plan_hash != before.plan_hash
     assert after.spray_tool_axis == "+z"
@@ -294,3 +321,106 @@ def test_invalid_final_transform_rejects_spray(generator):
     generator._segment_frame_transform = lambda: ("link0", np.eye(3), np.array([np.nan, 0., 0.]))
     assert generate(generator) is None
     assert not generator.segment_pub.messages
+
+
+def test_missing_eoat_profile_blocks_generation_and_clears_stale_output(generator):
+    generator.spray_eoat_profile = ""
+    cleared = []
+    generator._publish_marker_clear = lambda *args: cleared.append("markers")
+    generator._publish_fill_preview = lambda *args: cleared.append("fill")
+    assert generate(generator) is None
+    assert json.loads(generator.plan_status_pub.messages[-1].data)["state"] == "rejected"
+    assert generator.segment_pub.messages[-1].data == ""
+    assert generator.pub.messages[-1].poses == []
+    assert set(cleared) == {"markers", "fill"}
+
+
+def test_generation_rereads_profile_and_mesh_and_hashes_metadata(generator):
+    path = generate(generator)
+    assert path is not None
+    payload = path.raw_payload
+    assert len(payload["spray_eoat_profile_sha256"]) == 64
+    assert payload["spray_endpoint_tcp_m"] == pytest.approx([.02, -.18, .03])
+    for field in ("spray_eoat_profile_sha256", "spray_endpoint_tcp_m"):
+        assert payload["source"][field] == payload[field]
+    profile_path = Path(generator.spray_eoat_profile)
+    data = json.loads(profile_path.read_text())
+    data["endpoint_tcp_m"] = [.02, -.17, .03]
+    profile_path.write_text(json.dumps(data))
+    changed = generate(generator)
+    assert changed.plan_hash != path.plan_hash
+    assert changed.raw_payload["spray_endpoint_tcp_m"] == [.02, -.17, .03]
+    import trimesh
+    mesh_path = profile_path.parent / "tool.stl"
+    mesh = trimesh.load_mesh(mesh_path)
+    mesh.apply_scale(1.1)
+    mesh_path.write_bytes(mesh.export(file_type="stl"))
+    remeshed = generate(generator)
+    assert remeshed.plan_hash != changed.plan_hash
+    data["endpoint_confirmed"] = False
+    profile_path.write_text(json.dumps(data))
+    assert generate(generator) is None
+    assert generator.segment_pub.messages[-1].data == ""
+
+
+def test_deleted_mesh_invalidates_previous_generated_path(generator):
+    assert generate(generator) is not None
+    (Path(generator.spray_eoat_profile).parent / "tool.stl").unlink()
+    assert generate(generator) is None
+    assert generator.segment_pub.messages[-1].data == ""
+
+
+def test_spray_markers_show_compensated_tcp_across_serpentine_strokes(generator):
+    path = generate(generator)
+    generator.marker_pub = Publisher()
+    type(generator)._publish_segment_markers(generator, path, None)
+    markers = generator.marker_pub.messages[-1].markers
+    spheres = [marker for marker in markers if getattr(marker, "type", None) == Marker.SPHERE_LIST]
+    points = [point for marker in spheres for point in marker.points]
+    assert len(points) == len(path.rows)
+    assert all(point.z == pytest.approx(.68) for point in points)
+    poses = generator._compat_pose_array_from_segment(path, None).poses
+    np.testing.assert_allclose([[p.x, p.y, p.z] for p in points],
+                               [[p.position.x, p.position.y, p.position.z] for p in poses])
+    safety = next(marker for marker in markers if getattr(marker, "ns", "").endswith("_safety_approach"))
+    assert all(point.z == pytest.approx(.68) for point in safety.points)
+
+
+def test_paint_generation_does_not_load_spray_profile(generator):
+    generator.process_mode = "paint"
+    generator.spray_eoat_profile = "missing-file.json"
+    generator.real_painting_enabled, generator.dry_run = False, True
+    generator._segment_context = lambda: ("work-1", "plane-1")
+    generator.precontact_clearance_m = .005
+    generator.safety_approach_offset_m = generator.final_retreat_offset_m = .08
+    generator.contact_search_speed_mps = .002
+    generator.retract_speed_mps = .01
+    generator.approach_speed_mps = .005
+    generator.roller_length_m = .175
+    path = generate(generator, source={"plane": "d405_refined"})
+    assert path is not None
+    assert path.process_mode == "paint"
+    assert "spray_endpoint_tcp_m" not in path.raw_payload
+    assert path.contact_geometry_offset_m == .026
+
+
+@pytest.mark.parametrize("axis,endpoint", [("-y", [.02, -.18, .03]), ("+z", [.02, .03, .18])])
+@pytest.mark.parametrize("tilted", [False, True])
+def test_preview_tcp_reconstructs_nozzle_half_meter_from_surface(generator, tmp_path, axis, endpoint, tilted):
+    generator.model_id = "rb20_1900es" if axis == "+z" else "rb10_1300e_u"
+    generator.spray_tool_axis = axis
+    write_profile(tmp_path, model=generator.model_id, axis=axis)
+    normal = np.array([.6, 0., .8] if tilted else [0., 0., 1.])
+    if tilted:
+        generator._segment_frame_transform = lambda: (
+            "link0", np.array([[.8, 0., .6], [0., 1., 0.], [-.6, 0., .8]]),
+            np.array([1., 2., 3.]))
+    path = generate(generator)
+    poses = generator._compat_pose_array_from_segment(path, None).poses
+    for row, pose in zip(path.rows, poses):
+        q = pose.orientation
+        rotation = quat_to_matrix([q.x, q.y, q.z, q.w])
+        tcp = np.array([pose.position.x, pose.position.y, pose.position.z])
+        nozzle = tcp + rotation @ endpoint
+        np.testing.assert_allclose(nozzle, np.asarray(row.position) + .5 * normal, atol=1e-8)
+        assert np.dot(tcp - row.position, normal) == pytest.approx(.68)

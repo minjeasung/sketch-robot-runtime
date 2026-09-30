@@ -24,6 +24,12 @@ def generate_launch_description():
     share = Path(get_package_share_directory('sketch_control'))
     return LaunchDescription([
         DeclareLaunchArgument('model_id', default_value='rb10_1300e_u'),
+        DeclareLaunchArgument('spray_eoat_profile', default_value=''),
+        DeclareLaunchArgument('spray_tool_axis', default_value=''),
+        DeclareLaunchArgument('spray_footprint_width_m', default_value='0.35'),
+        DeclareLaunchArgument('spray_overlap', default_value='0.30'),
+        DeclareLaunchArgument('spray_speed_mps', default_value='0.020'),
+        DeclareLaunchArgument('spray_standoff_m', default_value='0.5'),
         DeclareLaunchArgument('zed_calibration_file'),
         DeclareLaunchArgument('outpost_http', default_value='http://127.0.0.1:8100'),
         DeclareLaunchArgument('outpost_zed_hw_id'),
@@ -43,6 +49,9 @@ def generate_launch_description():
             PythonLaunchDescriptionSource(str(share / 'launch/rb10_perception_sketch.launch.py')),
             launch_arguments={
                 'process_mode': 'spray', 'model_id': LaunchConfiguration('model_id'),
+                **{key: LaunchConfiguration(key) for key in
+                   ('spray_eoat_profile', 'spray_tool_axis', 'spray_footprint_width_m',
+                    'spray_overlap', 'spray_speed_mps', 'spray_standoff_m')},
                 'zed_calibration_file': LaunchConfiguration('zed_calibration_file'),
                 'use_zed_calibration_file': 'true', 'real_painting_enabled': 'false',
                 'dry_run': 'true', 'front_view_source': 'zed',

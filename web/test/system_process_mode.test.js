@@ -35,6 +35,31 @@ test("camera-less startup sends the selected spray mode to the supervisor", asyn
   assert.equal(requests.some(request => request.url === "/prepare-system"), true);
 });
 
+test("EOAT profile survives reload and unrelated save, and locks while active", async () => {
+  const path = "/workspace/profiles/nozzle outlet.json";
+  const { ui, requests, state } = await supervisor({ spray_eoat_profile: path });
+  assert.equal(ui.element("spray-eoat-profile").value, path);
+  await ui.evaluate("refresh()");
+  await ui.element("start").fire("click");
+  assert.equal(JSON.parse(requests.find(r => r.url === "/configuration").body).spray_eoat_profile, path);
+  state.processes[0].pid = 123;
+  await ui.evaluate("refresh()");
+  assert.equal(ui.element("spray-eoat-profile").disabled, true);
+});
+
+test("EOAT edits survive polling and can be explicitly cleared", async () => {
+  const { ui, requests } = await supervisor({ spray_eoat_profile: "/old.json" });
+  ui.element("spray-eoat-profile").value = "profiles/new nozzle.json";
+  await ui.evaluate("refresh()");
+  assert.equal(ui.element("spray-eoat-profile").value, "profiles/new nozzle.json");
+  await ui.element("start").fire("click");
+  assert.equal(JSON.parse(requests.find(r => r.url === "/configuration").body).spray_eoat_profile,
+    "profiles/new nozzle.json");
+  ui.element("spray-eoat-profile").value = "";
+  await ui.element("start").fire("click");
+  assert.equal(JSON.parse(requests.filter(r => r.url === "/configuration").at(-1).body).spray_eoat_profile, "");
+});
+
 test("startup reflects saved mode and locks the spray motion test profile to spray", async () => {
   const { ui, requests } = await supervisor({ process_mode: "spray" });
   assert.equal(ui.element("process-mode").value, "spray");

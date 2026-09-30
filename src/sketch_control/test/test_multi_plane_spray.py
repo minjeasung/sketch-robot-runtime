@@ -1,6 +1,8 @@
 import copy
 import json
 import time
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import numpy as np
 import pytest
@@ -36,8 +38,11 @@ def test_two_walls_have_independent_normals_and_pixel_support():
 
 
 def spray_plan():
-    node=_spray_generator_stub(real=True)
-    path=_publish_two_strokes(node)
+    from test_zed_spray_generation import write_profile
+    with TemporaryDirectory() as directory:
+        profile = write_profile(Path(directory))
+        node=_spray_generator_stub(real=True, spray_eoat_profile=profile)
+        path=_publish_two_strokes(node)
     assert path is not None
     return path
 
