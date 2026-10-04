@@ -246,6 +246,7 @@ def node(monkeypatch):
     for name in ("zed_status_pub", "work_area_state_pub", "work_area_corners_pub",
                  "work_area_pub", "front_extent_pub", "front_pub"):
         setattr(result, name, _Publisher())
+    result.front_preview = SimpleNamespace(publish=lambda rgb, header: None)
     result.get_logger = lambda: SimpleNamespace(info=lambda *a, **k: None, warn=lambda *a, **k: None)
     result.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(
         nanoseconds=12_000_000_000,

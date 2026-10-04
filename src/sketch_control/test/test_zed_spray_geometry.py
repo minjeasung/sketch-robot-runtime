@@ -50,7 +50,25 @@ def test_fill_coverage_uses_spray_footprint_and_overlap():
     assert [stroke[0][1] for stroke in strokes] == [0., 400., 0., 400.]
 
 
-def test_fill_rejects_work_area_narrower_than_footprint():
+@pytest.mark.parametrize("width", [.02, .2, .35])
+def test_spray_area_no_wider_than_fan_has_one_center_stroke(width):
+    strokes = generate_spray_fill_strokes(
+        (120., 80., 520., 680.), work_area_width_m=width,
+        work_area_height_m=.6, footprint_width_m=.35, overlap=.3)
+    assert strokes == (((320., 80.), (320., 680.)),)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("work_area_width_m", 0.), ("work_area_width_m", -.2),
+    ("work_area_width_m", float("nan")),
+    ("work_area_height_m", .001),
+    ("footprint_width_m", 0.), ("footprint_width_m", -.35),
+    ("footprint_width_m", float("inf")),
+    ("overlap", -.1), ("overlap", 1.), ("overlap", float("nan")),
+])
+def test_narrow_spray_still_rejects_invalid_geometry(field, value):
+    options = dict(work_area_width_m=.2, work_area_height_m=.5,
+                   footprint_width_m=.35, overlap=.3)
+    options[field] = value
     with pytest.raises(WorkAreaGeometryError):
-        generate_spray_fill_strokes((0., 0., 800., 400.), work_area_width_m=.2,
-                                   work_area_height_m=.5, footprint_width_m=.35, overlap=.3)
+        generate_spray_fill_strokes((120., 80., 520., 680.), **options)

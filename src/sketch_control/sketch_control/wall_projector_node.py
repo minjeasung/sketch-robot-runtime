@@ -38,6 +38,7 @@ from geometry_msgs.msg import Pose, PoseArray, PoseStamped
 from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import Empty, String
 from tf2_ros import Buffer, TransformListener, TransformException
+from sketch_control.image_preview import ImagePreview
 
 from sketch_control.zed_spray_projection import (
     plane_orientation, project_target_rectangle, select_work_area, stamp_ns,
@@ -322,6 +323,7 @@ class WallProjectorNode(Node):
             qos_profile_sensor_data)
 
         self.front_pub = self.create_publisher(Image, OUTPUT_TOPIC, 10)
+        self.front_preview = ImagePreview(self, OUTPUT_TOPIC)
         self.work_area_pub = self.create_publisher(
             PoseStamped, WORK_AREA_TOPIC, LATCHED_QOS)
         self.work_area_corners_pub = self.create_publisher(
@@ -533,7 +535,7 @@ class WallProjectorNode(Node):
             cv2.polylines(front, [pixels], True, (0, 255, 0), 3)
             if self._show_fill_preview:
                 self._draw_fill_preview(front)
-        self.front_pub.publish(_encode_rgb(front, "wall_front_view", msg.header.stamp))
+        self._publish_front(front, msg.header.stamp)
         self._publish_front_view_extent(extent, msg.header.stamp)
 
     def _on_zed_work_area_request(self, msg: String):
@@ -1009,7 +1011,7 @@ class WallProjectorNode(Node):
             self._overlay_and_publish_work_area(
                 front, np.asarray(extent, dtype=float), out_w, out_h, stamp)
 
-        self.front_pub.publish(_encode_rgb(front, "wall_front_view", stamp))
+        self._publish_front(front, stamp)
         self._publish_front_view_extent(np.asarray(extent, dtype=float), stamp)
         self._d405_warn_count = 0
         self.get_logger().info(
@@ -1118,7 +1120,7 @@ class WallProjectorNode(Node):
             self.get_logger().warn(f"D405 work-area warp 실패: {e}")
             return
 
-        self.front_pub.publish(_encode_rgb(front, "wall_front_view", stamp))
+        self._publish_front(front, stamp)
         work_center = corners_3d.mean(axis=0)
         pose = PoseStamped()
         pose.header.stamp = stamp
@@ -1292,8 +1294,7 @@ class WallProjectorNode(Node):
             self.get_logger().warn(f"warpPerspective 실패: {e}")
             return
 
-        out = _encode_rgb(front, "wall_front_view", msg.header.stamp)
-        self.front_pub.publish(out)
+        self._publish_front(front, msg.header.stamp)
 
         pose = PoseStamped()
         pose.header.stamp = msg.header.stamp
@@ -1314,6 +1315,11 @@ class WallProjectorNode(Node):
             f"view={out_w}x{out_h}, physical={physical_w:.3f}x{physical_h:.3f}m, "
             f"center=({work_center[0]:+.3f},{work_center[1]:+.3f},"
             f"{work_center[2]:+.3f})")
+
+    def _publish_front(self, rgb, stamp):
+        image = _encode_rgb(rgb, "wall_front_view", stamp)
+        self.front_pub.publish(image)
+        self.front_preview.publish(rgb, image.header)
 
     def _front_view_size(self, corners_3d):
         pts = np.asarray(corners_3d, dtype=float)

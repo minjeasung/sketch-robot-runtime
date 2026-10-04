@@ -43,6 +43,8 @@ function logEvent(line) {
 
 // ---- ROS 연결 ----
 const ros = new ROSLIB.Ros({ url: WS_URL });
+// Large/slow video frames must not queue ahead of plan results or commands.
+const imageRos = new ROSLIB.Ros({ url: WS_URL });
 let rosConnected = false;
 let zedImageReliable = false;
 
@@ -890,9 +892,9 @@ function refreshPaintingUI() {
   const pathGate = rosConnected && !processModePending && pathContext && !derived.running &&
     paintingState.readinessSeq > 0 &&
     derived.targetSelected === true && derived.workAreaSelected === true && derived.surfaceAccepted;
-  $("btn-set-target").disabled = !rosConnected || processModePending || derived.running ||
+  $("btn-set-target").disabled = !rosConnected || zedFrameCount === 0 || processModePending || derived.running ||
     workflowMode !== "target" || cs.length === 0 || currentView !== "zed_raw";
-  $("btn-set-work-area").disabled = !rosConnected || processModePending || derived.running ||
+  $("btn-set-work-area").disabled = !rosConnected || zedFrameCount === 0 || processModePending || derived.running ||
     workflowMode !== "work_area" || currentView !== "wall_front" || derived.targetSelected !== true ||
     (spray && (zedFrameCount === 0 || !sprayRectangleReady(cs)));
   $("btn-execute").disabled = spray || !pathGate || cs.length === 0;
@@ -1019,29 +1021,43 @@ function decodeImageData(msg) {
   return new ImageData(buf, w, h);
 }
 
-function handleImageMsg(msg) {
-  if (msg.width !== zedCanvas.width || msg.height !== zedCanvas.height) {
-    zedCanvas.width = msg.width;
-    zedCanvas.height = msg.height;
-    if (sketchCanvas.width !== msg.width || sketchCanvas.height !== msg.height) {
-      sketchCanvas.width = msg.width;
-      sketchCanvas.height = msg.height;
+function resizeImageCanvas(width, height) {
+  if (width !== zedCanvas.width || height !== zedCanvas.height) {
+    zedCanvas.width = width;
+    zedCanvas.height = height;
+    if (sketchCanvas.width !== width || sketchCanvas.height !== height) {
+      sketchCanvas.width = width;
+      sketchCanvas.height = height;
       redrawSketch();
     }
   }
+}
+
+function handleImageMsg(msg) {
   try {
     const imgData = decodeImageData(msg);
+    resizeImageCanvas(msg.width, msg.height);
     zedCtx.putImageData(imgData, 0, 0);
   } catch (e) {
     logEvent(`image decode 실패: ${e.message || e}`);
     return;
   }
 
+  imageDisplayed(msg.width, msg.height, msg.encoding);
+}
+
+function handlePreviewImage(image) {
+  resizeImageCanvas(image.width, image.height);
+  zedCtx.drawImage(image, 0, 0);
+  imageDisplayed(image.width, image.height, "JPEG preview");
+}
+
+function imageDisplayed(width, height, encoding) {
   zedFrameCount += 1;
   $("camera-empty").hidden = true;
 
   if (zedFrameCount === 1) {
-    logEvent(`first image on ${VIEW_TOPICS[currentView]} (${msg.width}×${msg.height}, ${msg.encoding})`);
+    logEvent(`first image on ${VIEW_TOPICS[currentView]} (${width}×${height}, ${encoding})`);
   }
   refreshPaintingUI();
 }
@@ -1052,19 +1068,17 @@ function subscribeView(viewName) {
     currentImageSub = null;
   }
   const topic = VIEW_TOPICS[viewName];
-  const sub = createImageTopic({
-    ros: ros,
+  const sub = createPreviewStream({
+    ros: imageRos,
     name: topic,
     reliable: viewName === "zed_raw" && zedImageReliable,
-    messageType: "sensor_msgs/Image",
-    // Raw ZED/D405 frames are several megabytes as rosbridge JSON.  Five Hz
-    // is responsive enough for target/path drawing without starving the
-    // controller and F/T watchdog callbacks on the commissioning workstation.
-    throttle_rate: 200,
-    queue_length: 1,
-  });
-  sub.subscribe(msg => {
-    if (currentImageSub === sub && currentView === viewName) handleImageMsg(msg);
+    onRaw: msg => {
+      if (currentImageSub === sub && currentView === viewName) handleImageMsg(msg);
+    },
+    onPreview: image => {
+      if (currentImageSub === sub && currentView === viewName) handlePreviewImage(image);
+    },
+    onError: error => logEvent(`image decode 실패: ${error.message || error}`),
   });
   currentImageSub = sub;
   // 새 view 의 첫 frame 도착 전 — stats reset 으로 fps 계산 정확하게.
@@ -1091,6 +1105,25 @@ function switchView(viewName) {
 
 // 초기 구독
 subscribeView(currentView);
+let imageReconnectTimer = null;
+imageRos.on("close", () => {
+  if (currentImageSub) currentImageSub.unsubscribe();
+  currentImageSub = null;
+  zedFrameCount = 0;
+  zedCtx.clearRect(0, 0, zedCanvas.width, zedCanvas.height);
+  $("camera-empty").hidden = false;
+  currentStroke = null; pendingRect = null; pendingLine = null; currentMouse = null;
+  refreshPaintingUI();
+  if (imageReconnectTimer === null) imageReconnectTimer = setTimeout(() => {
+    imageReconnectTimer = null;
+    imageRos.connect(WS_URL);
+  }, 1000);
+});
+imageRos.on("connection", () => {
+  clearTimeout(imageReconnectTimer); imageReconnectTimer = null;
+  if (!currentImageSub) subscribeView(currentView);
+});
+imageRos.on("error", () => logEvent("영상 연결 오류 — 재연결 대기"));
 
 
 // ============================================================================
@@ -1339,6 +1372,10 @@ function redrawSketch() {
 // ---- Pointer event handlers (mouse + touch 통합) ----
 sketchCanvas.addEventListener("pointerdown", (ev) => {
   ev.preventDefault();
+  if (zedFrameCount === 0) {
+    logEvent("영상 수신 후 영역을 선택하세요");
+    return;
+  }
   if (paintingDerivedState().running || processModePending ||
       (processMode === "spray" && (workflowMode === "path" ||
         (workflowMode === "work_area" && (!zedSelection.target || currentView !== "wall_front" || zedFrameCount === 0))))) {
@@ -1706,6 +1743,7 @@ function publishPixels(pub, topicName, frameId, strokes, stamp = null) {
 
 $("btn-set-target").addEventListener("click", () => {
   if (workflowMode !== "target" || currentView !== "zed_raw") return;
+  if (zedFrameCount === 0) return;
   if (!rosConnected || processModePending || paintingDerivedState().running || !currentStrokes().length) return;
   if (typeof clearPlaneSelection === "function") clearPlaneSelection(true);
   if (processMode === "spray") invalidateSelection("new ZED target selected");
@@ -1736,6 +1774,7 @@ $("btn-set-target").addEventListener("click", () => {
 
 $("btn-set-work-area").addEventListener("click", () => {
   if (workflowMode !== "work_area" || currentView !== "wall_front") return;
+  if (zedFrameCount === 0) return;
   if (!rosConnected || processModePending || paintingDerivedState().running) return;
   let strokes = currentStrokes();
   if (processMode === "spray") {

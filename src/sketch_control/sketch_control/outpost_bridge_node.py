@@ -17,6 +17,7 @@ from std_msgs.msg import Header
 import zmq
 
 from .outpost_camera import camera_status, decode_frame, FrameGuard
+from .image_preview import ImagePreview
 
 
 CAMERA_SPECS = {
@@ -127,6 +128,7 @@ class OutpostBridge(Node):
                         next_publish=0.0,
                         next_status=0.0,
                         point_stride=point_stride,
+                        preview=ImagePreview(self, topics[0]),
                         publishers=[
                             self.create_publisher(t, topic, qos)
                             for t, topic in zip(
@@ -251,6 +253,8 @@ class OutpostBridge(Node):
                 pubs[1].publish(info)
             if pubs[3].get_subscription_count():
                 pubs[3].publish(info)
+
+        camera["preview"].publish(rgb, header)
 
         # The global ZED cloud can be sparse without losing sketch pixel
         # precision because sketch ROI reconstruction uses full depth+CameraInfo.

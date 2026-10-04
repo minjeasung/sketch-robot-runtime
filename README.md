@@ -15,6 +15,8 @@ Michelo Outpost의 ZED/D405 데이터로 작업 평면을 측정하고 웹 스�
 **로봇 PC에 설치하고, 같은 네트워크의 원격 PC에서 브라우저로 접속합니다.**
 원격 PC에는 ROS나 Python 설치가 필요 없습니다.
 
+**설치가 끝났다면 [리눅스 / 윈도우 실행 순서](RUN.md)부터 확인하세요.**
+
 ## 로봇 PC 설치
 
 Ubuntu 24.04 x86_64 / ROS 2 Jazzy를 준비합니다. 기본 카메라 입력은 Michelo Outpost이므로

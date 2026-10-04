@@ -171,6 +171,38 @@ def test_auto_fill_callback_publishes_matching_hashed_path_and_preview(generator
     assert all(pose.position.z == pytest.approx(.68) for pose in generator.pub.messages[0].poses)
 
 
+def test_narrow_spray_publishes_center_preview_and_matching_world_path(generator):
+    # A 200 mm area within the existing 1 m front view, with a 350 mm fan.
+    generator.zed_surface_status.update(
+        corners=[[.3, 0., 0.], [.5, 0., 0.], [.5, .5, 0.], [.3, .5, 0.]],
+        position=[.4, .25, 0.])
+    for pose, (u, v) in zip(generator.latest_work_area_pixels.poses,
+                            ((240., 0.), (400., 0.), (400., 400.), (240., 400.))):
+        pose.position.x, pose.position.y = u, v
+    generator.latest_work_area_rect_px = (240., 0., 400., 400.)
+    previews = []
+    generator._publish_fill_preview = lambda strokes, **kwargs: previews.append(strokes)
+    generator._on_fill_work_area(None)
+    assert len(generator.segment_pub.messages) == 1
+    payload = json.loads(generator.segment_pub.messages[0].data)
+    assert payload["plan_hash"] == segment_path.compute_plan_hash(payload)
+    assert payload["source"]["spray_footprint_width_m"] == .35
+    assert previews[-1] == (((320., 0.), (320., 400.)),)
+    poses = generator.pub.messages[0].poses
+    # The mesh endpoint, rather than the TCP, follows the center spray pass.
+    nozzle_positions = []
+    for pose in poses:
+        q = pose.orientation
+        rotation = quat_to_matrix([q.x, q.y, q.z, q.w])
+        tcp = np.array([pose.position.x, pose.position.y, pose.position.z])
+        nozzle_positions.append(tcp + rotation @ np.array([.02, -.18, .03]))
+    nozzle_positions = np.array(nozzle_positions)
+    np.testing.assert_allclose(nozzle_positions[:, 0], .4, atol=1e-8)
+    np.testing.assert_allclose(nozzle_positions[:, 2], .5, atol=1e-8)
+    assert nozzle_positions[:, 1].min() == pytest.approx(0., abs=1e-8)
+    assert nozzle_positions[:, 1].max() == pytest.approx(.5)
+
+
 @pytest.mark.parametrize("source", [dict(plane="zed", view="wall_front"),
     dict(plane="d405_refined", view="wall_front", coverage="auto_fill"),
     dict(plane="zed", view="zed_raw", coverage="auto_fill")])

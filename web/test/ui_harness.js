@@ -10,6 +10,13 @@ function loadUI(page = "index.html", fetch) {
   const html = fs.readFileSync(path.join(__dirname, "..", page), "utf8");
   const elements = new Map();
   const radios = [];
+  const images = [], connections = [], timers = new Map();
+  let nextTimer = 0;
+  function runTimers(milliseconds) {
+    for (const [id, {fn, delay}] of [...timers]) if (delay <= milliseconds) {
+      timers.delete(id); fn();
+    }
+  }
   class Element {
     constructor(tag = "div") {
       this.tagName = tag;
@@ -71,7 +78,9 @@ function loadUI(page = "index.html", fetch) {
   const topics = [];
   let ros;
   class Ros {
-    constructor() { ros = this; this.listeners = {}; }
+    constructor() { if (!ros) ros = this; connections.push(this); this.listeners = {}; }
+    connect(url) { this.connectCalls = [...(this.connectCalls || []), url]; }
+    callOnConnection(packet) { this.packets = [...(this.packets || []), packet]; }
     on(event, fn) { (this.listeners[event] ||= []).push(fn); }
     emit(event) { for (const fn of this.listeners[event] || []) fn(); }
   }
@@ -92,7 +101,10 @@ function loadUI(page = "index.html", fetch) {
     },
     ROSLIB: { Ros, Topic, Message: class { constructor(value) { Object.assign(this, value); } } },
     location: { hostname: "localhost", href: "http://localhost:8000/" },
-    confirm: () => true, setInterval() {}, setTimeout() { return 1; }, clearTimeout() {},
+    confirm: () => true, setInterval() {},
+    setTimeout(fn, delay) {timers.set(++nextTimer, {fn, delay}); return nextTimer;},
+    clearTimeout(id) {timers.delete(id);},
+    Image: class {constructor() {images.push(this);}},
     atob: value => Buffer.from(value, "base64").toString("binary"),
     ImageData: class { constructor(data, width, height) { Object.assign(this, { data, width, height }); } },
     Option: class extends Element { constructor(text, value) { super("option"); this.textContent = text; this.value = value; } },
@@ -105,14 +117,22 @@ function loadUI(page = "index.html", fetch) {
     vm.runInContext(fs.readFileSync(path.join(__dirname, "..", name), "utf8"), context, { filename: name });
   }
   return {
-    element: id => elements.get(id), queryAll, published, ros,
+    element: id => elements.get(id), queryAll, published, ros, connections, topics, runTimers,
     evaluate: code => vm.runInContext(code, context),
     emit(name, payload, raw = false) {
       const message = raw ? payload : { data: JSON.stringify(payload) };
       for (const topic of topics.filter(t => t.name === name)) for (const fn of topic.callbacks) fn(message);
     },
     frame(name) {
+      // This fixture represents a legacy server with raw images only.
+      runTimers(1500);
       this.emit(name, { width: 100, height: 80, encoding: "rgb8", data: Buffer.alloc(24000).toString("base64") }, true);
+    },
+    async previewFrame(name, width=320, height=240) {
+      this.emit(name+'/compressed', {format:'jpeg', data:'fixture'}, true);
+      const image = images.at(-1);
+      image.width = width; image.height = height; image.onload();
+      await new Promise(setImmediate);
     },
     async rectangle() {
       const canvas = elements.get("sketch-canvas");

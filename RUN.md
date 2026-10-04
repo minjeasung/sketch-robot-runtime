@@ -1,82 +1,66 @@
-# 현재 스케치 로봇 API 실행
+# 리눅스 / 윈도우 실행 순서
+
+설치와 원격 접속 설정을 마친 PC 기준입니다. **리눅스에서 카메라·서버를 실행하고, 윈도우에서는 브라우저만 사용합니다.**
+두 PC를 같은 공유기에 연결하세요. 아래 경로와 `192.168.0.21`은 현재 운영 PC 기준이며, 다른 PC에서는 설치 경로와 리눅스 LAN IP로 바꿉니다.
+
+## 1. 리눅스 — 미켈로 카메라 준비
+
+미켈로 Outpost가 꺼져 있을 때만 터미널에서 실행합니다. 이미 콘솔이 열리면 중복 실행하지 않습니다.
 
 ```bash
-/home/Minjea/sketch_robot_ws/scripts/run_system_api.sh
+cd /home/snucem/SNUCEM_Robot/linux/michelo/backend.bridge.linux
+uv run --no-sync test-outpost
 ```
 
-관리 화면: http://127.0.0.1:8080/ — [API 실행 안내](docs/SYSTEM_API.md).
-기존 여섯 터미널 대신 전체 시작·종료와 개별 프로세스 제어를 제공합니다.
+이 터미널은 켜 둡니다. 리눅스 브라우저에서 [미켈로 콘솔](http://127.0.0.1:8100/console/)을 열어 **카메라 연결 → RGB·깊이 스트리밍 시작**을 진행합니다.
 
-아래 내용은 이전 Isaac Sim 실행 안내입니다.
+- ZED 미리보기·뿜칠: ZED의 RGB와 깊이 스트리밍을 켭니다.
+- 롤러 도장: 해당 설정의 ZED와 D405를 준비합니다.
+- 이미 `streaming` 상태이면 다음 단계로 넘어갑니다.
 
-# 실행 방법
+## 2. 리눅스 — 스케치 서버 실행
 
-## 터미널 1 — Isaac Sim
-
-ROS2 환경 변수를 자동으로 정리하는 스크립트를 사용하세요.
+새 터미널에서 실행하고 켜 둡니다. 이미 실행 중이면 중복 실행하지 않습니다.
 
 ```bash
-~/sketch_robot_ws/run_isaac_sim.sh
+cd /home/snucem/Documents/Codex/sketch
+bash scripts/run_michelo_sketch.sh
 ```
 
-Isaac Sim 창이 뜨면 스페이스바(또는 ▶) 눌러서 play.
+이 명령은 스케치 서버(`8081`)와 미켈로 연결 화면(`8101`)을 실행합니다. **Outpost 데몬이나 카메라 스트리밍은 자동으로 시작하지 않습니다.**
 
-## 터미널 2 — ROS2 노드들 (robot_state_publisher + MoveIt + sketch_ui + moveit_executor)
+다른 터미널에서 접속용 API 토큰을 확인합니다.
 
 ```bash
-source /opt/ros/jazzy/setup.bash
-source ~/sketch_robot_ws/install/setup.bash
-ros2 launch sketch_control sketch_control.launch.py
+sed -n 's/^SKETCH_SUPERVISOR_API_TOKEN=//p' /home/snucem/Documents/Codex/sketch/config/sketch_runtime.env
 ```
 
-## 검증 (터미널 3)
+출력되는 문자열을 윈도우의 관리 화면에 입력합니다. 실제 토큰은 로컬 설정 파일에만 보관합니다.
 
-```bash
-source /opt/ros/jazzy/setup.bash
+## 3. 윈도우 — 관리 화면에서 시작
 
-# URDF 확인
-ros2 topic echo /robot_description --once | head -5
+1. Edge 또는 Chrome에서 [관리 화면](http://192.168.0.21:8081/)을 엽니다.
+2. 상단 **API 토큰** 칸에 앞에서 확인한 문자열을 입력하고 **연결 확인**을 누릅니다.
+3. **실행 모드와 카메라 ID·시리얼**을 확인합니다. 로봇 없이 경로를 준비할 때는 **ZED만 · 경로 생성 (로봇 없음)**을 선택합니다.
+4. **전체 시작**을 누릅니다. 이미 전체 프로세스가 실행 중이면 건너뜁니다.
+5. [스케치 화면](http://192.168.0.21:8081/sketch/)을 열고 작업합니다.
 
-# 토픽 확인
-ros2 topic list | grep -E "camera|joint|sketch|tf"
-ros2 topic hz /camera/image_raw         # ~30Hz
+윈도우에는 ROS·Python 설치나 터미널 명령이 필요 없습니다. 윈도우 주소에는 `127.0.0.1` 대신 **리눅스 PC의 LAN IP**를 사용합니다.
+토큰은 관리 화면의 메모리에만 저장되므로 새로 열거나 새로고침했다면 다시 입력합니다.
 
-# TF 확인
-ros2 run tf2_tools view_frames
-# → frames.pdf 에 world, base_link, tool0, SketchCamera 전부 있어야 함
+## 4. 작업 종료 / 수정 적용
 
-# 웨이포인트 모니터링
-ros2 topic echo /sketch_waypoints
-```
+- 작업 종료: 관리 화면에서 **전체 종료** → 필요하면 리눅스의 스케치 서버 터미널에서 `Ctrl+C` → 미켈로에서 스트리밍 종료.
+- 현재 설치의 영상 전송 수정 적용: 작업 종료 상태에서 관리 화면 **전체 종료 → 전체 시작** 후, 윈도우 스케치 화면에서 **Ctrl+F5**.
+- 스케치 화면 **연결·진단**에 `JPEG preview`가 표시되면 압축 미리보기가 적용된 상태입니다.
 
-## 사용 절차
+## 접속이 안 될 때
 
-1. sketch_ui 창에 로봇+벽 카메라 뷰가 실시간으로 뜸.
-2. 벽 위에서 마우스로 선 드래그.
-3. 작업 평면 x 슬라이더: 0.55~0.75, 기본 0.60 (벽 앞면).
-4. "실행" 버튼 → 로봇이 벽 쪽으로 approach 한 뒤 스케치대로 움직임.
-
-## 트러블슈팅
-
-| 증상 | 원인 후보 |
+| 증상 | 확인할 것 |
 |---|---|
-| Isaac Sim 렌더 검은 화면 | RTX 5060 드라이버 < 570, 또는 play 상태 아님 |
-| Isaac Sim xformOp 에러 | USD 내부 transform 충돌. 최신 코드인지 확인 |
-| `Could not import rclpy` 경고 | run_isaac_sim.sh 대신 직접 실행함. 스크립트 사용 |
-| sketch_ui 이미지 안 뜸 | `ros2 topic hz /camera/image_raw` 확인. 0 이면 Isaac Sim play 상태 체크 |
-| TF lookup 실패 | sketch_ui 로그에서 사용 가능한 프레임 목록 확인 |
-| MoveIt fraction 낮음 | 스케치가 로봇 리치 밖, x_plane 을 0.55~0.65 로 |
-| MoveIt robot_description 없음 | launch 파일에 robot_state_publisher 포함 확인 |
-| 로봇이 베이스 위에 안 올라감 | isaac_sim_ur10.py 의 xform translate 코드 확인 |
-| `/joint_command` 무시됨 | ROS2SubscribeJointState 의 joint 이름 순서 확인 |
+| 터미널에 `401 Unauthorized` | 관리 화면에 API 토큰을 입력한 뒤 **연결 확인**. 토큰 없는 상태 조회 요청은 401로 거절됩니다. |
+| 윈도우에서 화면이 안 열림 | 같은 공유기인지, 리눅스 LAN IP가 맞는지, 스케치 서버가 켜져 있는지 확인합니다. |
+| 화면은 열리지만 영상·작업 상태가 안 나옴 | 미켈로 카메라가 스트리밍 중인지, **전체 시작**을 했는지, 윈도우에서 리눅스 TCP `9090`에 접근 가능한지 확인합니다. |
 
-## Isaac Sim 버전별 차이
-
-이 프로젝트는 Isaac Sim **5.0+** 기준으로 작성됨. 4.5 에서도 백엔드 호환 시도가 코드에
-들어 있지만, 5.0 이 공식 권장.
-
-업그레이드:
-```bash
-source ~/isaac_env/bin/activate
-pip install --upgrade "isaacsim[all,extscache]==5.0.0" --extra-index-url https://pypi.nvidia.com
-```
+최초 설치·접속 설정은 [두 PC 설치 안내](docs/PORTABLE_INSTALL.md), 미켈로 연동은 [연동 안내](docs/MICHELO_INTEGRATION.md)를 참고하세요.
+[이전 Isaac Sim 실행 안내](docs/ISAAC_SIM_LEGACY_RUN.md)는 별도 문서로 보관합니다.

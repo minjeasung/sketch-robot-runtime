@@ -77,11 +77,16 @@ def validate_zed_surface_status(payload):
 
 def generate_spray_fill_strokes(rect, *, work_area_width_m, work_area_height_m,
                                footprint_width_m, overlap):
-    """Generate coverage using the spray fan width and requested overlap."""
+    """Generate spray coverage, with one center stroke for a narrow area.
+
+    The actual fan width is unchanged: a narrow area's spray footprint extends
+    beyond its sides, while the nozzle center path stays inside the selection.
+    """
     return generate_fill_strokes(
         rect, work_area_width_m=work_area_width_m,
         work_area_height_m=work_area_height_m,
         roller_length_m=footprint_width_m, overlap=overlap,
+        allow_footprint_overhang=True,
     )
 
 
@@ -295,11 +300,13 @@ def generate_fill_strokes(
     roller_length_m: float,
     overlap: float,
     minimum_stroke_length_m: float = 0.005,
+    allow_footprint_overhang: bool = False,
 ) -> tuple[PixelStroke, ...]:
     """Generate a vertical serpentine fill wholly inside a selected rectangle.
 
     The roller's long axis is horizontal, so each stroke center keeps a
-    half-roller margin from the left and right work-area boundaries.
+    half-roller margin from the left and right work-area boundaries. Spray
+    explicitly permits footprint overhang for areas narrower than its fan.
     """
 
     u0, v0, u1, v1 = [float(value) for value in rect]
@@ -327,7 +334,7 @@ def generate_fill_strokes(
         raise WorkAreaGeometryError("roller_length_m must be positive")
     if not 0.0 <= overlap < 1.0:
         raise WorkAreaGeometryError("overlap must be in [0, 1)")
-    if physical_width + 1e-9 < roller_length:
+    if physical_width + 1e-9 < roller_length and not allow_footprint_overhang:
         raise WorkAreaGeometryError(
             f"work area width {physical_width:.4f}m is smaller than roller "
             f"length {roller_length:.4f}m"
@@ -337,14 +344,14 @@ def generate_fill_strokes(
             f"work area height {physical_height:.4f}m cannot form a valid stroke"
         )
 
-    roller_px = roller_length / physical_width * width_px
-    left = u0 + roller_px * 0.5
-    right = u1 - roller_px * 0.5
     usable_m = max(0.0, physical_width - roller_length)
     step_m = roller_length * (1.0 - overlap)
     if usable_m <= 1e-9:
-        centers = [(left + right) * 0.5]
+        centers = [(u0 + u1) * 0.5]
     else:
+        roller_px = roller_length / physical_width * width_px
+        left = u0 + roller_px * 0.5
+        right = u1 - roller_px * 0.5
         count = max(2, int(math.ceil(usable_m / step_m)) + 1)
         centers = list(np.linspace(left, right, count))
 
