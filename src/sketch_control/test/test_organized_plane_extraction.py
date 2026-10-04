@@ -1,5 +1,6 @@
 """Image topology must keep web/flange support and disconnected faces apart."""
 import numpy as np
+import pytest
 
 from sketch_control.multi_plane_geometry import extract_planes
 
@@ -73,6 +74,24 @@ def test_color_stripe_does_not_split_one_geometric_wall():
     planes = _extract(depth, rgb)
     assert len(planes) == 1
     assert planes[0]['inlier_count'] == 6000
+
+
+@pytest.mark.parametrize("threshold", [.006, .015])
+def test_missing_rgb_preserves_all_three_web_and_flange_faces(threshold):
+    y, x = np.mgrid[:400, :240]
+    depth = np.where(x < 80, 1., 1.25)
+    depth = np.where(x >= 160, 1/(.8 + (x-160)/500), depth)
+    depth += np.random.default_rng(4).normal(0, .001, depth.shape)
+    points, pixels = _cloud(depth)
+    planes = extract_planes(points, pixels, pixel_stride=4, rgb=None,
+                            min_points=80, iterations=300, threshold=threshold)
+    assert len(planes) == 3
+    left, web, right = sorted(planes, key=lambda p: np.array(p['polygon_px'])[:, 0].mean())
+    assert left['center'][2] == pytest.approx(1., abs=.005)
+    assert web['center'][2] == pytest.approx(1.25, abs=.01)
+    assert abs(np.dot(web['normal'], [0, 0, 1])) > .995
+    assert abs(np.dot(web['normal'], right['normal'])) < .9
+    assert all(plane['inlier_count'] > 1000 for plane in planes)
 
 
 def test_thin_boundary_strip_is_not_offered_as_a_work_plane():

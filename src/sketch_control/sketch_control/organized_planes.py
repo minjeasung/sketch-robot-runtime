@@ -99,6 +99,8 @@ def spatial_plane_segments(points, pixels, *, pixel_stride, rgb, **fit_options):
               for label in order[:max(16, 2*fit_options['max_planes'])]]
     proposals = []
     for group in groups:
+        # Connectivity does not imply planarity: without an RGB boundary a
+        # flange can meet the web continuously in depth within one region.
         options = dict(fit_options, min_global_inlier_ratio=0.)
         for segment in segment_planes_iterative_ransac(points[group], **options):
             proposals.append((group, segment))
@@ -108,7 +110,8 @@ def spatial_plane_segments(points, pixels, *, pixel_stride, rgb, **fit_options):
     owner = np.full(len(points), -1, dtype=int)
     for i, (group, segment) in enumerate(proposals):
         owner[group[segment['inlier_indices']]] = i
-    pairs = np.unique(np.sort(np.c_[owner[da], owner[db]], axis=1), axis=0)
+    pairs = np.unique(np.sort(np.c_[owner[da[~boundaries]],
+                                    owner[db[~boundaries]]], axis=1), axis=0)
     parents = np.arange(len(proposals))
 
     def root(index):
