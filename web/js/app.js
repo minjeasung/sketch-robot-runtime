@@ -343,7 +343,7 @@ function surfaceAcceptedPayload(payload) {
     : d405AcceptedPayload(payload);
 }
 
-function invalidateSelection(reason, clearTarget = true) {
+function invalidateSelection(reason, clearTarget = true, {preserveWorkArea = false} = {}) {
   if (clearTarget) zedSelection.reset();
   else zedSelection.clearWorkArea();
   paintingState.zedSeq = 0;
@@ -362,7 +362,7 @@ function invalidateSelection(reason, clearTarget = true) {
   clearTargetRefineWait();
   waitingWorkAreaRefine = false;
   latestWorkAreaSizeM = null;
-  strokesMap.work_area = [];
+  if (!preserveWorkArea) strokesMap.work_area = [];
   strokesMap.path = [];
   resetFreeSpaceConfirmation(reason, true);
   invalidatePlanLocally(reason);
@@ -377,10 +377,11 @@ function syncZedSelection(action) {
     local.selectionIdentityPending = true;
     invalidatePlanLocally("ZED selection invalidated");
   } else if (zedSelection.surface) {
+    const acceptingWorkArea = local.selectionIdentityPending;
     paintingState.zedSeq += 1;
     local.planeInvalidated = false;
     local.selectionIdentityPending = false;
-    local.unsentInputEdit = false;
+    if (acceptingWorkArea) local.unsentInputEdit = false;
     if (workflowMode === "work_area") switchToPathMode();
   } else if (zedSelection.target && workflowMode === "target") {
     switchToWorkAreaMode();
@@ -896,20 +897,21 @@ function refreshPaintingUI() {
     workflowMode !== "target" || cs.length === 0 || currentView !== "zed_raw";
   $("btn-set-work-area").disabled = !rosConnected || zedFrameCount === 0 || processModePending || derived.running ||
     workflowMode !== "work_area" || currentView !== "wall_front" || derived.targetSelected !== true ||
-    (spray && (zedFrameCount === 0 || !sprayRectangleReady(cs)));
-  $("btn-execute").disabled = spray || !pathGate || cs.length === 0;
-  $("btn-execute").hidden = spray;
+    (spray && (currentStroke || pendingLine || pendingRect || !sprayWorkAreaBoundary(cs)));
+  $("btn-execute").disabled = !pathGate || zedFrameCount === 0 || cs.length === 0 || Boolean(currentStroke || pendingLine || pendingRect);
+  $("btn-execute").hidden = false;
   $("btn-fill-work-area").textContent = spray ? "자동 도포 경로 생성" : "영역 자동 채우기";
   $("btn-fill-work-area").disabled = !pathGate;
   $("btn-run-robot").disabled = planningOnly || !rosConnected || !derived.ready || stopRequested;
-  $("btn-clear").disabled = derived.running || cs.length === 0;
-  $("btn-undo").disabled = derived.running || cs.length === 0;
+  const targetExtraction = workflowMode === "target" &&
+    typeof hasPlaneExtraction === "function" && hasPlaneExtraction();
+  $("btn-clear").disabled = derived.running || (cs.length === 0 && !targetExtraction);
+  $("btn-undo").disabled = derived.running || (cs.length === 0 && !targetExtraction);
   $("free-space-confirmed").disabled = !rosConnected || derived.running || Boolean(derived.abortReason);
   $("btn-stop-robot").disabled = planningOnly || !rosConnected;
   $("btn-stop-robot").hidden = planningOnly;
   document.querySelectorAll('input[name="workflow-mode"], input[name="sketch-mode"]').forEach(input => {
-    input.disabled = derived.running || processModePending ||
-      (spray && input.name === "sketch-mode" && (workflowMode === "path" || (workflowMode === "work_area" && input.value !== "rect")));
+    input.disabled = derived.running || processModePending;
   });
 
   $("target-actions").hidden = workflowMode !== "target";
@@ -918,11 +920,11 @@ function refreshPaintingUI() {
   $("tare-confirmation").hidden = processMode === "spray" || workflowMode !== "path";
   const hints = {
     target: "작업할 대상을 둘러 그린 뒤 평면을 추출하세요.",
-    work_area: spray ? "ZED Wall Front · 사각형 작업영역" : "측정한 평면 위에 칠할 영역을 그리세요.",
-    path: planningOnly ? "자동 도포 경로 미리보기 · 로봇 도달성·충돌 검증 전" : spray ? "자동 도포 경로 · 충돌 및 실행 검증" : "영역을 자동으로 채우거나, 원하는 경로를 직접 그리세요.",
+    work_area: spray ? "사각형·자유선 또는 이어진 직선으로 작업영역을 둘러 그리세요." : "측정한 평면 위에 칠할 영역을 그리세요.",
+    path: planningOnly ? "직선·자유선 경로 또는 자동 채우기 미리보기 · 로봇 실행 안 함" : "영역을 자동으로 채우거나, 원하는 경로를 직접 그리세요.",
   };
-  $("work-area-description").textContent = spray ? "ZED 평면 · 사각형 영역" : "칠할 영역을 둘러 그리세요. 그리지 않으면 정면 영상 전체를 사용합니다.";
-  $("path-actions-title").textContent = spray ? "자동 도포 경로" : "작업 경로";
+  $("work-area-description").textContent = spray ? "직선은 두 점을 클릭해 이어 그리고, 자유선은 드래그하세요. 마지막 점과 첫 점을 이어 영역을 닫습니다." : "칠할 영역을 둘러 그리세요. 그리지 않으면 정면 영상 전체를 사용합니다.";
+  $("path-actions-title").textContent = "작업 경로";
   $("view-card-title").textContent = currentView === "wall_front" && spray ? "ZED Wall Front" : VIEW_TITLES[currentView];
   $("workflow-hint").textContent = derived.running ? "로봇 작업 중에는 스케치를 수정할 수 없습니다." : hints[workflowMode];
   $("sketch-canvas").setAttribute("aria-label", hints[workflowMode]);
@@ -1137,8 +1139,8 @@ const sketchCtx = sketchCanvas.getContext("2d");
 const strokesMap = { target: [], work_area: [], path: [] };
 let workflowMode = "target";
 function currentStrokes() { return strokesMap[workflowMode]; }
-function sprayRectangleReady(strokes) {
-  return window.ZedSurfaceGate.rectangleReady(strokes, sketchCanvas.width, sketchCanvas.height);
+function sprayWorkAreaBoundary(strokes) {
+  return window.ZedSurfaceGate.workAreaBoundary(strokes, sketchCanvas.width, sketchCanvas.height);
 }
 
 let currentStroke = null;     // 진행 중 freehand stroke (mousedown ~ mouseup)
@@ -1337,6 +1339,17 @@ function redrawSketch() {
     sketchCtx.stroke();
   }
 
+  if (processMode === "spray" && workflowMode === "work_area" && !currentStroke && !pendingLine && !pendingRect) {
+    const boundary = sprayWorkAreaBoundary(currentStrokes());
+    if (boundary) {
+      sketchCtx.beginPath();
+      sketchCtx.moveTo(boundary[0].u, boundary[0].v);
+      for (const point of boundary.slice(1)) sketchCtx.lineTo(point.u, point.v);
+      sketchCtx.closePath();
+      sketchCtx.stroke();
+    }
+  }
+
   // Rect 모드 preview (drag 중 점선 직사각형)
   if (pendingRect && pendingRect.end) {
     const a = pendingRect.start, b = pendingRect.end;
@@ -1377,8 +1390,9 @@ sketchCanvas.addEventListener("pointerdown", (ev) => {
     return;
   }
   if (paintingDerivedState().running || processModePending ||
-      (processMode === "spray" && (workflowMode === "path" ||
-        (workflowMode === "work_area" && (!zedSelection.target || currentView !== "wall_front" || zedFrameCount === 0))))) {
+      (processMode === "spray" && workflowMode !== "target" &&
+        (!zedSelection.target || currentView !== "wall_front" ||
+         (workflowMode === "path" && !paintingDerivedState().surfaceAccepted)))) {
     logEvent("stroke ignored: execution is running");
     return;
   }
@@ -1386,14 +1400,13 @@ sketchCanvas.addEventListener("pointerdown", (ev) => {
   const c = getNativeCoords(ev);
   currentMouse = c;
   paintingState.local.unsentInputEdit = true;
+  if (workflowMode === "target") invalidateTargetPlanes("target edited");
   if (processMode === "spray") {
-    if (workflowMode === "target") invalidateSelection("ZED target edited");
-    else {
+    if (workflowMode === "work_area") {
       zedSelection.clearWorkArea();
       paintingState.local.planeInvalidated = true;
       paintingState.local.selectionIdentityPending = true;
-      strokesMap.work_area = [];
-      sketchMode = "rect";
+      if (sketchMode === "rect") strokesMap.work_area = [];
     }
   }
   invalidatePlanLocally(`${workflowMode} stroke edited`, false);
@@ -1498,6 +1511,10 @@ function switchWorkflow(mode) {
     sketchMode = "rect";
     document.querySelector('input[name="sketch-mode"][value="rect"]').checked = true;
   }
+  if (processMode === "spray" && mode === "path" && sketchMode === "rect") {
+    sketchMode = "freehand";
+    document.querySelector('input[name="sketch-mode"][value="freehand"]').checked = true;
+  }
   // Work area pixels always refer to the projector's Wall Front view.
   const targetView = mode === "target" ? "zed_raw" : "wall_front";
   switchView(targetView);
@@ -1519,7 +1536,8 @@ $("btn-clear").addEventListener("click", () => {
   pendingLine = null;
   pendingRect = null;
   currentStroke = null;
-  if (processMode === "spray") invalidateSelection("ZED selection cleared", workflowMode === "target");
+  if (workflowMode === "target") invalidateTargetPlanes("target cleared");
+  else if (processMode === "spray" && workflowMode === "work_area") invalidateSelection("ZED selection cleared", false);
   invalidatePlanLocally(`${workflowMode} cleared`, false);
   redrawSketch();
 });
@@ -1527,10 +1545,12 @@ $("btn-clear").addEventListener("click", () => {
 $("btn-undo").addEventListener("click", () => {
   if (paintingDerivedState().running) return;
   const cs = currentStrokes();
-  if (cs.length > 0) {
+  if (cs.length > 0 || (workflowMode === "target" && hasPlaneExtraction())) {
     cs.pop();
     paintingState.local.unsentInputEdit = true;
-    if (processMode === "spray") invalidateSelection("ZED selection undone", workflowMode === "target");
+    if (workflowMode === "target") invalidateTargetPlanes("target undone");
+    else if (processMode === "spray" && workflowMode === "work_area")
+      invalidateSelection("ZED selection undone", false, {preserveWorkArea: workflowMode === "work_area"});
     invalidatePlanLocally(`${workflowMode} undo`, false);
     redrawSketch();
   }
@@ -1580,6 +1600,9 @@ const sketchPub = new ROSLIB.Topic({
   ros: ros,
   name: SKETCH_PIXELS_TOPIC,
   messageType: "geometry_msgs/PoseArray",
+});
+const zedSketchRequestPub = new ROSLIB.Topic({
+  ros, name: "/painting_system/zed_sketch_request", messageType: "std_msgs/String",
 });
 const sketchExecutePub = new ROSLIB.Topic({
   ros: ros,
@@ -1715,7 +1738,9 @@ function nowRosTime() {
 function posesFromStrokes(strokes) {
   const poses = [];
   strokes.forEach((s, strokeIndex) => {
-    for (const pt of s.points) {
+    const points = workflowMode === "path" && s.type === "rect" && s.points.length
+      ? [...s.points, s.points[0]] : s.points;
+    for (const pt of points) {
       poses.push({
         position: { x: pt.u, y: pt.v, z: strokeIndex },
         orientation: { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
@@ -1755,6 +1780,7 @@ $("btn-set-target").addEventListener("click", () => {
   // race the target surface across two DDS topics and could refine the old
   // target instead.
   const selectionStamp = nowRosTime();
+  beginPlaneExtraction(selectionStamp);
   clearTargetRefineWait();
   if (publishPixels(
     targetSelectionPub,
@@ -1767,6 +1793,7 @@ $("btn-set-target").addEventListener("click", () => {
   } else {
     clearTargetRefineWait();
     paintingState.targetSelectionState = "rejected";
+    clearPlaneSelection(true);
     logEvent("target selection has no pixels; D405 refinement was not armed");
   }
   refreshPaintingUI();
@@ -1778,7 +1805,9 @@ $("btn-set-work-area").addEventListener("click", () => {
   if (!rosConnected || processModePending || paintingDerivedState().running) return;
   let strokes = currentStrokes();
   if (processMode === "spray") {
-    if (!zedSelection.target || zedFrameCount === 0 || !sprayRectangleReady(strokes)) return;
+    const boundary = sprayWorkAreaBoundary(strokes);
+    if (!zedSelection.target || zedFrameCount === 0 || !boundary || currentStroke || pendingLine || pendingRect) return;
+    strokes = [{type: "boundary", points: boundary}];
     const stamp = nowRosTime();
     if (!zedSelection.beginWorkArea(stamp)) return;
     paintingState.local.planeInvalidated = true;
@@ -1835,7 +1864,7 @@ $("btn-fill-work-area").addEventListener("click", () => {
 });
 
 $("btn-execute").addEventListener("click", () => {
-  if (processMode === "spray") return;
+  if (zedFrameCount === 0 || currentStroke || pendingLine || pendingRect) return;
   const cs = currentStrokes();
   if (cs.length === 0) return;
   const derived = paintingDerivedState();
@@ -1847,6 +1876,20 @@ $("btn-execute").addEventListener("click", () => {
   }
 
   beginPlanRequest("free-sketch path requested");
+  if (processMode === "spray") {
+    const area = zedSelection.surface;
+    if (!area) return;
+    const poses = posesFromStrokes(cs);
+    const strokes = cs.map((_, index) => poses.filter(p => p.position.z === index)
+      .map(p => [p.position.x, p.position.y]));
+    zedSketchRequestPub.publish(new ROSLIB.Message({data: JSON.stringify({
+      source: "zed", plane_generation_id: area.plane_generation_id,
+      work_area_id: area.work_area_id, selection_id: area.selection_id,
+      header: {frame_id: "wall_front", stamp: nowRosTime()}, strokes,
+    })}));
+    logEvent("그린 경로 전송 — 작업영역·이격거리·실행 조건 검증 대기");
+    return;
+  }
   if (!publishPixels(sketchPub, SKETCH_PIXELS_TOPIC, "wall_front", cs)) return;
   logEvent("path pixels sent; waiting for backend plan validation before Run is enabled");
 });

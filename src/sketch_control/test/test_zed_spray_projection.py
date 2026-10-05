@@ -124,7 +124,7 @@ def test_projection_orients_reversed_catalog_corners_like_camera():
     [[-0.001, 0], [100, 100]], [[0, 0], [900, 100]],
     [[0, 0], [100, 540]], [[0, 0], [float("inf"), 100]],
     [[0, 0], [float("nan"), 100]], [[0, 0], [10, 100]],
-    [[0, 0], [100, 0], [90, 100], [0, 100]], [[0, 0]],
+    [[0, 0], [100, 100], [0, 100], [100, 0]], [[0, 0]],
 ])
 def test_area_rejects_invalid_pixels_without_clamping(points):
     with pytest.raises(ValueError):
@@ -312,6 +312,18 @@ def test_atomic_status_binds_exact_plane_and_selection_identity(node):
     assert point == pytest.approx([0, 0, 2])
     assert normal == pytest.approx([0, 0, -1])
     assert corners == pytest.approx(np.asarray(_target()["corners"]))
+    from sketch_control.work_area_geometry import validate_zed_surface_status
+    assert validate_zed_surface_status(status) == status
+
+
+def test_polygon_work_area_publishes_exact_boundary_with_compatible_envelope(node):
+    _ready(node)
+    boundary = [[100, 100], [700, 100], [700, 400], [450, 250], [100, 400]]
+    node._on_zed_work_area_request(_request(_area(points=boundary)))
+    status = json.loads(node.zed_status_pub.messages[-1].data)
+    assert status['accepted'] is True
+    assert status['boundary_pixels'] == boundary
+    assert node.locked_work_area['boundary_pixels'] == boundary
     from sketch_control.work_area_geometry import validate_zed_surface_status
     assert validate_zed_surface_status(status) == status
 

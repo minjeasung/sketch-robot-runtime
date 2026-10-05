@@ -29,7 +29,13 @@ def make_spray_rows(strokes, normal, fallback, transform_point, transform_tangen
     for index, stroke in enumerate(strokes):
         tangent = np.asarray(stroke[-1]) - np.asarray(stroke[0])
         if np.linalg.norm(tangent) < 1e-8:
-            raise ValueError("spraying requires a nonzero stroke")
+            # A closed freehand loop still has motion. Keep one stable fan
+            # orientation for this stroke, using its first nonzero edge.
+            tangent = next((np.asarray(b) - np.asarray(a)
+                            for a, b in zip(stroke, stroke[1:])
+                            if np.linalg.norm(np.asarray(b) - np.asarray(a)) >= 1e-8), None)
+            if tangent is None:
+                raise ValueError("spraying requires a nonzero stroke")
         tangent = transform_tangent(tangent)
         start = transform_point(stroke[0])
         rows.append(row_factory("SPRAY_APPROACH" if index == 0 else "SPRAY_TRAVEL",
@@ -85,7 +91,7 @@ def validate_spray_path(path):
     if path.contact_geometry_offset_m != 0.0 or path.contact_offset_m != 0.0:
         reject("spray must not apply roller or brush geometry offsets")
     if (path.source.get("plane") != "zed" or path.source.get("view") != "wall_front"
-            or path.source.get("coverage") != "auto_fill"
+            or path.source.get("coverage") not in {"auto_fill", "manual_sketch"}
             or not path.plane_generation_id.startswith("zed:")
             or path.source.get("plane_generation_id") != path.plane_generation_id
             or path.source.get("work_area_id") != path.work_area_id

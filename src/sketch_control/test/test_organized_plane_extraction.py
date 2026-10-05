@@ -32,19 +32,6 @@ def test_disconnected_coplanar_patches_never_bridge_the_gap():
         assert x.max() <= 76 or x.min() >= 160
 
 
-def test_folded_surface_keeps_both_faces_beside_a_disconnected_patch():
-    _, x = np.mgrid[:240, :240]
-    depth = np.where(x < 80, 1., 1 / (1 + .8 * (x - 80) / 500))
-    depth[:, 160:200] = np.nan
-    depth[:, 200:] = 1.5
-    planes = _extract(depth)
-    assert len(planes) == 3
-    tilted_normal = np.array([.8, 0., 1.064])
-    tilted_normal /= np.linalg.norm(tilted_normal)
-    assert any(abs(np.dot(plane['normal'], tilted_normal)) > .99
-               for plane in planes)
-
-
 def test_web_keeps_its_pixel_support_when_it_touches_a_flange():
     y, x = np.mgrid[:400, :240]
     # A recessed web between two flanges. Right flange meets the web

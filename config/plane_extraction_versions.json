@@ -1,0 +1,40 @@
+{
+  "paths": [
+    "docs/HBEAM_PLANES.md",
+    "src/sketch_control/sketch_control/multi_plane_geometry.py",
+    "src/sketch_control/sketch_control/organized_planes.py",
+    "src/sketch_control/sketch_control/plane_boundaries.py",
+    "src/sketch_control/sketch_control/plane_normals.py",
+    "src/sketch_control/sketch_control/pointcloud_utils.py",
+    "src/sketch_control/sketch_control/target_selector_node.py",
+    "src/sketch_control/test/fixtures/README.md",
+    "src/sketch_control/test/fixtures/hbeam_depth.npz",
+    "src/sketch_control/test/fixtures/shadow_beam_depth.npz",
+    "src/sketch_control/test/test_hbeam_planes.py",
+    "src/sketch_control/test/test_organized_plane_extraction.py",
+    "src/sketch_control/test/test_plane_boundary_refinement.py",
+    "src/sketch_control/test/test_target_rgb_pairing.py"
+  ],
+  "versions": {
+    "base": {
+      "ref": "refs/tags/plane-extraction/base",
+      "label": "원본 깊이 RANSAC",
+      "source": "Git f0f5fc9의 평면 추출 파일"
+    },
+    "v0": {
+      "ref": "refs/tags/plane-extraction/v0",
+      "label": "RGB 경계 우선: RGB·깊이 영역 분할 + RANSAC",
+      "source": "첫 H형강 수정 적용 직전 백업"
+    },
+    "v1": {
+      "ref": "refs/tags/plane-extraction/v1",
+      "label": "H형강 보강: 국소 법선·지지점 배정",
+      "source": "그림자 수정 적용 직전 백업"
+    },
+    "v2": {
+      "ref": "refs/tags/plane-extraction/v2",
+      "label": "깊이 RANSAC 우선 + RGB 경계 후처리",
+      "source": "2026-10-05 사용자가 비교한 현재 파일"
+    }
+  }
+}

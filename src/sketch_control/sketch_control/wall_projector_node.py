@@ -39,6 +39,7 @@ from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import Empty, String
 from tf2_ros import Buffer, TransformListener, TransformException
 from sketch_control.image_preview import ImagePreview
+from sketch_control.work_area_geometry import work_area_polygon
 
 from sketch_control.zed_spray_projection import (
     plane_orientation, project_target_rectangle, select_work_area, stamp_ns,
@@ -532,6 +533,8 @@ class WallProjectorNode(Node):
             tl, right, w, down, h = self._front_view_uv(extent)
             pixels = np.asarray([[(p - tl) @ right / w * (width - 1),
                                   (p - tl) @ down / h * (height - 1)] for p in corners], dtype=np.int32)
+            if "boundary_pixels" in self.locked_work_area:
+                pixels = np.asarray(self.locked_work_area["boundary_pixels"], dtype=np.int32)
             cv2.polylines(front, [pixels], True, (0, 255, 0), 3)
             if self._show_fill_preview:
                 self._draw_fill_preview(front)
@@ -591,12 +594,14 @@ class WallProjectorNode(Node):
             if not all(np.isfinite(p.position.z) for p in msg.poses):
                 raise ValueError("invalid work area stroke")
             if len({p.position.z for p in msg.poses}) != 1:
-                raise ValueError("work area must contain a single rectangle")
+                raise ValueError("work area must contain a single boundary")
+            boundary = work_area_polygon(points, *self.front_view_size)
             corners = select_work_area(self.front_view_extent, self.front_view_size, points)
             if self._zed_front_camera is None:
                 raise ValueError("selection requires current ZED camera geometry")
             validate_visible_work_area(corners, *self._zed_front_camera)
             payload = self._zed_surface_payload("work_area", corners, str(selection))
+            payload["boundary_pixels"] = boundary.tolist()
         except (ValueError, TypeError, OverflowError) as exc:
             self._invalidate_zed(str(exc))
             return
@@ -615,6 +620,7 @@ class WallProjectorNode(Node):
             source="zed", plane_generation_id=target["plane_generation_id"],
             work_area_id=self._work_area_id, selection_id=str(selection),
             base_mode="zed_wall_front", mode="locked:zed_wall_front",
+            boundary_pixels=boundary.tolist(),
         )
         self._locked_extent = self.front_view_extent.copy()
         self._locked_extent_size = self.front_view_size

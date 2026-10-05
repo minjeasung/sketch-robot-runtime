@@ -2,7 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { ZedSurfaceGate, stampPathId, matchesPlan, rectangleReady } = require("../js/zed_surface_gate.js");
+const { ZedSurfaceGate, stampPathId, matchesPlan, rectangleReady, workAreaBoundary } = require("../js/zed_surface_gate.js");
 
 const stamp = { sec: 1750000000, nanosec: 123456789 };
 const corners = [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]];
@@ -176,4 +176,12 @@ test("backend preview pixels require matching plan identity and finite geometry"
   assert.deepEqual(previewStrokes(message, '41'), []);
   message.poses[0].position.x = NaN;
   assert.deepEqual(previewStrokes(message, '42'), []);
+});
+
+test('connected lines enclose a work area; isolated or disconnected lines do not', () => {
+  const line = points => ({type:'line', points:points.map(([u,v]) => ({u,v}))});
+  assert.equal(workAreaBoundary([line([[10,10],[80,10]])], 100, 100), null);
+  assert.deepEqual(workAreaBoundary([line([[10,10],[80,10]]), line([[80,10],[40,80]])], 100, 100),
+    [{u:10,v:10},{u:80,v:10},{u:40,v:80}]);
+  assert.equal(workAreaBoundary([line([[10,10],[80,10]]), line([[80,50],[40,80]])], 100, 100), null);
 });

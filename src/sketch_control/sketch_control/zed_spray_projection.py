@@ -3,7 +3,7 @@ import numpy as np
 import cv2
 
 from sketch_control.rotation_utils import quat_from_matrix
-from sketch_control.work_area_geometry import bilinear_quad_point
+from sketch_control.work_area_geometry import bilinear_quad_point, work_area_polygon
 
 
 def stamp_ns(stamp):
@@ -40,11 +40,11 @@ def validate_work_area_request(payload, generation):
     if stamp["sec"] > 2_147_483_647:
         raise ValueError("work request stamp cannot be represented by ROS Time")
     pixels = payload.get("pixels")
-    if (not isinstance(pixels, list) or len(pixels) not in (0, 2, 4, 5)
+    if (not isinstance(pixels, list) or len(pixels) > 1024
             or any(not isinstance(point, list) or len(point) != 2
                    or any(type(value) not in (int, float) for value in point)
                    for point in pixels)):
-        raise ValueError("work request pixels must be one numeric rectangle")
+        raise ValueError("work request pixels must be one numeric boundary")
     points = np.asarray(pixels, dtype=float).reshape(-1, 2)
     if not np.isfinite(points).all():
         raise ValueError("work request pixels must be finite")
@@ -178,13 +178,13 @@ def validate_visible_work_area(corners, intrinsics, rotation, translation, image
 
 
 def select_work_area(extent, view_size, pixels):
-    """Map only a finite in-bounds rectangle on wall_front to its plane support."""
-    points = np.asarray(pixels, dtype=float)
-    if points.shape == (5, 2) and np.array_equal(points[0], points[-1]):
-        points = points[:-1]
-    if points.shape not in ((2, 2), (4, 2)) or not np.isfinite(points).all():
-        raise ValueError("work area must be one finite rectangle")
+    """Return the metric envelope of a validated Wall Front boundary.
+
+    The producer also publishes the boundary so path generation can enforce
+    its exact shape; this envelope retains the existing rectangular frame.
+    """
     width, height = view_size
+    points = work_area_polygon(pixels, width, height)
     if width <= 1 or height <= 1:
         raise ValueError("front view is unavailable")
     lo, hi = points.min(axis=0), points.max(axis=0)
@@ -193,8 +193,6 @@ def select_work_area(extent, view_size, pixels):
     if np.any(hi - lo < 20.0):
         raise ValueError("work area is too small")
     rectangle = np.array([lo, [hi[0], lo[1]], hi, [lo[0], hi[1]]])
-    if len(points) == 4 and sorted(map(tuple, points)) != sorted(map(tuple, rectangle)):
-        raise ValueError("work area is not an axis-aligned rectangle")
     support, _right, _down, _w, _h = _rectangle(extent)
     return np.asarray([bilinear_quad_point(support, u / (width - 1), v / (height - 1))
                        for u, v in rectangle])

@@ -1,6 +1,8 @@
 // Catalog selection is shared; only paint selection requests D405 motion.
 let planeCatalog = { generation: "", planes: [] };
 let planeState = {};
+// Catalog generations echo the target PoseArray stamp. Accept only this request.
+let requestedPlaneGeneration = "";
 const selectedPlaneIds = new Set();
 const planeColors = ["#38bdf8", "#f59e0b", "#a78bfa", "#4ade80", "#fb7185", "#22d3ee", "#f472b6", "#a3e635"];
 const selectPlanesPub = new ROSLIB.Topic({ ros, name: "/painting_system/select_planes", messageType: "std_msgs/String" });
@@ -9,10 +11,25 @@ const processModePub = new ROSLIB.Topic({ ros, name: "/painting_system/set_proce
 let requestedProcessMode = "";
 let lastPlaneRender = "";
 
+function beginPlaneExtraction(stamp) {
+  requestedPlaneGeneration = window.ZedSurfaceGate.stampPathId(stamp);
+}
+
+function hasPlaneExtraction() {
+  return Boolean(requestedPlaneGeneration || planeCatalog.planes.length);
+}
+
+function invalidateTargetPlanes(reason) {
+  clearPlaneSelection(true);
+  invalidateSelection(reason);
+}
+
 function clearPlaneSelection(clearCatalog = false) {
   planeState = {};
   selectedPlaneIds.clear();
   if (clearCatalog) {
+    requestedPlaneGeneration = "";
+    $("planes-status").textContent = "대상 영역을 그리고 평면을 추출하세요.";
     planeCatalog = { generation: "", planes: [] };
     zedSelection.setCatalog("");
   }
@@ -49,8 +66,11 @@ function renderPlaneList() {
       redrawSketch();
     });
     const coverage = Math.round(100 * (plane.segment_inlier_ratio || 0));
-    const detail = plane.partial_support ? ` · 부분 검출 ${coverage}%` : "";
-    if (plane.partial_support) {
+    let detail = plane.partial_support ? ` · 부분 검출 ${coverage}%` : "";
+    if (plane.depth_consistency_warning) {
+      detail += " · 깊이 일치 부족";
+      label.title = "면 내부의 깊이 일부가 평면과 맞지 않습니다. 깊이 오차나 가림이 있을 수 있으니 면 경계를 확인하세요.";
+    } else if (plane.partial_support) {
       label.title = "영역 전체의 깊이가 한 평면에 맞지 않아, 측정으로 확인된 부분만 표시합니다.";
     }
     label.append(checkbox, swatch, document.createTextNode(`면 ${index + 1}${detail}`));
@@ -107,6 +127,7 @@ function drawPlaneCandidates() {
 new ROSLIB.Topic({ ros, name: "/perception/target_planes", messageType: "std_msgs/String" }).subscribe(msg => {
   const payload = parseJsonStatus("/perception/target_planes", msg);
   if (processModePending || !payload || !Array.isArray(payload.planes) || !textId(payload.generation)) return;
+  if (!requestedPlaneGeneration || payload.generation !== requestedPlaneGeneration) return;
   if (payload.generation === planeCatalog.generation) return;
   invalidateSelection("new plane catalog");
   planeCatalog = payload;
@@ -132,7 +153,7 @@ $("btn-refine-planes").addEventListener("click", () => {
 
 new ROSLIB.Topic({ ros, name: "/painting_system/planes", messageType: "std_msgs/String" }).subscribe(msg => {
   const payload = parseJsonStatus("/painting_system/planes", msg);
-  if (processModePending || !payload || payload.generation !== planeCatalog.generation) return;
+  if (processModePending || !planeCatalog.generation || !payload || payload.generation !== planeCatalog.generation) return;
   if (processMode === "spray" && payload.source && payload.source !== "zed") return;
   const changed = payload.active_id !== planeState.active_id || planeState.state !== "ready";
   planeState = payload;

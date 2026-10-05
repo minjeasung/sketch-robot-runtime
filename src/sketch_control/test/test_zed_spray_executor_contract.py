@@ -383,9 +383,12 @@ def _ik_response(value=.1, error=1):
 
 
 @pytest.mark.parametrize("model,axis", [("rb20_1900es", "+z"), ("rb10_1300e_u", "-y")])
-def test_real_spray_accepts_zero_geometry_and_custom_standoff(model, axis):
+@pytest.mark.parametrize("coverage", ["auto_fill", "manual_sketch"])
+def test_real_spray_accepts_zero_geometry_and_custom_standoff(model, axis, coverage):
     node = _executor(model=model, axis=axis)
     payload = _spray_payload(model, axis)
+    payload['source']['coverage'] = coverage
+    payload = attach_plan_hash(payload)
     expected = _parse(payload)
     node.on_eoat_segments(executor_module.String(data=json.dumps(payload)))
 

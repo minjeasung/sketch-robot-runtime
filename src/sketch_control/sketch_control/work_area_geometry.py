@@ -22,6 +22,110 @@ PixelRect = tuple[float, float, float, float]
 PixelStroke = tuple[PixelPoint, PixelPoint]
 
 
+def _cross2(a, b):
+    return a[..., 0]*b[..., 1] - a[..., 1]*b[..., 0]
+
+
+def _edge_cuts(a, b, starts, ends):
+    """Parameters where segment a->b meets any polygon edge, including overlap."""
+    direction, edges = b-a, ends-starts
+    length2 = float(direction @ direction)
+    if length2 < 1e-16:
+        return []
+    delta = starts-a
+    denominator = _cross2(direction, edges)
+    nonparallel = abs(denominator) > 1e-10
+    t = np.divide(_cross2(delta, edges), denominator,
+                  out=np.zeros(len(edges)), where=nonparallel)
+    u = np.divide(_cross2(delta, direction), denominator,
+                  out=np.zeros(len(edges)), where=nonparallel)
+    hits = nonparallel & (t >= -1e-9) & (t <= 1+1e-9) & (u >= -1e-9) & (u <= 1+1e-9)
+    cuts = np.clip(t[hits], 0., 1.).tolist()
+    collinear = ~nonparallel & (abs(_cross2(delta, direction)) < 1e-8)
+    if np.any(collinear):
+        first = (starts[collinear]-a) @ direction / length2
+        last = (ends[collinear]-a) @ direction / length2
+        lo, hi = np.minimum(first, last), np.maximum(first, last)
+        overlaps = (hi >= -1e-9) & (lo <= 1+1e-9)
+        cuts.extend(np.clip(np.r_[lo[overlaps], hi[overlaps]], 0., 1.).tolist())
+    return cuts
+
+
+def work_area_polygon(points, width, height):
+    """Validate one simple boundary; legacy two-corner boxes remain supported."""
+    polygon = np.asarray(points, dtype=float)
+    if (polygon.ndim != 2 or polygon.shape[1] != 2 or not 2 <= len(polygon) <= 1024
+            or not np.isfinite(polygon).all()):
+        raise WorkAreaGeometryError("work area requires 2 to 1024 finite pixel vertices")
+    if len(polygon) == 2:
+        lo, hi = polygon.min(axis=0), polygon.max(axis=0)
+        polygon = np.array([lo, [hi[0], lo[1]], hi, [lo[0], hi[1]]])
+    polygon = polygon[np.r_[True, np.linalg.norm(np.diff(polygon, axis=0), axis=1) > 1e-8]]
+    if len(polygon) > 1 and np.linalg.norm(polygon[0]-polygon[-1]) < 1e-8:
+        polygon = polygon[:-1]
+    if (len(polygon) < 3 or width <= 1 or height <= 1 or np.any(polygon < 0)
+            or np.any(polygon[:, 0] > width-1) or np.any(polygon[:, 1] > height-1)):
+        raise WorkAreaGeometryError("work area must enclose a region inside Wall Front")
+    ends = np.roll(polygon, -1, axis=0)
+    if abs(float(np.sum(_cross2(polygon, ends)))) < 2.:
+        raise WorkAreaGeometryError("work area has no usable enclosed area")
+    for i, (a, b) in enumerate(zip(polygon, ends)):
+        others = [j for j in range(len(polygon)) if j not in {i, (i-1) % len(polygon), (i+1) % len(polygon)}]
+        if _edge_cuts(a, b, polygon[others], ends[others]):
+            raise WorkAreaGeometryError("work area boundary crosses or touches itself")
+        previous = polygon[i-1]-a
+        if abs(_cross2(previous, b-a)) < 1e-8 and previous @ (b-a) > 0:
+            raise WorkAreaGeometryError("work area boundary doubles back")
+    return polygon
+
+
+def _inside_polygon(point, polygon):
+    ends = np.roll(polygon, -1, axis=0)
+    edges, delta = ends-polygon, point-polygon
+    length2 = np.sum(edges*edges, axis=1)
+    t = np.clip(np.sum(delta*edges, axis=1)/length2, 0., 1.)
+    if np.min(np.linalg.norm(delta-t[:, None]*edges, axis=1)) <= 1e-7:
+        return True
+    crossing = (polygon[:, 1] > point[1]) != (ends[:, 1] > point[1])
+    p, q = polygon[crossing], ends[crossing]
+    intersections = p[:, 0]+(point[1]-p[:, 1])*(q[:, 0]-p[:, 0])/(q[:, 1]-p[:, 1])
+    return bool(np.count_nonzero(intersections > point[0]) % 2)
+
+
+def _polygon_intervals(a, b, polygon):
+    cuts = sorted(set([0., 1., *_edge_cuts(a, b, polygon, np.roll(polygon, -1, axis=0))]))
+    return [(lo, hi) for lo, hi in zip(cuts, cuts[1:]) if hi-lo > 1e-10
+            and _inside_polygon(a+((lo+hi)/2)*(b-a), polygon)]
+
+
+def strokes_inside_polygon(strokes, polygon):
+    """Check complete segments, including excursions through a concave gap."""
+    boundary = np.asarray(polygon, dtype=float)
+    for stroke in strokes:
+        points = np.asarray(stroke, dtype=float)
+        if (points.ndim != 2 or points.shape[1] != 2 or len(points) < 2
+                or not np.isfinite(points).all()
+                or not all(_inside_polygon(p, boundary) for p in points)):
+            return False
+        for a, b in zip(points, points[1:]):
+            if np.linalg.norm(b-a) < 1e-8:
+                continue
+            if sum(hi-lo for lo, hi in _polygon_intervals(a, b, boundary)) < 1-1e-8:
+                return False
+    return bool(strokes)
+
+
+def clip_strokes_to_polygon(strokes, polygon):
+    """Clip each fill pass; disconnected pieces become separate OFF-linked strokes."""
+    boundary = np.asarray(polygon, dtype=float)
+    result = []
+    for stroke in strokes:
+        a, b = np.asarray(stroke[0], dtype=float), np.asarray(stroke[-1], dtype=float)
+        for lo, hi in _polygon_intervals(a, b, boundary):
+            result.append((tuple(a+lo*(b-a)), tuple(a+hi*(b-a))))
+    return result
+
+
 def validate_zed_surface_status(payload):
     """Validate an atomic work-area geometry message before it can be cached."""
     if not isinstance(payload, dict) or (
@@ -70,6 +174,15 @@ def validate_zed_surface_status(payload):
             raise WorkAreaGeometryError("ZED position must be the work-area center")
         if outside_quad_3d_indices(payload["corners"], payload["front_extent"]):
             raise WorkAreaGeometryError("ZED work area is outside its front extent")
+        if "boundary_pixels" in payload:
+            boundary = work_area_polygon(payload["boundary_pixels"],
+                                         payload["view_width"], payload["view_height"])
+            lo, hi = boundary.min(axis=0), boundary.max(axis=0)
+            envelope = [lo, [hi[0], lo[1]], hi, [lo[0], hi[1]]]
+            expected = [bilinear_quad_point(payload["front_extent"],
+                u/(payload["view_width"]-1), v/(payload["view_height"]-1)) for u, v in envelope]
+            if not np.allclose(expected, payload["corners"], atol=1e-6, rtol=0.):
+                raise WorkAreaGeometryError("ZED boundary does not match its work-area envelope")
     except (TypeError, ValueError) as exc:
         raise WorkAreaGeometryError(str(exc)) from exc
     return payload

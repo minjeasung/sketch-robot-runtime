@@ -5,7 +5,7 @@ import time
 import numpy as np
 
 from sketch_control.rotation_utils import quat_apply
-from sketch_control.work_area_geometry import outside_quad_3d_indices
+from sketch_control.work_area_geometry import outside_quad_3d_indices, validate_zed_surface_status
 
 
 def selection_stamp_id(stamp):
@@ -29,6 +29,8 @@ def validate_zed_work_area(payload, generation, selection_id):
     if any(not isinstance(payload.get(key), str) or not payload[key].strip()
            for key in ("frame_id", "work_area_id")):
         raise ValueError("ZED frame and work-area ID required")
+    if "boundary_pixels" in payload:
+        validate_zed_surface_status(payload)
     try:
         point = np.asarray(payload["position"], dtype=float)
         quaternion = np.asarray(payload["orientation"], dtype=float)
@@ -129,7 +131,7 @@ class ZedSprayExecutionMixin:
         selection_id = selection_stamp_id(msg.header.stamp)
         pending = getattr(self, "_zed_pending_area", None)
         self._invalidate_zed_work_area("ZED_WORK_AREA_SELECTION_CHANGED")
-        valid = msg.header.frame_id == "wall_front" and len(msg.poses) in (2, 4, 5)
+        valid = msg.header.frame_id == "wall_front" and 2 <= len(msg.poses) <= 1024
         self._zed_work_area_selection_id = selection_id if valid else ""
         if pending and pending.get("selection_id") == self._zed_work_area_selection_id:
             self._zed_pending_area = pending
@@ -162,7 +164,8 @@ class ZedSprayExecutionMixin:
             return
         accepted = getattr(self, "_zed_accepted_area", None)
         if accepted and payload.get("selection_id") == accepted.get("selection_id"):
-            keys = ("work_area_id", "plane_generation_id", "frame_id", "position", "orientation", "corners")
+            keys = ("work_area_id", "plane_generation_id", "frame_id", "position", "orientation", "corners",
+                    "boundary_pixels", "front_extent", "view_width", "view_height")
             if any(payload.get(key) != accepted.get(key) for key in keys):
                 self._invalidate_zed_work_area("ZED_LOCK_GEOMETRY_CHANGED")
                 self._zed_work_area_selection_id = ""
