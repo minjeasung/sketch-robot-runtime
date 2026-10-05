@@ -51,8 +51,8 @@ def extract_planes(
         structure="generic"):
     """Extract robust plane candidates while preserving sketch pixel support.
 
-    Organized depth (pixel_stride supplied) uses connected RGB/depth regions
-    before fitting, and splits disconnected inliers before constructing hulls.
+    Organized depth (pixel_stride supplied) fits depth-connected regions first.
+    RGB only refines ambiguous boundaries between already validated planes.
     Unorganized clouds retain iterative RANSAC. Both preserve original support.
     """
     if structure not in ("generic", "hbeam"):
@@ -90,9 +90,12 @@ def extract_planes(
             continue
 
         cloud = points[indices]
-        normal = np.asarray(segment["model"][:3], dtype=float)
-        normal /= np.linalg.norm(normal)
+        normal = np.array(segment["model"][:3], dtype=float, copy=True)
+        normal_length = np.linalg.norm(normal)
+        normal /= normal_length
         center = cloud.mean(axis=0)
+        # Boundary reassignment must not translate the established 3D plane.
+        center -= normal*(normal @ center+segment["model"][3]/normal_length)
         if normal @ center > 0:
             normal = -normal
 
@@ -137,6 +140,10 @@ def extract_planes(
             removed_count=int(segment["removed_count"]),
             remaining_after_removal=int(segment["remaining_after_removal"]),
             region_rms_m=float(segment.get("region_rms_m", segment["rms_m"])),
+            interior_support_ratio=segment.get("interior_support_ratio"),
+            interior_rms_m=segment.get("interior_rms_m"),
+            depth_consistency_warning=bool(segment.get("interior_support_ratio") is not None
+                                           and segment["interior_support_ratio"] < .8),
             partial_support=bool(segment.get("region_rms_m", 0.) > threshold
                                  and segment["segment_inlier_ratio"] < .8),
         ))

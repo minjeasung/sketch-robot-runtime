@@ -46,7 +46,7 @@ def test_stale_or_different_resolution_rgb_does_not_guide_depth(shape, stamp):
     assert node._rgb_for_depth() is None
 
 
-def test_target_selection_uses_hbeam_profile_for_recorded_faces():
+def test_target_selection_preserves_depth_models_with_rgb_shadows():
     import time
     from pathlib import Path
     from geometry_msgs.msg import Pose, PoseArray
@@ -60,7 +60,6 @@ def test_target_selection_uses_hbeam_profile_for_recorded_faces():
     node.latest_depth_header.frame_id = 'zed_left_camera_frame_optical'
     node.K = scene['K']
     node.plane_structure = 'hbeam'
-    node.rgb_frames.append((10_100_000_000, rgb))
     published = []
     node.catalog_pub = SimpleNamespace(publish=lambda msg: published.append(json.loads(msg.data)))
     request = PoseArray()
@@ -68,8 +67,25 @@ def test_target_selection_uses_hbeam_profile_for_recorded_faces():
     for x, y in ((0., 0.), (155., 631.)):
         p = Pose(); p.position.x = x; p.position.y = y
         request.poses.append(p)
-    node._on_selection(request)
-    assert len(published) == 1
-    assert len(published[0]['planes']) == 4
-    assert published[0]['structure'] == 'hbeam'
-    assert published[0]['extraction_method'] == 'rgb_depth_regions'
+    shadow = rgb.copy()
+    shadow[:, 64:100] //= 5
+    for color in (None, rgb, shadow):
+        node.rgb_frames.clear()
+        if color is not None:
+            node.rgb_frames.append((10_100_000_000, color))
+        node.latest_depth_received_at = time.monotonic()
+        request.header.stamp.sec += 1
+        node._on_selection(request)
+    assert len(published) == 3
+    baseline = published[0]['planes']
+    assert baseline
+    for i, catalog in enumerate(published):
+        assert len(catalog['planes']) == len(baseline)
+        assert catalog['structure'] == 'hbeam'
+        assert catalog['extraction_version'] == 'geometry_first_v2'
+        expected = 'depth_ransac' if i == 0 else 'depth_ransac_rgb_refined'
+        assert catalog['extraction_method'] == expected
+        for before, after in zip(baseline, catalog['planes']):
+            np.testing.assert_allclose(after['normal'], before['normal'], atol=1e-12)
+            assert np.dot(after['normal'], after['center']) == pytest.approx(
+                np.dot(before['normal'], before['center']), abs=1e-12)

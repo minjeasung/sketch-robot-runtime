@@ -86,7 +86,7 @@ def test_close_hbeam_fold_is_not_averaged_into_one_plane():
 
 
 @pytest.mark.parametrize('frame', range(12))
-def test_recorded_hbeam_has_one_long_web_not_residual_fragments(frame):
+def test_recorded_depth_models_are_invariant_to_rgb_shadows(frame):
     from pathlib import Path
     scene = np.load(Path(__file__).parent/'fixtures/hbeam_depth.npz')
     depth = scene['depths'][frame]
@@ -96,17 +96,21 @@ def test_recorded_hbeam_has_one_long_web_not_residual_fragments(frame):
     pixels, z = pixels[valid], z[valid]; K = scene['K']
     points = np.c_[(pixels[:, 0]-K[0, 2])*z/K[0, 0],
                    (pixels[:, 1]-K[1, 2])*z/K[1, 1], z]
-    planes = extract_planes(points, pixels, pixel_stride=4, rgb=scene['rgb'],
-                            structure='hbeam')
-    # Three steel faces and the foreground strip on the left. These bounds
-    # are image annotations, not an assertion of metric depth accuracy.
-    assert len(planes) == 4
-    web = [p for p in planes if 72 <= np.mean(np.array(p['polygon_px'])[:, 0]) <= 116]
-    assert len(web) == 1
-    polygon = np.array(web[0]['polygon_px'])
-    assert np.ptp(polygon[:, 1]) > 500
-    assert web[0]['inlier_count'] > 950
-    assert web[0]['rms_m'] < .010
+    # This recording has biased depth, not calibrated plane ground truth.
+    # The former count==4 / fixed web annotation encoded an image-based split
+    # the user identified as wrong. It must not force that split back in.
+    baseline = extract_planes(points, pixels, pixel_stride=4, structure='hbeam')
+    assert baseline
+    rgb = scene['rgb'].copy()
+    rgb[:, 24+frame*8:] = rgb[:, 24+frame*8:]//4
+    planes = extract_planes(points, pixels, pixel_stride=4, rgb=rgb, structure='hbeam')
+    assert len(planes) == len(baseline)
+    for before, after in zip(baseline, planes):
+        np.testing.assert_allclose(after['normal'], before['normal'], atol=1e-12)
+        before_offset = np.dot(before['normal'], before['center'])
+        after_offset = np.dot(after['normal'], after['center'])
+        assert after_offset == pytest.approx(before_offset, abs=1e-12)
+        assert after['inlier_count'] >= 80
 
 
 def test_hbeam_profile_preserves_short_transverse_face():
@@ -165,3 +169,128 @@ def test_short_parallel_offset_face_is_not_a_residual_shard():
     planes = extract_planes(points, pixels, pixel_stride=4, structure='hbeam', iterations=300)
     assert len(planes) == 2
     assert sorted(round(p['center'][2], 3) for p in planes) == [1., 1.02]
+
+
+@pytest.mark.parametrize('shadow_x', [110, 118, 150])
+@pytest.mark.parametrize('rotate', [False, True])
+def test_shadow_edge_cannot_cut_or_duplicate_a_measured_beam_face(shadow_x, rotate):
+    points, pixels, truth, normals, shape = _folded_beam(rotate=rotate)
+    rgb = np.full((*shape, 3), 180, np.uint8)
+    if rotate:
+        rgb[shadow_x:, :] = 35
+    else:
+        rgb[:, shadow_x:] = 35
+    planes = extract_planes(points, pixels, pixel_stride=4, rgb=rgb,
+                            structure='hbeam', iterations=300)
+    assert len(planes) == 3
+    for label, expected in enumerate(normals):
+        target = pixels[truth == label]
+        plane = min(planes, key=lambda p: np.linalg.norm(np.mean(p['polygon_px'], axis=0)-target.mean(axis=0)))
+        assert abs(np.dot(plane['normal'], expected)) > .995
+        assert plane['inlier_count'] >= .95*len(target)
+        polygon = np.array(plane['polygon_px'])
+        direction = 1 if rotate else 0
+        assert polygon[:, direction].min() <= target[:, direction].min()+4
+        assert polygon[:, direction].max() >= target[:, direction].max()-4
+
+
+@pytest.mark.parametrize('frame', [0, 1, 2])
+def test_shadow_recording_preserves_models_and_reports_raw_depth_disagreement(frame):
+    # User annotation: the former pink "plane 5" is part of the cyan "plane 1",
+    # not an additional steel face. Its depth is curved/bias-corrupted.
+    # RGB must not change the 3D hypotheses; raw-depth diagnostics must expose
+    # disagreement rather than claim that RANSAC recovered the physical faces.
+    from pathlib import Path
+    scene = np.load(Path(__file__).parent/'fixtures/shadow_beam_depth.npz')
+    depth = scene['depths'][frame]
+    y, x = np.mgrid[:depth.shape[0], :depth.shape[1]]
+    z = depth.ravel(); pixels = np.c_[x.ravel()*4, y.ravel()*4]
+    valid = np.isfinite(z) & (z > .15) & (z < 5.)
+    pixels, z = pixels[valid], z[valid]; K = scene['K']
+    points = np.c_[(pixels[:, 0]-K[0, 2])*z/K[0, 0],
+                   (pixels[:, 1]-K[1, 2])*z/K[1, 1], z]
+    baseline = extract_planes(points, pixels, pixel_stride=4, structure='hbeam')
+    planes = extract_planes(points, pixels, pixel_stride=4, rgb=scene['rgb'], structure='hbeam')
+    assert len(planes) == len(baseline)
+    for before, after in zip(baseline, planes):
+        np.testing.assert_allclose(after['normal'], before['normal'], atol=1e-12)
+        assert np.dot(after['normal'], after['center']) == pytest.approx(
+            np.dot(before['normal'], before['center']), abs=1e-12)
+    target = [p for p in planes if 116 <= np.mean(np.array(p['polygon_px'])[:, 0]) <= 208]
+    main = max(target, key=lambda p: p['inlier_count'])
+    assert abs(np.dot(main['normal'], [-.634, -.052, -.772])) > .99
+    assert main['inlier_count'] > 1000
+    for plane in planes:
+        ratio = plane['interior_support_ratio']
+        assert ratio is None or 0. <= ratio <= 1.
+        assert plane['depth_consistency_warning'] == (ratio is not None and ratio < .8)
+
+
+@pytest.mark.parametrize('noise', [.001, .003, .006, .010])
+def test_depth_interior_validation_keeps_a_noisy_true_plane(noise):
+    y, x = np.mgrid[0:320:4, 0:240:4]
+    pixels = np.c_[x.ravel(), y.ravel()]
+    z = 1.2+np.random.default_rng(25).normal(0, noise, x.size)
+    points = np.c_[(pixels[:, 0]-120)*z/500, (pixels[:, 1]-160)*z/500, z]
+    rgb = np.full((320, 240, 3), 180, np.uint8); rgb[:, 100:145] = 25
+    planes = extract_planes(points, pixels, pixel_stride=4, rgb=rgb,
+                            structure='hbeam', iterations=300)
+    assert len(planes) == 1
+    assert abs(planes[0]['normal'][2]) > .995
+    assert planes[0]['inlier_count'] > .75*len(points)
+
+
+@pytest.mark.parametrize('step', [.020, .026, .300])
+def test_depth_interior_validation_keeps_a_plane_behind_a_real_occluder(step):
+    y, x = np.mgrid[0:320:4, 0:240:4]
+    pixels = np.c_[x.ravel(), y.ravel()]
+    foreground = (abs(x-120) < 64) & (abs(y-160) < 96)
+    z = np.where(foreground, 1.2-step, 1.2).ravel()
+    points = np.c_[(pixels[:, 0]-120)*z/500, (pixels[:, 1]-160)*z/500, z]
+    planes = extract_planes(points, pixels, pixel_stride=4, structure='hbeam', iterations=300)
+    assert len(planes) == 2
+    np.testing.assert_allclose(sorted(p['center'][2] for p in planes), [1.2-step, 1.2], atol=1e-9)
+    if step == .020:
+        background = max(planes, key=lambda p: p['center'][2])
+        assert background['interior_support_ratio'] < .8
+        assert background['depth_consistency_warning']
+
+
+@pytest.mark.parametrize('narrow', [24, 40, 64])
+@pytest.mark.parametrize('noise', [.003, .004])
+def test_noisy_hbeam_crease_keeps_the_real_web(narrow, noise):
+    points, pixels, truth, normals, _ = _folded_beam(narrow=narrow)
+    rays = points/points[:, 2, None]
+    z = points[:, 2]+np.random.default_rng(55).normal(0, noise, len(points))
+    points = rays*z[:, None]
+    planes = extract_planes(points, pixels, pixel_stride=4,
+                            structure='hbeam', iterations=300)
+    assert len(planes) == 3
+    for label, expected in enumerate(normals):
+        target = pixels[truth == label]
+        plane = min(planes, key=lambda p: np.linalg.norm(
+            np.mean(p['polygon_px'], axis=0)-target.mean(axis=0)))
+        assert abs(np.dot(plane['normal'], expected)) > .995
+        assert plane['inlier_count'] >= .8*len(target)
+
+
+def test_reclaim_cannot_steal_a_narrow_faces_crease_samples():
+    from sketch_control.organized_planes import _lattice, _reclaim_support
+    y, x = np.mgrid[0:40, -20:4]
+    pixels = np.c_[4*x.ravel(), 4*y.ravel()]
+    first = x.ravel() < 0
+    z = np.where(first, 1., 1/(1-.008*x.ravel()))
+    points = np.c_[.008*x.ravel()*z, .008*y.ravel()*z, z]
+    xy, a, b = _lattice(pixels, 4)
+    segments = []
+    for mask, model in ((first, np.array([0., 0., 1., -1.])),
+                        (~first, np.array([-1., 0., 1., -1.])/np.sqrt(2))):
+        indices = np.flatnonzero(mask)
+        segments.append(dict(model=model, inlier_indices=indices,
+                             inlier_count=len(indices), rms_m=0.,
+                             segment_inlier_ratio=1., region_rms_m=0.))
+    refined = _reclaim_support(points, pixels, xy, a, b, np.ones(len(points), int),
+                               segments, .015, 80, 4)
+    assert len(refined) == 2
+    assert not np.intersect1d(refined[0]['inlier_indices'], refined[1]['inlier_indices']).size
+    assert set(refined[1]['inlier_indices']) >= set(segments[1]['inlier_indices'])

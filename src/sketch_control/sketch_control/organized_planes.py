@@ -1,8 +1,8 @@
 """Spatial support for plane fitting on an RGB/depth pixel lattice.
 
-Long image edges propose boundaries; depth geometry decides whether adjacent
-regions really differ. This prevents a global RANSAC hypothesis from consuming
-pieces of several narrow faces before the recessed face can be fitted.
+Depth geometry generates and validates every plane. Image edges may only
+refine ambiguous boundaries between existing planes; shadows cannot create
+plane candidates or partition the RANSAC input.
 """
 import cv2
 import numpy as np
@@ -142,14 +142,81 @@ def _residual_shard(points, pixels, group, segment, proposals, threshold):
     return False
 
 
+def _interior_quality(points, xy, support, group, model, threshold):
+    """Validate raw interior depth, including points RANSAC did not select.
+
+    Erode one sample at the contour to avoid mixed edge pixels. Other depth
+    components (occluders and gaps) are not evidence against this surface.
+    This measures geometric consistency, not camera confidence or accuracy.
+    """
+    width, height = xy.max(axis=0)+1
+    mask = np.zeros((height, width), dtype=np.uint8)
+    hull = cv2.convexHull(xy[support].astype(np.int32))
+    cv2.fillConvexPoly(mask, hull, 1)
+    mask = cv2.erode(mask, np.ones((3, 3), np.uint8),
+                     borderType=cv2.BORDER_CONSTANT, borderValue=0)
+    inside = group[mask[xy[group, 1], xy[group, 0]] != 0]
+    if len(inside) < 20:
+        return None, None
+    residual = abs(points[inside] @ model[:3]+model[3])
+    return float(np.mean(residual < threshold)), float(np.sqrt(np.mean(residual**2)))
+
+
+def _reclaim_support(points, pixels, xy, a, b, labels, segments,
+                     threshold, minimum, stride):
+    """Rejected hypotheses must not keep stealing a valid face's samples."""
+    best = np.full(len(points), np.inf)
+    owner = np.full(len(points), -1, dtype=int)
+    for i, segment in enumerate(segments):
+        support = segment['inlier_indices']
+        owner[support] = i
+        best[support] = abs(points[support] @ segment['model'][:3]+segment['model'][3])
+    available = owner < 0
+    groups = []
+    for i, segment in enumerate(segments):
+        group = np.flatnonzero(labels == labels[segment['inlier_indices'][0]])
+        groups.append(group)
+        model = segment['model']
+        residual = abs(points[group] @ model[:3]+model[3])
+        # Existing accepted faces keep their measured core. Only points freed
+        # by rejected hypotheses compete, so a fallback cannot overlap a peer.
+        take = available[group] & (residual < best[group])
+        owner[group[take]], best[group[take]] = i, residual[take]
+    out = []
+    for i, (group, segment) in enumerate(zip(groups, segments)):
+        active = (owner == i) & (best < threshold)
+        connected = _components(xy, a, b, active)
+        # Grow the original measured component, not another matching patch.
+        counts = np.bincount(connected[segment['inlier_indices']])
+        counts[0] = 0
+        if not counts.any():
+            out.append(segment)
+            continue
+        support = np.flatnonzero(active & (connected == counts.argmax()))
+        sides = cv2.minAreaRect(pixels[support].astype(np.float32))[1]
+        if (len(support) < minimum or min(sides) < 3*stride
+                or len(support)*stride**2/max(sides) < 3*stride):
+            out.append(segment)
+            continue
+        model = segment['model']
+        face_region = group[owner[group] == i]
+        residual = points[support] @ model[:3]+model[3]
+        region_residual = points[face_region] @ model[:3]+model[3]
+        out.append(dict(segment, inlier_indices=support, inlier_count=len(support),
+                        rms_m=float(np.sqrt(np.mean(residual**2))),
+                        segment_inlier_ratio=len(support)/len(face_region),
+                        global_inlier_ratio=len(support)/len(points),
+                        region_rms_m=float(np.sqrt(np.mean(region_residual**2)))))
+    return out
+
+
 def spatial_plane_segments(points, pixels, *, pixel_stride, rgb,
                            structure="generic", **fit_options):
     """Fit connected faces; returned indices refer to the original cloud.
 
-    RGB lines are extended only within the selected ROI. Coplanar neighbours
-    are rejoined, so a painted stripe alone cannot manufacture two work faces.
-    Only fitted inliers are returned, never the whole image region or a line's
-    extrapolated extent. Missing RGB still allows depth/connectivity splitting.
+    RANSAC and local normals use only depth-connected regions. RGB is used
+    after plane validation, within a narrow band of an existing boundary.
+    Only measured inliers are returned, never an extrapolated image region.
     """
     if len(points) == 0:
         return []
@@ -160,11 +227,7 @@ def spatial_plane_segments(points, pixels, *, pixel_stride, rgb,
     threshold = fit_options['distance_threshold']
     linked = _depth_links(points, xy, a, b, threshold)
     da, db = a[linked], b[linked]
-    boundaries = np.ones(len(da), dtype=bool)
-    for x1, y1, x2, y2 in _image_boundaries(rgb, pixels, stride):
-        side = (pixels[:, 0]-x1)*(y2-y1) - (pixels[:, 1]-y1)*(x2-x1)
-        boundaries &= side[da]*side[db] >= 0
-    labels = _components(xy, da[boundaries], db[boundaries],
+    labels = _components(xy, da, db,
                          np.ones(len(points), dtype=bool))
     minimum = fit_options['min_inliers']
     # All regions compete for the same bounded candidate budget.
@@ -184,7 +247,7 @@ def spatial_plane_segments(points, pixels, *, pixel_stride, rgb,
     # Local normal seeds preserve narrow folds whose full depth variation is
     # smaller than the RANSAC tolerance. They still need measured 2D support.
     from sketch_control.plane_normals import normal_seed_models
-    proposals.extend(normal_seed_models(points, xy, da[boundaries], db[boundaries],
+    proposals.extend(normal_seed_models(points, xy, da, db,
                                          groups, _components, threshold, minimum))
 
     # Multiple scales often propose the same face. Keep its most precise
@@ -223,49 +286,6 @@ def spatial_plane_segments(points, pixels, *, pixel_stride, rgb,
         # Suppress only similarly oriented, nearby shards of an observed long face.
         proposals = [(group, segment) for group, segment in distinct
                      if not _residual_shard(points, pixels, group, segment, distinct, threshold)]
-
-    # Merge only neighbours separated by an image edge, and only if both
-    # complete regions agree with the same plane. Depth gaps remain separate.
-    owner = np.full(len(points), -1, dtype=int)
-    best = np.full(len(points), threshold)
-    for i, (group, segment) in enumerate(proposals):
-        model = np.asarray(segment['model'])
-        residual = abs(points[group] @ model[:3]+model[3])
-        take = residual < best[group]
-        owner[group[take]] = i
-        best[group[take]] = residual[take]
-    pairs = np.unique(np.sort(np.c_[owner[da[~boundaries]],
-                                    owner[db[~boundaries]]], axis=1), axis=0)
-    parents = np.arange(len(proposals))
-
-    def root(index):
-        while parents[index] != index:
-            index = parents[index]
-        return index
-
-    for left, right in pairs:
-        if left < 0:
-            continue
-        left, right = root(left), root(right)
-        if left == right:
-            continue
-        ga, sa = proposals[left]
-        gb, sb = proposals[right]
-        ma, mb = np.asarray(sa['model']), np.asarray(sb['model'])
-        if abs(ma[:3] @ mb[:3]) < .985:
-            continue
-        if (np.percentile(abs(points[ga] @ mb[:3]+mb[3]), 95) > threshold
-                or np.percentile(abs(points[gb] @ ma[:3]+ma[3]), 95) > threshold):
-            continue
-        group = np.union1d(ga, gb)
-        normal, offset, rms = _refine_plane_svd(points[group])
-        residual = abs(points[group] @ normal+offset)
-        inside = np.flatnonzero(residual < threshold)
-        merged = dict(sa, model=np.r_[normal, offset], inlier_indices=inside,
-                      inlier_count=len(inside), rms_m=rms)
-        proposals[right] = (group, merged)
-        proposals[left] = None
-        parents[left] = right
 
     # Sequential RANSAC removes a tolerance band before the next face is
     # fitted. Reassign the original points jointly to competing models so a
@@ -312,4 +332,20 @@ def spatial_plane_segments(points, pixels, *, pixel_stride, rgb,
                                  segment_inlier_ratio=len(support)/len(face_region),
                                  global_inlier_ratio=len(support)/len(points),
                                  region_rms_m=float(np.sqrt(np.mean(region_residual**2)))))
-    return sorted(segments, key=lambda s: -s['inlier_count'])[:fit_options['max_planes']]
+    segments = sorted(segments, key=lambda s: -s['inlier_count'])
+    if structure == 'hbeam':
+        segments = _reclaim_support(points, pixels, xy, da, db, labels, segments,
+                                    threshold, minimum, stride)
+    segments = segments[:fit_options['max_planes']]
+    from sketch_control.plane_boundaries import refine_image_boundaries
+    segments = refine_image_boundaries(
+        points, pixels, segments, _image_boundaries(rgb, pixels, stride),
+        da, db, stride, threshold, minimum)
+    # Score the final measured footprint, including raw depth RANSAC rejected.
+    # This is diagnostic: a real occluder can legitimately lower hull coverage.
+    for segment in segments:
+        support = segment['inlier_indices']
+        group = np.flatnonzero(labels == labels[support[0]])
+        ratio, rms = _interior_quality(points, xy, support, group, segment['model'], threshold)
+        segment.update(interior_support_ratio=ratio, interior_rms_m=rms)
+    return segments

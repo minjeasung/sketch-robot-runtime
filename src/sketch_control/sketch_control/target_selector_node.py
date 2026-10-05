@@ -206,7 +206,8 @@ class TargetSelectorNode(Node):
                 plane["id"] = generation + ":" + str(index+1)
             payload = dict(generation=generation, frame_id=self.latest_depth_header.frame_id,
                            image_width=depth.shape[1], image_height=depth.shape[0], planes=planes,
-                           extraction_method="rgb_depth_regions" if rgb is not None else "depth_regions",
+                           extraction_method="depth_ransac_rgb_refined" if rgb is not None else "depth_ransac",
+                           extraction_version="geometry_first_v2",
                            structure=getattr(self, 'plane_structure', 'hbeam'))
         except (ValueError, TypeError, RuntimeError) as exc:
             payload = dict(generation=str(msg.header.stamp.sec*1_000_000_000+msg.header.stamp.nanosec),

@@ -49,8 +49,11 @@ function renderPlaneList() {
       redrawSketch();
     });
     const coverage = Math.round(100 * (plane.segment_inlier_ratio || 0));
-    const detail = plane.partial_support ? ` · 부분 검출 ${coverage}%` : "";
-    if (plane.partial_support) {
+    let detail = plane.partial_support ? ` · 부분 검출 ${coverage}%` : "";
+    if (plane.depth_consistency_warning) {
+      detail += " · 깊이 일치 부족";
+      label.title = "면 내부의 깊이 일부가 평면과 맞지 않습니다. 깊이 오차나 가림이 있을 수 있으니 면 경계를 확인하세요.";
+    } else if (plane.partial_support) {
       label.title = "영역 전체의 깊이가 한 평면에 맞지 않아, 측정으로 확인된 부분만 표시합니다.";
     }
     label.append(checkbox, swatch, document.createTextNode(`면 ${index + 1}${detail}`));
