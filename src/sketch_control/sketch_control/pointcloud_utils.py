@@ -224,7 +224,9 @@ def segment_planes_iterative_ransac(
             fit_indices = sor_fit_indices
 
         if fit_indices.shape[0] < minimum:
-            break
+            # Voxel sampling limits cost; it must not reject a small measured
+            # face that had enough original support before downsampling.
+            fit_indices = remaining
 
         try:
             model, _ = ransac_plane(

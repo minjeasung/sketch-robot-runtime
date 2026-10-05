@@ -47,13 +47,16 @@ def extract_planes(
         threshold=0.015, iterations=2000, voxel_size=0.01,
         sor_mean_k=12, sor_std_ratio=1.0, sor_max_points=3500,
         max_fit_points=7000, removal_threshold_scale=1.25,
-        min_global_inlier_ratio=0.02, seed=7, pixel_stride=None, rgb=None):
+        min_global_inlier_ratio=0.02, seed=7, pixel_stride=None, rgb=None,
+        structure="generic"):
     """Extract robust plane candidates while preserving sketch pixel support.
 
     Organized depth (pixel_stride supplied) uses connected RGB/depth regions
     before fitting, and splits disconnected inliers before constructing hulls.
     Unorganized clouds retain iterative RANSAC. Both preserve original support.
     """
+    if structure not in ("generic", "hbeam"):
+        raise ValueError("structure must be generic or hbeam")
     points = np.asarray(points, dtype=float)
     pixels = np.asarray(pixels, dtype=float)
     if points.shape != (len(pixels), 3) or pixels.shape[1:] != (2,):
@@ -78,7 +81,7 @@ def extract_planes(
     else:
         from sketch_control.organized_planes import spatial_plane_segments
         segments = spatial_plane_segments(points, pixels, pixel_stride=pixel_stride,
-                                          rgb=rgb, **fit_options)
+                                          rgb=rgb, structure=structure, **fit_options)
 
     planes = []
     for segment in segments:

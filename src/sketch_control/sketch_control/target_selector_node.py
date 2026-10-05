@@ -82,6 +82,9 @@ class TargetSelectorNode(Node):
         self.latest_depth_header = None
         self.latest_depth_received_at = 0.0
         self.rgb_frames = deque(maxlen=4)
+        self.plane_structure = self.declare_parameter("plane_structure", "hbeam").value
+        if self.plane_structure not in ("generic", "hbeam"):
+            raise ValueError("plane_structure must be generic or hbeam")
 
         self.create_subscription(
             CameraInfo, CAMERA_INFO_TOPIC, self._on_info, qos_profile_sensor_data)
@@ -185,6 +188,7 @@ class TargetSelectorNode(Node):
                 pixels,
                 pixel_stride=ROI_SAMPLE_STRIDE,
                 rgb=rgb,
+                structure=getattr(self, 'plane_structure', 'hbeam'),
                 max_planes=RANSAC_MAX_PLANES,
                 min_points=MIN_TARGET_POINTS,
                 threshold=RANSAC_DIST,
@@ -202,7 +206,8 @@ class TargetSelectorNode(Node):
                 plane["id"] = generation + ":" + str(index+1)
             payload = dict(generation=generation, frame_id=self.latest_depth_header.frame_id,
                            image_width=depth.shape[1], image_height=depth.shape[0], planes=planes,
-                           extraction_method="rgb_depth_regions" if rgb is not None else "depth_regions")
+                           extraction_method="rgb_depth_regions" if rgb is not None else "depth_regions",
+                           structure=getattr(self, 'plane_structure', 'hbeam'))
         except (ValueError, TypeError, RuntimeError) as exc:
             payload = dict(generation=str(msg.header.stamp.sec*1_000_000_000+msg.header.stamp.nanosec),
                            planes=[], error=str(exc))
