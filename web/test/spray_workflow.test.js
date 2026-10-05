@@ -121,12 +121,11 @@ test("raw target to ZED lock to frontal rectangle to generated and validated cov
   const ui = await selectTarget();
   const area = await selectArea(ui);
   assert.equal(ui.element("btn-fill-work-area").disabled, false);
-  assert.equal(ui.element("btn-execute").hidden, true);
+  assert.equal(ui.element("btn-execute").hidden, false);
   assert.equal(ui.element("btn-execute").disabled, true);
   assert.equal(ui.element("btn-run-robot").disabled, true);
   const before = ui.published.length;
   await ui.element("btn-execute").fire("click");
-  await ui.rectangle();
   assert.equal(ui.published.length, before);
   assert.equal(ui.evaluate("strokesMap.path.length"), 0);
   await ui.element("btn-fill-work-area").fire("click");
@@ -152,6 +151,85 @@ test("raw target to ZED lock to frontal rectangle to generated and validated cov
   assert.equal(ui.published.some(entry => entry.name === "/refine_work_area" || entry.name === "/sketch_pixels"), false);
   ui.emit("/perception/zed_surface_status", { ...area, state: "invalidated", accepted: false });
   assert.equal(ui.element("btn-run-robot").disabled, true);
+});
+
+test("spray manual line is sent for validation and editing preserves area but revokes Run", async () => {
+  const ui = await selectTarget();
+  const area = await selectArea(ui);
+  ui.frame('/perception/wall_front_view');
+  const radio = ui.queryAll('input[name="sketch-mode"]').find(r => r.value === 'line');
+  assert.equal(radio.disabled, false);
+  for (const r of ui.queryAll('input[name="sketch-mode"]')) r.checked = r === radio;
+  await radio.fire('change');
+  const canvas = ui.element('sketch-canvas');
+  for (const [x, y] of [[20, 20], [70, 50]]) {
+    await canvas.fire('pointerdown', {pointerId: 1, clientX: x, clientY: y});
+    await canvas.fire('pointerup', {pointerId: 1, clientX: x, clientY: y});
+  }
+  assert.equal(ui.evaluate('paintingDerivedState().surfaceAccepted'), true);
+  assert.equal(ui.element('btn-execute').disabled, false);
+  await ui.element('btn-execute').fire('click');
+  assert.equal(ui.published.at(-1).name, '/painting_system/zed_sketch_request');
+  const request = JSON.parse(ui.published.at(-1).message.data);
+  assert.equal(request.work_area_id, area.work_area_id);
+  assert.equal(request.plane_generation_id, area.plane_generation_id);
+  assert.equal(request.selection_id, area.selection_id);
+  assert.deepEqual(request.strokes, [[[20,20],[70,50]]]);
+  assert.equal(ui.published.some(p => p.name === '/sketch_execute'), false);
+  validate(ui);
+  assert.equal(ui.element('btn-run-robot').disabled, false);
+  await ui.element('btn-undo').fire('click');
+  assert.equal(ui.evaluate('paintingDerivedState().surfaceAccepted'), true);
+  assert.equal(ui.element('btn-run-robot').disabled, true);
+  ui.emit('/perception/zed_surface_status', area);
+  assert.equal(ui.element('btn-run-robot').disabled, true);
+});
+
+test("work area freehand sends the actual polygon as one generation-bound selection", async () => {
+  const ui = await selectTarget();
+  const radio = ui.queryAll('input[name="sketch-mode"]').find(r => r.value === 'freehand');
+  assert.equal(radio.disabled, false);
+  for (const r of ui.queryAll('input[name="sketch-mode"]')) r.checked = r === radio;
+  await radio.fire('change');
+  const canvas = ui.element('sketch-canvas');
+  await canvas.fire('pointerdown', {pointerId: 1, clientX: 10, clientY: 10});
+  for (const [x, y] of [[90, 10], [50, 70], [10, 10]])
+    await canvas.fire('pointermove', {pointerId: 1, clientX: x, clientY: y});
+  await canvas.fire('pointerup', {pointerId: 1, clientX: 10, clientY: 10});
+  assert.equal(ui.element('btn-set-work-area').disabled, false);
+  await ui.element('btn-set-work-area').fire('click');
+  const envelope = JSON.parse(ui.published.at(-2).message.data);
+  assert.deepEqual(envelope.pixels, [[10, 10], [90, 10], [50, 70]]);
+  assert.equal(ui.published.at(-1).message.poses.length, 3);
+});
+
+test("undo keeps earlier segments of a connected-line work boundary", async () => {
+  const ui = await selectTarget();
+  const radio = ui.queryAll('input[name="sketch-mode"]').find(r => r.value === 'line');
+  for (const r of ui.queryAll('input[name="sketch-mode"]')) r.checked = r === radio;
+  await radio.fire('change');
+  const canvas = ui.element('sketch-canvas');
+  for (const [x,y] of [[10,10],[90,10],[90,10],[50,70]]) {
+    await canvas.fire('pointerdown', {pointerId:1,clientX:x,clientY:y});
+    await canvas.fire('pointerup', {pointerId:1,clientX:x,clientY:y});
+  }
+  assert.equal(ui.evaluate('strokesMap.work_area.length'), 2);
+  await ui.element('btn-undo').fire('click');
+  assert.equal(ui.evaluate('strokesMap.work_area.length'), 1);
+  assert.equal(ui.element('btn-set-work-area').disabled, true);
+});
+
+test("spray rectangle path sends all four sides shown on the canvas", async () => {
+  const ui = await selectTarget();
+  await selectArea(ui);
+  ui.frame('/perception/wall_front_view');
+  const radio = ui.queryAll('input[name="sketch-mode"]').find(r => r.value === 'rect');
+  for (const r of ui.queryAll('input[name="sketch-mode"]')) r.checked = r === radio;
+  await radio.fire('change');
+  await ui.rectangle();
+  await ui.element('btn-execute').fire('click');
+  const request = JSON.parse(ui.published.at(-1).message.data);
+  assert.deepEqual(request.strokes, [[[10,10],[90,10],[90,70],[10,70],[10,10]]]);
 });
 
 test("ZED-only workflow generates a current preview but cannot publish robot execution", async () => {

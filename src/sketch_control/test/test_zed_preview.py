@@ -24,7 +24,7 @@ def msg(data):
     return String(data=json.dumps(data))
 
 
-def select_target(node):
+def select_target(node, polygon=False):
     selection = PoseArray()
     selection.header.stamp.sec = 12
     node.on_zed_target_selection(selection)
@@ -36,7 +36,7 @@ def select_target(node):
     assert node._zed_target_lock['accepted'] is True
     selection.header.frame_id = 'wall_front'
     selection.header.stamp.sec = 13
-    selection.poses = [Pose() for _ in range(4)]
+    selection.poses = [Pose() for _ in range(3 if polygon else 4)]
     node.on_zed_area_pixels(selection)
     lock = node._zed_target_lock
     area = dict(source='zed', mode='work_area', state='locked', accepted=True,
@@ -44,13 +44,17 @@ def select_target(node):
                 plane_generation_id=lock['plane_generation_id'], target_stamp=lock['stamp'],
                 frame_id='link0', position=[0.,0.,1.], orientation=[1.,0.,0.,0.],
                 corners=[[-.2,-.2,1.],[.2,-.2,1.],[.2,.2,1.],[-.2,.2,1.]])
+    if polygon:
+        area.update(boundary_pixels=[[0,0],[100,0],[50,100]],
+                    front_extent=area['corners'], view_width=101, view_height=101)
     node.on_zed_surface_status(msg(area))
     assert node._zed_plane_accepted
     return area
 
 
-def test_preview_can_select_and_generate_without_joint_state_or_force(preview):
-    area = select_target(preview)
+@pytest.mark.parametrize('polygon', [False, True])
+def test_preview_can_select_and_generate_without_joint_state_or_force(preview, polygon):
+    area = select_target(preview, polygon)
     plan = dict(state='generated', process_mode='spray', path_id='path-1', plan_hash='hash-1',
                 work_area_id=area['work_area_id'], plane_generation_id=area['plane_generation_id'])
     preview._on_plan_status(msg(plan))

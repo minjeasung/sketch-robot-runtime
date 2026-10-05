@@ -158,6 +158,34 @@
     const [a, b, c, d] = points;
     return b.u - a.u > 3 && d.v - a.v > 3 && a.v === b.v && b.u === c.u && c.v === d.v && d.u === a.u;
   }
+  function workAreaBoundary(strokes, width, height) {
+    if (!Array.isArray(strokes) || !strokes.length) return null;
+    if (rectangleReady(strokes, width, height)) return strokes[0].points;
+    const boundary = [];
+    const distance = (a, b) => Math.hypot(a.u-b.u, a.v-b.v);
+    for (const stroke of strokes) {
+      if (!['freehand', 'line'].includes(stroke.type) || !Array.isArray(stroke.points)) return null;
+      let points = stroke.points;
+      if (!points.length || !points.every(p => Number.isFinite(p.u) && Number.isFinite(p.v) &&
+          p.u >= 0 && p.v >= 0 && p.u < width && p.v < height)) return null;
+      if (boundary.length) {
+        if (distance(boundary.at(-1), points[0]) > 6) {
+          if (distance(boundary.at(-1), points.at(-1)) > 6) return null;
+          points = [...points].reverse();
+        }
+        points = points.slice(1);
+      }
+      for (const point of points)
+        if (!boundary.length || distance(boundary.at(-1), point) > 1e-8) boundary.push(point);
+    }
+    if (boundary.length > 2 && distance(boundary[0], boundary.at(-1)) <= 6) boundary.pop();
+    if (boundary.length < 3 || boundary.length > 1024) return null;
+    const area = boundary.reduce((sum, a, i) => {
+      const b = boundary[(i+1) % boundary.length];
+      return sum + a.u*b.v-a.v*b.u;
+    }, 0);
+    return Math.abs(area) >= 2 ? boundary : null;
+  }
   function previewPlanGenerated(surface, plan, readiness) {
     return readiness?.planning_only === true && plan?.state === "generated" &&
       readiness.checks?.current_plan_generated === true && matchesPlan(surface, plan, readiness, "spray");
@@ -178,6 +206,6 @@
     }
     return [...strokes.values()].filter(points => points.length >= 2);
   }
-  return { ZedSurfaceGate, stampPathId, matchesPlan, rectangleReady,
+  return { ZedSurfaceGate, stampPathId, matchesPlan, rectangleReady, workAreaBoundary,
     previewPlanGenerated, executionAllowed, previewStrokes };
 });

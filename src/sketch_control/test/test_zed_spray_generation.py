@@ -16,7 +16,7 @@ import pytest
 from rbpodo_painting_control import segment_path, spray_path
 from sketch_control import work_area_geometry
 from sketch_control.rotation_utils import quat_from_matrix, quat_to_matrix
-from sketch_control.zed_spray_projection import validate_target_lock
+from sketch_control.zed_spray_projection import validate_target_lock, stamp_ns
 from test_zed_spray_geometry import atomic_status
 
 
@@ -62,7 +62,7 @@ def generator(tmp_path):
                      MarkerArray=lambda: SimpleNamespace(markers=[]),
                      WORLD_FRAME="World", CAM_FRAME="camera", String=Message, PoseStamped=Message,
                      PoseArray=Message, Pose=lambda: Message().pose, quat_from_matrix=quat_from_matrix,
-                     validate_target_lock=validate_target_lock,
+                     validate_target_lock=validate_target_lock, stamp_ns=stamp_ns,
                      _quat_to_rot=lambda *q: quat_to_matrix(q), TransformException=RuntimeError)
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     node = namespace["SketchToWaypointsNode"].__new__(namespace["SketchToWaypointsNode"])
@@ -130,6 +130,17 @@ def pixels(sec=2):
 
 def send(callback, payload):
     callback(Message(data=json.dumps(payload)))
+
+
+def manual_request(node, message, **overrides):
+    strokes = node._group_surface_points(
+        [(p.position.x, p.position.y) for p in message.poses], node._stroke_ids_from_msg(message))
+    payload = dict(source='zed', header=dict(frame_id=message.header.frame_id,
+        stamp=vars(message.header.stamp)),
+        **{key: node.zed_surface_status[key] for key in ('plane_generation_id', 'work_area_id', 'selection_id')},
+        strokes=[[point.tolist() for point in stroke] for stroke in strokes])
+    payload.update(overrides)
+    return node._on_zed_sketch_request(Message(data=json.dumps(payload)))
 
 
 def generate(node, source=None):
@@ -203,6 +214,8 @@ def test_narrow_spray_publishes_center_preview_and_matching_world_path(generator
     assert nozzle_positions[:, 1].max() == pytest.approx(.5)
 
 
+
+
 @pytest.mark.parametrize("source", [dict(plane="zed", view="wall_front"),
     dict(plane="d405_refined", view="wall_front", coverage="auto_fill"),
     dict(plane="zed", view="zed_raw", coverage="auto_fill")])
@@ -211,9 +224,101 @@ def test_backend_rejects_non_auto_spray_sources(generator, source):
     assert not generator.segment_pub.messages
 
 
-def test_freehand_topic_cannot_trigger_spray(generator):
-    assert generator._on_sketch(pixels()) is None
-    assert json.loads(generator.plan_status_pub.messages[-1].data)["reason"] == "SPRAY_AUTO_COVERAGE_REQUIRED"
+def test_manual_spray_preserves_drawn_points_and_off_travel(generator):
+    message = pixels(sec=3)
+    message.poses = [SimpleNamespace(position=SimpleNamespace(x=u, y=v, z=s))
+                     for u, v, s in [(80, 80, 0), (240, 160, 0), (400, 80, 0),
+                                     (480, 240, 1), (720, 320, 1)]]
+    previews = []
+    generator._publish_fill_preview = lambda strokes, **kw: previews.append((strokes, kw))
+    path = manual_request(generator, message)
+    assert path is not None
+    assert path.source['coverage'] == 'manual_sketch'
+    rows = [row for row in path.rows if row.mode == 'SPRAY']
+    np.testing.assert_allclose([row.position for row in rows],
+        [[.1, .1, 0], [.3, .2, 0], [.5, .1, 0], [.6, .3, 0], [.9, .4, 0]])
+    assert [row.mode for row in path.rows] == [
+        'SPRAY_APPROACH', 'SPRAY', 'SPRAY', 'SPRAY', 'SPRAY_TRAVEL',
+        'SPRAY', 'SPRAY', 'SPRAY_FINISH']
+    assert all(row.force_n == 0 and row.offset_m == .5 for row in path.rows)
+    assert generator._stamp_path_id(previews[-1][1]['stamp']) == path.path_id
+    assert len(previews[-1][0]) == 2
+    segment_path.validate_segment_path_for_real_execution(path)
+
+
+def test_closed_freehand_spray_loop_is_not_a_stationary_stroke(generator):
+    message = pixels(sec=3)
+    message.poses.append(copy.deepcopy(message.poses[0]))
+    path = manual_request(generator, message)
+    assert path is not None
+    assert len([row for row in path.rows if row.mode == 'SPRAY']) == 5
+
+
+def test_manual_spray_rejects_outside_area_before_publication(generator):
+    message = pixels(sec=3)
+    message.poses[1].position.x = 900
+    assert manual_request(generator, message) is None
+    assert not generator.segment_pub.messages
+    assert json.loads(generator.plan_status_pub.messages[-1].data)['reason'] == 'PATH_OUTSIDE_WORK_AREA_2D'
+
+
+def polygon_area(generator):
+    boundary = [[0, 0], [800, 0], [800, 400], [560, 400],
+                [560, 160], [240, 160], [240, 400], [0, 400]]
+    generator.zed_surface_status['boundary_pixels'] = boundary
+    generator.latest_work_area_pixels.poses = [
+        SimpleNamespace(position=SimpleNamespace(x=u, y=v, z=0.)) for u, v in boundary]
+
+
+def test_manual_segment_cannot_cross_an_unselected_concave_gap(generator):
+    polygon_area(generator)
+    message = pixels(sec=3)
+    message.poses = [SimpleNamespace(position=SimpleNamespace(x=u, y=320., z=0.))
+                     for u in (80., 720.)]
+    assert manual_request(generator, message) is None
+    assert not generator.segment_pub.messages
+
+
+def test_auto_fill_clips_passes_and_preview_to_polygon(generator):
+    polygon_area(generator)
+    previews = []
+    generator._publish_fill_preview = lambda strokes, **kw: previews.append(strokes)
+    generator._on_fill_work_area(None)
+    payload = json.loads(generator.segment_pub.messages[-1].data)
+    middle = [r for r in payload['rows'] if r['mode'] == 'SPRAY' and .3 < r['x'] < .7]
+    assert middle and all(r['y'] <= .2+1e-8 for r in middle)
+    assert all(v <= 160+1e-8 for stroke in previews[-1] for u, v in stroke if 240 < u < 560)
+
+
+def test_polygon_status_must_match_selected_pixels_not_just_their_box(generator):
+    polygon_area(generator)
+    generator.zed_surface_status['boundary_pixels'][4] = [560, 200]
+    assert generate(generator) is None
+
+
+@pytest.mark.parametrize('field', ['plane_generation_id', 'work_area_id', 'selection_id'])
+def test_manual_request_from_previous_selection_cannot_use_current_geometry(generator, field):
+    assert manual_request(generator, pixels(sec=3), **{field:'previous'}) is None
+    assert not generator.segment_pub.messages
+
+
+def test_bare_spray_pixels_have_no_selection_identity(generator):
+    assert generator._on_sketch(pixels(sec=3)) is None
+    assert not generator.segment_pub.messages
+
+
+def test_delayed_manual_request_cannot_replace_a_newer_request(generator):
+    assert manual_request(generator, pixels(sec=4)) is not None
+    count = len(generator.segment_pub.messages)
+    assert manual_request(generator, pixels(sec=3)) is None
+    assert len(generator.segment_pub.messages) == count
+
+
+@pytest.mark.parametrize('strokes', [[], [[]], [[[10, 10]]], [[[True, 10], [20, 20]]],
+    [[[10, float('nan')], [20, 20]]], [[[10, 10], [10, 10]]]])
+def test_malformed_or_stationary_manual_request_is_rejected(generator, strokes):
+    assert manual_request(generator, pixels(sec=3), strokes=strokes) is None
+    assert not generator.segment_pub.messages
 
 
 @pytest.mark.parametrize("missing", ["zed_surface_status", "zed_target_lock", "latest_work_area_pixels"])

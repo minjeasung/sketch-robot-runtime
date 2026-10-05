@@ -66,7 +66,7 @@ from rbpodo_painting_control.spray_eoat import (
     load_spray_eoat_profile, compensate_spray_endpoint,
 )
 from sketch_control.rotation_utils import quat_from_matrix, quat_to_matrix
-from sketch_control.zed_spray_projection import validate_target_lock
+from sketch_control.zed_spray_projection import validate_target_lock, stamp_ns
 from sketch_control.work_area_geometry import (
     WorkAreaGeometryError,
     bilinear_quad_point,
@@ -77,6 +77,7 @@ from sketch_control.work_area_geometry import (
     pixel_rect_from_points,
     quad_size_m,
     validate_zed_surface_status,
+    work_area_polygon, strokes_inside_polygon, clip_strokes_to_polygon,
 )
 
 
@@ -321,6 +322,8 @@ class SketchToWaypointsNode(Node):
             QoSProfile(depth=1))
         self.create_subscription(
             PoseArray, SKETCH_PIXELS_TOPIC, self._on_sketch, 10)
+        self.create_subscription(String, "/painting_system/zed_sketch_request",
+                                 self._on_zed_sketch_request, 10)
         self.create_subscription(
             Empty, FILL_WORK_AREA_TOPIC, self._on_fill_work_area, 10)
         self.create_subscription(
@@ -714,6 +717,14 @@ class SketchToWaypointsNode(Node):
                 boundary_tolerance_px=getattr(self, "work_area_pixel_tolerance_px", 1.0),
             )
             u0, v0, u1, v1 = rect
+            selected = work_area_polygon(
+                [(pose.position.x, pose.position.y) for pose in pixels.poses],
+                status["view_width"], status["view_height"])
+            boundary = work_area_polygon(status.get("boundary_pixels",
+                [[u0, v0], [u1, v0], [u1, v1], [u0, v1]]),
+                status["view_width"], status["view_height"])
+            if selected.shape != boundary.shape or not np.allclose(selected, boundary, atol=1e-6, rtol=0.):
+                return None
             expected = [bilinear_quad_point(
                 status["front_extent"], u / (status["view_width"] - 1),
                 v / (status["view_height"] - 1))
@@ -853,14 +864,63 @@ class SketchToWaypointsNode(Node):
             self.get_logger().info(
                 f"wall_front view size 갱신: {self.view_w}x{self.view_h}")
 
-    def _on_sketch(self, msg: PoseArray, *, _spray_fill=False):
+    def _on_zed_sketch_request(self, msg: String):
+        """Bind manual pixels to the exact area displayed when they were drawn."""
+        if self.process_mode != "spray":
+            return
+        try:
+            payload = json.loads(msg.data)
+            status = self._accepted_zed_work_area()
+            if not isinstance(payload, dict) or payload.get("source") != "zed":
+                raise ValueError("manual path requires a ZED request")
+            if status is None:
+                raise ValueError("manual path requires an accepted ZED work area")
+            if any(payload.get(key) != status[key] for key in
+                   ("plane_generation_id", "work_area_id", "selection_id")):
+                return  # A retired request cannot invalidate a newer plan.
+            header = payload.get("header")
+            if not isinstance(header, dict) or header.get("frame_id") != "wall_front":
+                raise ValueError("manual path must use Wall Front pixels")
+            stamp = header.get("stamp")
+            request_id = stamp_ns(stamp)
+            if stamp["sec"] > 2_147_483_647:
+                raise ValueError("manual path stamp is outside ROS Time range")
+            key = (status["plane_generation_id"], status["work_area_id"], status["selection_id"])
+            previous_key, previous_id = getattr(self, "_latest_manual_request", (None, 0))
+            if key == previous_key and request_id <= previous_id:
+                return
+            self._latest_manual_request = (key, request_id)
+            strokes = payload.get("strokes")
+            if (not isinstance(strokes, list) or not strokes or len(strokes) > 1000
+                    or any(not isinstance(s, list) or len(s) < 2 for s in strokes)
+                    or sum(map(len, strokes)) > 10000):
+                raise ValueError("manual path requires nonempty strokes (up to 10000 points)")
+            pixels = PoseArray()
+            pixels.header.frame_id = "wall_front"
+            pixels.header.stamp.sec, pixels.header.stamp.nanosec = stamp["sec"], stamp["nanosec"]
+            for index, stroke in enumerate(strokes):
+                for point in stroke:
+                    if (not isinstance(point, list) or len(point) != 2
+                            or any(type(v) not in (int, float) or not math.isfinite(v) for v in point)):
+                        raise ValueError("manual path pixels must be finite numeric pairs")
+                    pose = Pose()
+                    pose.position.x, pose.position.y, pose.position.z = float(point[0]), float(point[1]), float(index)
+                    pose.orientation.w = 1.
+                    pixels.poses.append(pose)
+        except (ValueError, TypeError, OverflowError) as exc:
+            self._publish_fill_preview(())
+            self._publish_plan_status("rejected", reason="SPRAY_MANUAL_REQUEST_INVALID", detail=str(exc))
+            return
+        return self._on_sketch(pixels, _spray_manual=True)
+
+    def _on_sketch(self, msg: PoseArray, *, _spray_fill=False, _spray_manual=False):
         # A fill preview represents an executable backend plan, not merely a
         # raster candidate. Any new path attempt invalidates the old preview;
         # the fill callback republishes it only after this method succeeds.
         self._publish_fill_preview((), stamp=msg.header.stamp)
         spray = getattr(self, "process_mode", "paint") == "spray"
-        if spray and not _spray_fill:
-            self._publish_plan_status("rejected", reason="SPRAY_AUTO_COVERAGE_REQUIRED")
+        if spray and not (_spray_fill or _spray_manual):
+            self._publish_plan_status("rejected", reason="SPRAY_BOUND_PATH_REQUIRED")
             return
         zed_status = self._accepted_zed_work_area() if spray else None
         if spray and zed_status is None:
@@ -1036,14 +1096,18 @@ class SketchToWaypointsNode(Node):
                 "view": view,
                 "plane": work_area_source,
                 "surface_point_count": len(surface_points),
-                **({"coverage": "auto_fill"} if spray else {}),
+                **({"coverage": "auto_fill" if _spray_fill else "manual_sketch"} if spray else {}),
             },
+            **({"spray_pixels": self._group_surface_points(pixels, stroke_ids)}
+               if spray and not _spray_fill else {}),
         )
         if path is None:
             return
         out = self._compat_pose_array_from_segment(path, stamp)
         self.pub.publish(out)
         self._publish_segment_markers(path, stamp)
+        if spray and not _spray_fill:
+            self._publish_fill_preview(self._group_surface_points(pixels, stroke_ids), stamp=stamp)
 
         self.get_logger().info(
             f"{len(out.poses)} waypoints published "
@@ -1074,6 +1138,11 @@ class SketchToWaypointsNode(Node):
                 strokes = generate_spray_fill_strokes(
                     rect, work_area_width_m=width_m, work_area_height_m=height_m,
                     footprint_width_m=footprint, overlap=overlap)
+                boundary = self.zed_surface_status.get("boundary_pixels")
+                if boundary is not None:
+                    strokes = clip_strokes_to_polygon(strokes, boundary)
+                if not strokes:
+                    raise WorkAreaGeometryError("no fill pass intersects the selected work area; draw a manual path")
             else:
                 footprint, overlap = self.roller_length_m, self.fill_overlap
                 strokes = generate_fill_strokes(
@@ -1239,7 +1308,7 @@ class SketchToWaypointsNode(Node):
         self._publish_marker_clear(self.eoat_segment_frame or WORLD_FRAME)
 
     def _publish_eoat_segments(
-        self, strokes, normal_world, fallback_tangent, path_id, source
+        self, strokes, normal_world, fallback_tangent, path_id, source, *, spray_pixels=None
     ):
         if not getattr(self, "publish_eoat_segments", True):
             self._publish_plan_status(
@@ -1252,9 +1321,9 @@ class SketchToWaypointsNode(Node):
         work_area_id, plane_generation_id = context
         spray = getattr(self, "process_mode", "paint") == "spray"
         if spray:
-            if (source.get("coverage") != "auto_fill" or source.get("plane") != "zed"
+            if (source.get("coverage") not in {"auto_fill", "manual_sketch"} or source.get("plane") != "zed"
                     or source.get("view") != "wall_front"):
-                self._publish_plan_status("rejected", reason="SPRAY_AUTO_COVERAGE_REQUIRED")
+                self._publish_plan_status("rejected", reason="SPRAY_ZED_PATH_REQUIRED")
                 return None
             try:
                 spray_profile = load_spray_eoat_profile(
@@ -1268,7 +1337,11 @@ class SketchToWaypointsNode(Node):
                     "rejected", reason="SPRAY_EOAT_PROFILE_INVALID", detail=str(exc))
                 return None
             try:
-                strokes, normal_world, fallback_tangent = self._spray_coverage_world()
+                manual = source.get("coverage") == "manual_sketch"
+                if manual and spray_pixels is None:
+                    raise ValueError("manual spray requires Wall Front pixel strokes")
+                strokes, normal_world, fallback_tangent = self._spray_coverage_world(
+                    spray_pixels if manual else None)
             except (ValueError, TransformException) as exc:
                 self._publish_plan_status("rejected", reason="SPRAY_COVERAGE_INVALID", detail=str(exc))
                 return None
@@ -1541,8 +1614,8 @@ class SketchToWaypointsNode(Node):
         )
         return path
 
-    def _spray_coverage_world(self):
-        """Rebuild spray strokes from the atomic surface, never caller geometry."""
+    def _spray_coverage_world(self, pixel_strokes=None):
+        """Map fill or manual pixels through the accepted atomic ZED surface."""
         status = self._accepted_zed_work_area()
         if status is None:
             raise WorkAreaGeometryError("accepted selected ZED work area is required")
@@ -1551,7 +1624,18 @@ class SketchToWaypointsNode(Node):
             self.latest_work_area_rect_px,
             work_area_width_m=width, work_area_height_m=height,
             footprint_width_m=self.spray_footprint_width_m, overlap=self.spray_overlap,
-        )
+        ) if pixel_strokes is None else pixel_strokes
+        boundary = status.get("boundary_pixels")
+        if boundary is not None:
+            if pixel_strokes is None:
+                pixels = clip_strokes_to_polygon(pixels, boundary)
+            elif not strokes_inside_polygon(pixels, boundary):
+                raise WorkAreaGeometryError("drawn spray path leaves the selected boundary")
+        if not pixels or any(len(stroke) < 2 for stroke in pixels):
+            raise WorkAreaGeometryError("spray requires strokes with at least two points")
+        if any(outside_pixel_rect_indices(stroke, self.latest_work_area_rect_px,
+                                         tolerance_px=0.) for stroke in pixels):
+            raise WorkAreaGeometryError("spray path is outside the accepted work area")
         rotation, translation = np.eye(3), np.zeros(3)
         if status["frame_id"] != WORLD_FRAME:
             transform = self.tf_buffer.lookup_transform(
