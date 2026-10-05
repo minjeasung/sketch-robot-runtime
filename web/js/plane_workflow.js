@@ -48,12 +48,7 @@ function renderPlaneList() {
       renderPlaneList();
       redrawSketch();
     });
-    const coverage = Math.round(100 * (plane.segment_inlier_ratio || 0));
-    const detail = plane.partial_support ? ` · 부분 검출 ${coverage}%` : "";
-    if (plane.partial_support) {
-      label.title = "영역 전체의 깊이가 한 평면에 맞지 않아, 측정으로 확인된 부분만 표시합니다.";
-    }
-    label.append(checkbox, swatch, document.createTextNode(`면 ${index + 1}${detail}`));
+    label.append(checkbox, swatch, document.createTextNode(`면 ${index + 1}`));
     list.append(label);
   });
   $("btn-refine-planes").textContent = spray ? "선택한 ZED 면 확정" : "선택한 면 D405 측정";

@@ -15,7 +15,6 @@ target_selector_node — ZED 전역 이미지 위 사용자 스케치로 작업�
 """
 import json
 import time
-from collections import deque
 import numpy as np
 from std_msgs.msg import String
 from sketch_control.multi_plane_geometry import polygon_mask, extract_planes
@@ -31,7 +30,6 @@ from sketch_control.pointcloud_utils import ransac_plane
 TARGET_SELECTION_TOPIC = "/target_selection_pixels"
 DEPTH_TOPIC = "/zed/zed_node/depth/depth_registered"
 CAMERA_INFO_TOPIC = "/zed/zed_node/depth/camera_info"
-RGB_TOPIC = "/zed/zed_node/rgb/color/rect/image"
 TARGET_SURFACE_TOPIC = "/perception/target_surface"
 
 ROI_PADDING_PX = 16
@@ -81,7 +79,6 @@ class TargetSelectorNode(Node):
         self.latest_depth = None
         self.latest_depth_header = None
         self.latest_depth_received_at = 0.0
-        self.rgb_frames = deque(maxlen=4)
 
         self.create_subscription(
             CameraInfo, CAMERA_INFO_TOPIC, self._on_info, qos_profile_sensor_data)
@@ -89,8 +86,6 @@ class TargetSelectorNode(Node):
             "zed_image_reliable", False).value else qos_profile_sensor_data
         self.create_subscription(
             Image, DEPTH_TOPIC, self._on_depth, depth_qos)
-        self.create_subscription(
-            Image, RGB_TOPIC, self._on_rgb, depth_qos)
         self.create_subscription(
             PoseArray, TARGET_SELECTION_TOPIC, self._on_selection, 10)
 
@@ -111,37 +106,6 @@ class TargetSelectorNode(Node):
             self.latest_depth_received_at = time.monotonic()
         except Exception as e:
             self.get_logger().warn(f"depth decode 실패: {e}")
-
-    def _on_rgb(self, msg: Image):
-        try:
-            channels = {'rgb8': 3, 'bgr8': 3, 'rgba8': 4, 'bgra8': 4,
-                        'mono8': 1}.get(msg.encoding)
-            if channels is None:
-                raise ValueError(f"unsupported RGB encoding: {msg.encoding}")
-            rows = np.frombuffer(msg.data, np.uint8).reshape(msg.height, msg.step)
-            rgb = rows[:, :msg.width*channels].reshape(msg.height, msg.width, channels)
-            if channels == 1:
-                rgb = np.repeat(rgb, 3, axis=2)
-            else:
-                rgb = rgb[:, :, :3]
-                if msg.encoding.startswith('bgr'):
-                    rgb = rgb[:, :, ::-1]
-            stamp = msg.header.stamp.sec*1_000_000_000 + msg.header.stamp.nanosec
-            self.rgb_frames.append((stamp, rgb.copy()))
-        except (ValueError, TypeError) as exc:
-            self.get_logger().warn(f"RGB decode 실패: {exc}")
-
-    def _rgb_for_depth(self):
-        frames = getattr(self, 'rgb_frames', ())
-        header = self.latest_depth_header
-        if not frames or not hasattr(header, 'stamp'):
-            return None
-        stamp = header.stamp.sec*1_000_000_000 + header.stamp.nanosec
-        frame_stamp, rgb = min(frames, key=lambda item: abs(item[0]-stamp))
-        if (stamp <= 0 or abs(frame_stamp-stamp) > 80_000_000
-                or rgb.shape[:2] != self.latest_depth.shape):
-            return None
-        return rgb
 
     def _on_selection(self, msg: PoseArray):
         if (msg.header.frame_id or "") != "zed_raw":
@@ -179,12 +143,9 @@ class TargetSelectorNode(Node):
             pixels, z = pixels[valid], z[valid]
             points = np.column_stack(((pixels[:,0]-self.K[0,2])*z/self.K[0,0],
                                       (pixels[:,1]-self.K[1,2])*z/self.K[1,1], z))
-            rgb = self._rgb_for_depth()
             planes = extract_planes(
                 points,
                 pixels,
-                pixel_stride=ROI_SAMPLE_STRIDE,
-                rgb=rgb,
                 max_planes=RANSAC_MAX_PLANES,
                 min_points=MIN_TARGET_POINTS,
                 threshold=RANSAC_DIST,
@@ -201,8 +162,7 @@ class TargetSelectorNode(Node):
             for index, plane in enumerate(planes):
                 plane["id"] = generation + ":" + str(index+1)
             payload = dict(generation=generation, frame_id=self.latest_depth_header.frame_id,
-                           image_width=depth.shape[1], image_height=depth.shape[0], planes=planes,
-                           extraction_method="rgb_depth_regions" if rgb is not None else "depth_regions")
+                           image_width=depth.shape[1], image_height=depth.shape[0], planes=planes)
         except (ValueError, TypeError, RuntimeError) as exc:
             payload = dict(generation=str(msg.header.stamp.sec*1_000_000_000+msg.header.stamp.nanosec),
                            planes=[], error=str(exc))
