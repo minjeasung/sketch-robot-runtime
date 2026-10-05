@@ -2,12 +2,12 @@
 
 2026-10-05 현장 비교용으로 저장한 **버전별 스냅샷**이다. GitHub에서는 `plane-extraction/*` 보관 브랜치로,
 이 PC에서는 동일한 이름의 로컬 태그와 복구용 번들로 보관한다.
-번호가 높다고 성능이 좋은 것은 아니다. 사용자가 원본 RANSAC으로 복원하도록 선택했다.
+번호가 높다고 성능이 좋은 것은 아니다. 현재 선택한 실행 버전은 **v0 (RGB 경계 우선)**이다.
 
 | 이름 | 보관 브랜치 / 로컬 태그 | 평면 추출 방식 |
 |---|---|---|
 | base | `plane-extraction/base` | Git `f0f5fc9`의 원본. 선택 영역 전체 깊이에 반복 RANSAC 적용. RGB 경계 분할 없음. |
-| v0 | `plane-extraction/v0` | 최근 두 수정 직전. RGB 직선과 깊이 연결 영역으로 나눈 뒤 RANSAC 피팅. |
+| v0 | `plane-extraction/v0` | RGB 경계 우선. RGB 직선과 깊이 연결 영역으로 나눈 뒤 RANSAC 피팅. |
 | v1 | `plane-extraction/v1` | H형강 보강. 국소 법선 후보, 좁은 면의 지지점 배정, 잔여 조각 억제. |
 | v2 | `plane-extraction/v2` | 깊이 RANSAC 우선. RGB는 기존 면 사이 경계만 보정. 깊이 일치 진단 표시. |
 
@@ -25,13 +25,16 @@ v0/v1은 수정 직전의 실제 파일 백업에서, v2는 사용자가 비교�
 ```bash
 python3 scripts/plane_versions.py list
 python3 scripts/plane_versions.py status
-python3 scripts/plane_versions.py switch base --dry-run
-python3 scripts/plane_versions.py switch base
-# 비교할 때 base 대신 v0, v1, v2를 사용한다.
+python3 scripts/plane_versions.py switch v0 --dry-run
+python3 scripts/plane_versions.py switch v0
+# 비교할 때 v0 대신 base, v1, v2를 사용한다.
 ```
 
 전환 범위는 `config/plane_extraction_versions.json`에 기록된 평면 관련 파일뿐이다.
 다른 작업 파일, 현재 브랜치, Git 스테이징 상태는 유지한다.
+브라우저 UI는 공통으로 유지한다. 대상 영역의 되돌리기·모두 지우기는 평면 목록과 선택도 지우고,
+취소된 요청의 늦은 응답을 무시한다. 알고리즘 전환은 이 삭제 동작을 되돌리지 않는다.
+작업영역·경로 단계의 되돌리기는 해당 스케치만 수정하며 대상 평면은 유지한다.
 로컬 태그가 없으면 `origin/plane-extraction/*` 보관 브랜치를 읽는다.
 기록되지 않은 수정이나 혼합 상태가 있으면 전환을 거부한다. 먼저 새 버전을 저장해야 한다.
 버전에 없는 실험 파일은 전환 시 제거되지만 해당 태그에 복원 가능한 원본이 남는다.

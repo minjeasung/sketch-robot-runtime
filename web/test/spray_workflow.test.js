@@ -5,8 +5,8 @@ const assert = require("node:assert/strict");
 const { loadUI } = require("./ui_harness.js");
 const corners = [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]];
 const lock = {
-  source: "zed", state: "locked", accepted: true, catalog_generation: "catalog-1", plane_id: "plane-1",
-  plane_generation_id: "zed:catalog-1:plane-1:1750000000123456789", frame_id: "map",
+  source: "zed", state: "locked", accepted: true, catalog_generation: "1000000000", plane_id: "plane-1",
+  plane_generation_id: "zed:1000000000:plane-1:1750000000123456789", frame_id: "map",
   center: [0.5, 0.5, 1], normal: [0, 0, 1], corners, stamp: { sec: 1750000000, nanosec: 123456789 },
 };
 const target = {
@@ -22,21 +22,22 @@ const readiness = {
 
 async function selectTarget(browserTimeMs, planningOnly = false) {
   const ui = loadUI();
-  if (browserTimeMs !== undefined) ui.evaluate(`Date.now = () => ${browserTimeMs}`);
+  ui.evaluate("Date.now = () => 1000");
   ui.ros.emit("connection");
   ui.emit("/painting_system/process_mode", { mode: "spray", planning_only: planningOnly });
   ui.frame("/zed/zed_node/rgb/color/rect/image");
   await ui.rectangle();
   await ui.element("btn-set-target").fire("click");
   assert.equal(ui.published.at(-1).name, "/target_selection_pixels");
-  ui.emit("/perception/target_planes", { generation: "catalog-1", planes: [{ id: "plane-1", corners }] });
+  if (browserTimeMs !== undefined) ui.evaluate(`Date.now = () => ${browserTimeMs}`);
+  ui.emit("/perception/target_planes", { generation: "1000000000", planes: [{ id: "plane-1", corners }] });
   const checkbox = ui.element("plane-candidates").children[0].children[0];
   checkbox.checked = true;
   await checkbox.fire("change");
   await ui.element("btn-refine-planes").fire("click");
-  assert.deepEqual(JSON.parse(ui.published.at(-1).message.data), { generation: "catalog-1", ids: ["plane-1"] });
+  assert.deepEqual(JSON.parse(ui.published.at(-1).message.data), { generation: "1000000000", ids: ["plane-1"] });
   ui.emit("/perception/zed_target_lock", lock);
-  ui.emit("/painting_system/planes", { source: "zed", generation: "catalog-1", selected: ["plane-1"], measured: ["plane-1"], state: "ready", active_id: "plane-1", running: false });
+  ui.emit("/painting_system/planes", { source: "zed", generation: "1000000000", selected: ["plane-1"], measured: ["plane-1"], state: "ready", active_id: "plane-1", running: false });
   ui.emit("/perception/zed_surface_status", { ...target, accepted: false, state: "invalidated", plane_generation_id: "" });
   ui.emit("/perception/zed_surface_status", target);
   assert.equal(ui.evaluate("workflowMode"), "work_area");

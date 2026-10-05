@@ -902,8 +902,10 @@ function refreshPaintingUI() {
   $("btn-fill-work-area").textContent = spray ? "자동 도포 경로 생성" : "영역 자동 채우기";
   $("btn-fill-work-area").disabled = !pathGate;
   $("btn-run-robot").disabled = planningOnly || !rosConnected || !derived.ready || stopRequested;
-  $("btn-clear").disabled = derived.running || cs.length === 0;
-  $("btn-undo").disabled = derived.running || cs.length === 0;
+  const targetExtraction = workflowMode === "target" &&
+    typeof hasPlaneExtraction === "function" && hasPlaneExtraction();
+  $("btn-clear").disabled = derived.running || (cs.length === 0 && !targetExtraction);
+  $("btn-undo").disabled = derived.running || (cs.length === 0 && !targetExtraction);
   $("free-space-confirmed").disabled = !rosConnected || derived.running || Boolean(derived.abortReason);
   $("btn-stop-robot").disabled = planningOnly || !rosConnected;
   $("btn-stop-robot").hidden = planningOnly;
@@ -1386,9 +1388,9 @@ sketchCanvas.addEventListener("pointerdown", (ev) => {
   const c = getNativeCoords(ev);
   currentMouse = c;
   paintingState.local.unsentInputEdit = true;
+  if (workflowMode === "target") invalidateTargetPlanes("target edited");
   if (processMode === "spray") {
-    if (workflowMode === "target") invalidateSelection("ZED target edited");
-    else {
+    if (workflowMode === "work_area") {
       zedSelection.clearWorkArea();
       paintingState.local.planeInvalidated = true;
       paintingState.local.selectionIdentityPending = true;
@@ -1519,7 +1521,8 @@ $("btn-clear").addEventListener("click", () => {
   pendingLine = null;
   pendingRect = null;
   currentStroke = null;
-  if (processMode === "spray") invalidateSelection("ZED selection cleared", workflowMode === "target");
+  if (workflowMode === "target") invalidateTargetPlanes("target cleared");
+  else if (processMode === "spray" && workflowMode === "work_area") invalidateSelection("ZED selection cleared", false);
   invalidatePlanLocally(`${workflowMode} cleared`, false);
   redrawSketch();
 });
@@ -1527,10 +1530,11 @@ $("btn-clear").addEventListener("click", () => {
 $("btn-undo").addEventListener("click", () => {
   if (paintingDerivedState().running) return;
   const cs = currentStrokes();
-  if (cs.length > 0) {
+  if (cs.length > 0 || (workflowMode === "target" && hasPlaneExtraction())) {
     cs.pop();
     paintingState.local.unsentInputEdit = true;
-    if (processMode === "spray") invalidateSelection("ZED selection undone", workflowMode === "target");
+    if (workflowMode === "target") invalidateTargetPlanes("target undone");
+    else if (processMode === "spray") invalidateSelection("ZED selection undone", false);
     invalidatePlanLocally(`${workflowMode} undo`, false);
     redrawSketch();
   }
@@ -1755,6 +1759,7 @@ $("btn-set-target").addEventListener("click", () => {
   // race the target surface across two DDS topics and could refine the old
   // target instead.
   const selectionStamp = nowRosTime();
+  beginPlaneExtraction(selectionStamp);
   clearTargetRefineWait();
   if (publishPixels(
     targetSelectionPub,
@@ -1767,6 +1772,7 @@ $("btn-set-target").addEventListener("click", () => {
   } else {
     clearTargetRefineWait();
     paintingState.targetSelectionState = "rejected";
+    clearPlaneSelection(true);
     logEvent("target selection has no pixels; D405 refinement was not armed");
   }
   refreshPaintingUI();

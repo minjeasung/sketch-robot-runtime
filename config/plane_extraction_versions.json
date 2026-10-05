@@ -13,8 +13,7 @@
     "src/sketch_control/test/test_hbeam_planes.py",
     "src/sketch_control/test/test_organized_plane_extraction.py",
     "src/sketch_control/test/test_plane_boundary_refinement.py",
-    "src/sketch_control/test/test_target_rgb_pairing.py",
-    "web/js/plane_workflow.js"
+    "src/sketch_control/test/test_target_rgb_pairing.py"
   ],
   "versions": {
     "base": {
@@ -24,7 +23,7 @@
     },
     "v0": {
       "ref": "refs/tags/plane-extraction/v0",
-      "label": "최근 두 수정 전: RGB 경계 분할 + RANSAC",
+      "label": "RGB 경계 우선: RGB·깊이 영역 분할 + RANSAC",
       "source": "첫 H형강 수정 적용 직전 백업"
     },
     "v1": {

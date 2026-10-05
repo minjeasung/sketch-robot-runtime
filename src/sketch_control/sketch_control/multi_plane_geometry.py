@@ -47,20 +47,19 @@ def extract_planes(
         threshold=0.015, iterations=2000, voxel_size=0.01,
         sor_mean_k=12, sor_std_ratio=1.0, sor_max_points=3500,
         max_fit_points=7000, removal_threshold_scale=1.25,
-        min_global_inlier_ratio=0.02, seed=7):
+        min_global_inlier_ratio=0.02, seed=7, pixel_stride=None, rgb=None):
     """Extract robust plane candidates while preserving sketch pixel support.
 
-    The fitting core uses voxel representatives, statistical outlier removal,
-    iterative RANSAC, full-cloud SVD refinement, and expanded inlier removal.
-    Final support polygons are still computed from the original sketch points.
+    Organized depth (pixel_stride supplied) uses connected RGB/depth regions
+    before fitting, and splits disconnected inliers before constructing hulls.
+    Unorganized clouds retain iterative RANSAC. Both preserve original support.
     """
     points = np.asarray(points, dtype=float)
     pixels = np.asarray(pixels, dtype=float)
     if points.shape != (len(pixels), 3) or pixels.shape[1:] != (2,):
         raise ValueError("point/pixel shape mismatch")
 
-    segments = segment_planes_iterative_ransac(
-        points,
+    fit_options = dict(
         max_planes=max_planes,
         max_iterations=iterations,
         distance_threshold=threshold,
@@ -74,6 +73,12 @@ def extract_planes(
         removal_threshold_scale=removal_threshold_scale,
         min_global_inlier_ratio=min_global_inlier_ratio,
     )
+    if pixel_stride is None:
+        segments = segment_planes_iterative_ransac(points, **fit_options)
+    else:
+        from sketch_control.organized_planes import spatial_plane_segments
+        segments = spatial_plane_segments(points, pixels, pixel_stride=pixel_stride,
+                                          rgb=rgb, **fit_options)
 
     planes = []
     for segment in segments:
@@ -128,5 +133,8 @@ def extract_planes(
             global_inlier_ratio=float(segment["global_inlier_ratio"]),
             removed_count=int(segment["removed_count"]),
             remaining_after_removal=int(segment["remaining_after_removal"]),
+            region_rms_m=float(segment.get("region_rms_m", segment["rms_m"])),
+            partial_support=bool(segment.get("region_rms_m", 0.) > threshold
+                                 and segment["segment_inlier_ratio"] < .8),
         ))
     return planes
