@@ -52,3 +52,12 @@ Ruling: finite measured support is exported independently from inferred support.
 - Humble CI run `37434249227` at runtime commit `51de13a`: 285 passed; installed compact bundle imports and initializes nodes in a separate interpreter. Packaging/upload succeeded.
 - Legacy contact suite differential against unchanged parent `ebc36dd`: 119 cases, 109 passed and the same 10 existing failures on both versions. No new regressions or missing cases. Reports are attached to the CI artifact.
 - Delivery remains on `codex/snucem-spray-addon`, draft PR #2. The upstream repository and target main branch were not modified. The Korean guide and validation record separate CI results from pending real MoveIt/FJT/robot/gun acceptance.
+
+## ARM64 / CUDA 12.6 correction
+
+- User confirmed Jetson AGX Orin Developer Kit and ZED SDK 5.3.1; retained Ubuntu 22.04 / Humble / Python 3.10. CUDA is 12.6; JetPack/L4T minor version is not inferred.
+- Version 0.2.0 / manifest schema 2 binds ARM64 and the external camera CUDA/SDK target. Install environment setup, doctor and runtime share the ARM64 gate. Incorrect bundle targets fail before extraction; wrong-host environment setup fails before installation writes.
+- All dependency versions remain compatible; installation uses ARM64 wheels only. GPU SDKs stay outside the add-on venv and are neither installed nor modified. Doctor explicitly labels the camera versions as targets, not detected/verified values.
+- Native ARM64 Humble CI `37435758171` at `05fdc4e`: 298 passed, no skips, one known dependency warning; installed package node smoke and artifact creation pass. NumPy/SciPy/Shapely aarch64 wheel installation is confirmed in logs.
+- Legacy contact differential on ARM64: 109 passed / the same 10 failures on baseline and current; no new regressions or missing cases. Local focused tests: 231 passed, 2 environment skips. Browser code is unchanged from the prior 66-pass run.
+- Physical Jetson GPU/camera and robot/gun acceptance remains separate and unverified; upstream and main remain unchanged.

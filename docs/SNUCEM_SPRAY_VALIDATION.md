@@ -73,7 +73,13 @@ CI runner를 `ubuntu-22.04-arm`으로 변경했습니다. 같은 Humble 컨테�
 모든 pip 의존성은 `--only-binary=:all:`로 설치합니다. 실제 ROS 메시지/노드 생성,
 설치된 경량 배포물의 별도 프로세스 실행, 기존 접촉 도장 비교는 동일하게 유지합니다.
 이 CI에는 Jetson GPU·CUDA·ZED 카메라가 없으므로 GPU 운전 검증과 구별합니다.
-현재 변경의 CI 결과는 검증 후 이 절에 기록합니다.
+2026-10-06 [ARM64 CI 실행](https://github.com/minjeasung/sketch-robot-runtime/actions/runs/37435758171)은
+런타임 커밋 `05fdc4e3917ca28fdba8d334caf538c6101939ac`에서 **전체 절차 성공**입니다.
+로그의 실제 아키텍처는 `aarch64`이며 NumPy 1.26.4, SciPy 1.15.3, Shapely 2.1.2의
+CPython 3.10 ARM64 wheel을 설치했습니다. 핵심 회귀 결과는 **298 passed**, skip 없음,
+기존 AnyIO 경고 1개입니다. 배포물의 독립 프로세스 실행·노드 생성 검사도 포함합니다.
+기존 접촉 도장 suite는 ARM64에서도 변경 전후 모두 **109 passed, 같은 10 failed**이며
+`new_regressions: [], missing: []`입니다. 배포물 생성과 artifact 업로드도 성공했습니다.
 
 ## 현장 확인
 
