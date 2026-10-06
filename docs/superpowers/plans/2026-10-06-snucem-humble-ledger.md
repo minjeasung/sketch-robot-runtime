@@ -12,6 +12,7 @@ Source was inspected through the authenticated GitHub connector. Reference files
 Ruling: use the existing isolated checkout of the requested feature branch; no second worktree is needed.
 Ruling: implement inline, with a fresh final review. Do not create per-task implementer agents.
 Ruling: ROS processes use the existing Humble underlay and Python 3.10, with NumPy <2. The add-on does not install/build/patch the upstream stack or camera SDK.
+Ruling: the user's later hardware correction supersedes the original x86 assumption: Jetson AGX Orin Developer Kit, ARM64/aarch64, CUDA 12.6, ZED SDK 5.3.1. JetPack/L4T detail is not yet supplied. This bounded platform correction updates the existing installation/runtime gate, bundle contract, native ARM64 CI and guide; it does not require new design authorization.
 Ruling: external stack URDF/SRDF/limits and mesh hashes bind the generated tool profile and execution. No second collision tool is attached.
 Ruling: finite measured support is exported independently from inferred support. Work polygons must lie within the measured support; source or calibration changes revoke execution. Observation-only timestamp changes do not.
 

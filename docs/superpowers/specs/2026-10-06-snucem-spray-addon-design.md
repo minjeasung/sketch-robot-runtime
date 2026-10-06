@@ -153,7 +153,7 @@ FastAPI 관리 API와 rosbridge 메시지를 유지한다.
 
 ## 8. 설치·갱신
 
-지원 설치 대상은 기존 저장소와 동일하게 Ubuntu 22.04 x86_64 / ROS 2 Humble / Python 3.10로 둔다.
+지원 설치 대상은 사용자의 실제 로봇컴인 Jetson AGX Orin Developer Kit의 ARM64(aarch64) / Ubuntu 22.04 / ROS 2 Humble / Python 3.10 / CUDA 12.6 / ZED SDK 5.3.1로 둔다. JetPack/L4T 세부 버전은 별도 확인하며 기존 카메라 환경을 변경하지 않는다.
 다른 환경에는 자동 호환을 주장하지 않는다. 새 PC 실환경은 설치 전 검사한다.
 
 1. 사용자가 SNUCEM_Robot_22.04를 설치·빌드하고 카메라/로봇 모델 구성을 완료한다.

@@ -1,12 +1,21 @@
-# SNUCEM Robot 22.04 스케치 뿜칠 애드온
+# SNUCEM Robot 22.04 스케치 뿜칠 애드온 — Jetson ARM64
 
 기존 **JongHyunSeo11/SNUCEM_Robot_22.04** 설치에 스케치 화면, 측정 평면 선택,
 작업영역 지정, 경로 생성·검증·자동 실행을 연결합니다. 대상 환경은
-Ubuntu 22.04 x86_64, ROS 2 Humble, Python 3.10입니다.
+NVIDIA Jetson AGX Orin Developer Kit, **ARM64(aarch64), Ubuntu 22.04,
+ROS 2 Humble, Python 3.10, CUDA 12.6, ZED SDK 5.3.1**입니다.
 
-원본의 카메라 컨테이너 기준은 ZED SDK **5.3.1**, CUDA **13.0**,
-CPython **3.11.16**입니다 (`research/jammy/Dockerfile`). ROS 애드온과
-카메라 SDK는 분리된 환경이며 애드온이 SDK/CUDA를 설치하거나 변경하지 않습니다.
+CPU/SDK/CUDA는 사용자가 확인한 실제 로봇컴 기준입니다. JetPack/L4T 세부 버전은
+아직 전달되지 않았으므로 특정 버전으로 단정하지 않습니다. ZED SDK는 그 L4T에 맞는
+**Jetson용 5.3.1 설치**를 그대로 사용합니다. ROS 애드온은 CPU와 ROS 토픽을 사용하며
+CUDA/pyzed에 직접 링크하지 않습니다. GPU 런타임은 기존 카메라 환경에서 담당합니다.
+원본의 `research/jammy/Dockerfile`에 있는 x86/CUDA 13.0 이미지를 이 애드온이
+빌드하거나 실행하지 않습니다. SDK/CUDA/JetPack, 원본 파일은 설치·업그레이드하지 않습니다.
+
+참고: [NVIDIA JetPack 6.1](https://developer.nvidia.com/embedded/jetpack-sdk-61)은
+Ubuntu 22.04와 CUDA 12.6을 사용합니다. 이는 로봇컴의 JetPack 버전을 확인했다는 뜻은 아닙니다.
+[Stereolabs 5.3 릴리스 기록](https://docs.stereolabs.com/docs/development/zed-sdk/release-notes/5-x/5-3)과
+[공식 Jetson 이미지 목록](https://github.com/stereolabs/zed-docker)을 기준으로 설치 환경을 확인합니다.
 
 지원 인터페이스 기준은 `7b0a2edcc3d1659bdc2dcb495d4dd63f75899f1c`입니다.
 애드온은 원본 저장소를 clone/build/patch하지 않습니다. 배포 파일에 원본 소스,
@@ -16,6 +25,12 @@ URDF/SRDF/관절 제한/mesh 해시를 읽습니다. 원본 모델 캐시 생성
 
 ## 설치 전 준비
 
+- 로봇컴에서 `uname -m`이 `aarch64`인지 확인합니다. x86_64와 32비트 ARM은 설치/실행 대상이 아닙니다.
+- `cat /etc/nv_tegra_release`, `dpkg-query -W nvidia-l4t-core`로 L4T를 확인합니다.
+  기존 카메라를 실행하는 환경에서 `/usr/local/cuda/version.json` 또는 `nvcc --version`으로
+  CUDA 12.6을 확인합니다. `nvidia-smi`의 CUDA 표시는 설치된 SDK 버전 확인을 대신하지 않습니다.
+  같은 카메라 Python 환경에서 `python -c "import pyzed.sl as sl; print(sl.Camera.get_sdk_version())"`로
+  ZED SDK 5.3.1을 확인합니다. 애드온 venv에는 pyzed를 설치하지 않습니다.
 - 기존 Humble 로봇 드라이버, MoveIt, TF, ZED/Outpost와 실제 보정은 운영자가 준비합니다.
 - `/robot_description`, `/move_group/get_parameters`, `/joint_states`,
   `/controller_manager/list_controllers`, MoveIt 서비스, `link0`/`tcp` TF가 필요합니다.
@@ -41,8 +56,8 @@ source /opt/ros/humble/setup.bash
 # 이미 구축된 원본 ROS overlay의 setup.bash도 현재 스택의 실행 절차에 따라 source합니다.
 mkdir -p "$HOME/snucem-sketch-bootstrap" "$HOME/.local/state/snucem-sketch"
 chmod 700 "$HOME/.local/state/snucem-sketch"
-sha256sum -c snucem-spray-humble.tar.gz.sha256
-tar -xzf snucem-spray-humble.tar.gz -C "$HOME/snucem-sketch-bootstrap"
+sha256sum -c snucem-spray-humble-arm64-cuda12.6.tar.gz.sha256
+tar -xzf snucem-spray-humble-arm64-cuda12.6.tar.gz -C "$HOME/snucem-sketch-bootstrap"
 ```
 
 `$HOME/.local/state/snucem-sketch/config.json` 예시:
@@ -75,12 +90,15 @@ RB10은 `model_id: rb10_1300e_u`를 사용하고 실제 spray URDF와 일치해�
 ```bash
 python3 -B "$HOME/snucem-sketch-bootstrap/scripts/snucem_spray.py" \
   --config "$HOME/.local/state/snucem-sketch/config.json" \
-  install --bundle "$PWD/snucem-spray-humble.tar.gz" --setup-env
+  install --bundle "$PWD/snucem-spray-humble-arm64-cuda12.6.tar.gz" --setup-env
 ```
 
 설치 출력의 `version`과 `version_root`를 사용합니다. 가상환경은
-`install_root/envs/<version>`에 생성합니다. 의존성 설치가 실패하면 이전 활성 버전은 유지됩니다.
+`install_root/envs/<version>`에 생성합니다. ARM64 Python 3.10 wheel만 설치하므로
+의존성을 현장에서 소스 컴파일하지 않습니다. 의존성 설치가 실패하면 이전 활성 버전은 유지됩니다.
 기존 설정을 덮어쓰지 않습니다. 실행 중인 서비스의 업그레이드는 거절합니다.
+배포물 0.2.0은 ARM64/CUDA 12.6/ZED 5.3.1 메타데이터를 검증합니다.
+이전 x86 기준 0.1.0 bootstrap 대신 새 압축 파일의 installer를 사용합니다.
 
 ```bash
 ADDON_ROOT=/home/robot/.local/share/snucem-sketch/versions/<version>
@@ -137,5 +155,7 @@ scene 정리를 보장할 수 없으므로 실제 로봇 정지 여부는 외부
 
 검증 결과와 미확인 항목은 [검증 기록](SNUCEM_SPRAY_VALIDATION.md)을 참조합니다.
 `doctor` 성공은 정적 준비 상태 확인이며 실물 로봇·건의 시운전 통과를 뜻하지 않습니다.
-GitHub의 Humble CI는 외부 원본 접근 없이 synthetic model과 실제 ROS 메시지로
+`doctor`의 `camera_environment` 값은 **요구 버전**이며, 자동 감지 결과가 아닙니다.
+`verified: false`를 유지하므로 위 명령으로 기존 카메라 환경을 별도 확인합니다.
+GitHub의 ARM64 Humble CI는 외부 원본 접근 없이 synthetic model과 실제 ROS 메시지로
 노드 생성/차단 경계를 검사합니다. 실제 카메라·MoveIt·FJT 전체 운전 시험은 별도입니다.

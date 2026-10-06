@@ -8,7 +8,7 @@
 
 **Architecture:** The add-on owns its files, processes and settings. A wrapper imports the installed SNUCEM perception class and exports immutable finite plane snapshots. Our adapter, path generation and executor use that data and the external stack's actual model, while retaining the existing HTTP-management/ROS-workflow separation.
 
-**Tech Stack:** Ubuntu 22.04 x86_64, ROS 2 Humble, Python 3.10, FastAPI/Uvicorn, NumPy/SciPy/OpenCV, existing browser JavaScript and rosbridge.
+**Tech Stack:** Jetson AGX Orin Developer Kit, Ubuntu 22.04 ARM64, ROS 2 Humble, Python 3.10, external CUDA 12.6 / ZED SDK 5.3.1 camera environment, FastAPI/Uvicorn, NumPy/SciPy/OpenCV, existing browser JavaScript and rosbridge.
 
 **Spec:** ../specs/2026-10-06-snucem-spray-addon-design.md
 

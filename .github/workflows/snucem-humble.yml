@@ -1,4 +1,4 @@
-name: SNUCEM Humble add-on
+name: SNUCEM ARM64 Humble add-on
 on:
   push:
     branches: [codex/snucem-spray-addon]
@@ -9,7 +9,7 @@ permissions:
   contents: read
 jobs:
   humble:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-22.04-arm
     container: ros:humble-ros-base-jammy
     timeout-minutes: 20
     env:
@@ -27,13 +27,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install isolated CI dependencies
         run: |
+          test "$(uname -m)" = aarch64
           apt-get update
           apt-get install -y --no-install-recommends python3-pip python3-opencv ros-humble-moveit-msgs ros-humble-controller-manager-msgs ros-humble-control-msgs ros-humble-tf2-ros ros-humble-visualization-msgs
-          python3 -m pip install -r addons/snucem_spray/requirements-humble.txt pytest==8.3.5 httpx==0.28.1
+          python3 -m pip install --only-binary=:all: -r addons/snucem_spray/requirements-humble.txt pytest==8.3.5 httpx==0.28.1
       - name: Real Humble import, initialization and regression checks
         run: |
           source /opt/ros/humble/setup.bash
           export PYTHONPATH="$PWD/addons/snucem_spray:$PWD/src/sketch_control:$PWD/src/rbpodo_painting_control:$PYTHONPATH"
+          python3 -c 'import os, platform, sys; from snucem_spray_addon.config import check_platform; check_platform("22.04", os.environ["ROS_DISTRO"], sys.version_info); print("Native architecture:", platform.machine())'
           python3 -m pytest -q addons/snucem_spray/tests src/sketch_control/test/test_zed_spray_projection.py src/sketch_control/test/test_zed_spray_generation.py src/sketch_control/test/test_polygon_work_area.py src/rbpodo_painting_control/test/test_spray_eoat.py src/sketch_control/test/test_executor_plan_identity.py src/sketch_control/test/test_spray_motion_test.py src/sketch_control/test/test_contact_collision_acm.py src/sketch_control/test/test_multi_plane_spray.py
       - name: Compare legacy contact failures with the unchanged parent
         run: |
@@ -43,10 +45,10 @@ jobs:
           git -c safe.directory="$PWD" archive ebc36dd676602ad913a187b32762b3aedd15b88f src | tar -x -C "$RUNNER_TEMP/snucem-parent"
           python3 scripts/check_snucem_baseline.py --baseline "$RUNNER_TEMP/snucem-parent" --current "$PWD" --reports /tmp/snucem-regression-reports
       - name: Build deterministic distribution
-        run: python3 scripts/package_snucem_spray.py --output /tmp/snucem-spray-humble.tar.gz
+        run: python3 scripts/package_snucem_spray.py --output /tmp/snucem-spray-humble-arm64-cuda12.6.tar.gz
       - uses: actions/upload-artifact@v4
         with:
-          name: snucem-spray-humble
+          name: snucem-spray-humble-arm64-cuda12.6
           path: |
-            /tmp/snucem-spray-humble.tar.gz*
+            /tmp/snucem-spray-humble-arm64-cuda12.6.tar.gz*
             /tmp/snucem-regression-reports/

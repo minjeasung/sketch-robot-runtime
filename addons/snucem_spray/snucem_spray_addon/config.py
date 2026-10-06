@@ -2,8 +2,13 @@
 from dataclasses import asdict, dataclass
 import json
 import os
+import platform
 from pathlib import Path
 from urllib.parse import urlparse
+
+TARGET_PLATFORM = dict(device='NVIDIA Jetson AGX Orin Developer Kit',
+                       architecture='aarch64', ubuntu='22.04', ros_distro='humble',
+                       python='3.10', cuda='12.6', zed_sdk='5.3.1')
 
 
 def validate_paths(upstream_root, install_root, state_root):
@@ -19,9 +24,12 @@ def validate_paths(upstream_root, install_root, state_root):
     return roots
 
 
-def check_platform(ubuntu, ros_distro, python_version):
+def check_platform(ubuntu, ros_distro, python_version, machine=None):
     if ubuntu != '22.04' or ros_distro != 'humble' or tuple(python_version[:2]) != (3, 10):
         raise ValueError('requires Ubuntu 22.04, ROS 2 Humble and system Python 3.10')
+    machine = platform.machine() if machine is None else machine
+    if machine.lower() not in ('aarch64', 'arm64'):
+        raise ValueError('requires ARM64 (aarch64); detected '+repr(machine))
 
 
 def owned_path(root, relative):

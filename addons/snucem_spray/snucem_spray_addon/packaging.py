@@ -6,6 +6,8 @@ import io
 import json
 from pathlib import Path
 import tarfile
+from . import __version__
+from .config import TARGET_PLATFORM
 
 ENTRY_MODULES = ('sketch_control.moveit_executor', 'sketch_control.wall_projector_node',
                  'sketch_control.sketch_to_waypoints_node', 'sketch_control.zed_preview_node')
@@ -65,10 +67,11 @@ def build_bundle(root, output):
     unpacked = sum(map(len, contents.values()))
     if unpacked > 10_000_000:
         raise ValueError('unpacked add-on exceeds 10 MB')
-    manifest = dict(schema_version=1, name='snucem-spray-humble', version='0.1.0',
+    manifest = dict(schema_version=2, name='snucem-spray-humble-arm64-cuda12.6', version=__version__,
                     upstream_repository='JongHyunSeo11/SNUCEM_Robot_22.04',
                     upstream_revision='7b0a2edcc3d1659bdc2dcb495d4dd63f75899f1c',
-                    ubuntu='22.04', ros_distro='humble', python='3.10', unpacked_bytes=unpacked,
+                    **TARGET_PLATFORM, unpacked_bytes=unpacked,
+                    cuda_dependency='external_camera_only',
                     dependencies_included=False,
                     files={name:hashlib.sha256(data).hexdigest() for name, data in sorted(contents.items())})
     contents['manifest.json'] = json.dumps(manifest, sort_keys=True, indent=2).encode()

@@ -54,6 +54,27 @@ def test_installer_rejects_traversal_before_creating_files(tmp_path):
     assert not (tmp_path/'escape').exists()
 
 
+@pytest.mark.parametrize('field,value', [('architecture', 'x86_64'), ('cuda', '13.0')])
+def test_installer_rejects_bundle_for_another_robot_platform(tmp_path, field, value):
+    bundle, _ = module('packaging').build_bundle(ROOT, tmp_path/'bundle.tar.gz')
+    contents = module('install').verified_members(bundle)
+    manifest = json.loads(contents['manifest.json'])
+    manifest[field] = value
+    contents['manifest.json'] = json.dumps(manifest).encode()
+    wrong = tmp_path/'wrong-platform.tar.gz'
+    with tarfile.open(wrong, 'w:gz') as archive:
+        for name, data in contents.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    up = tmp_path/'up'
+    up.mkdir()
+    cfg = module('config').AddonConfig(str(up), str(tmp_path/'install'), str(tmp_path/'state'))
+    with pytest.raises(ValueError, match='manifest'):
+        module('install').install_bundle(wrong, cfg)
+    assert not Path(cfg.install_root).exists()
+
+
 def test_environment_setup_failure_does_not_activate_new_version(tmp_path, monkeypatch):
     from dataclasses import asdict
     import subprocess
@@ -79,3 +100,25 @@ def test_environment_setup_failure_does_not_activate_new_version(tmp_path, monke
     with pytest.raises(subprocess.CalledProcessError):
         cli.main(['--config', str(config_file), 'install', '--bundle', str(bundle), '--setup-env'])
     assert json.loads(active.read_text()) == {'version': 'previous'}
+
+
+def test_environment_install_rejects_wrong_cpu_before_writing(tmp_path, monkeypatch):
+    from dataclasses import asdict
+    cli = module('cli')
+    bundle, _ = module('packaging').build_bundle(ROOT, tmp_path/'bundle.tar.gz')
+    up = tmp_path/'up'
+    up.mkdir()
+    cfg = module('config').AddonConfig(str(up), str(tmp_path/'install'), str(tmp_path/'state'))
+    config_file = tmp_path/'config.json'
+    config_file.write_text(json.dumps(asdict(cfg)), encoding='utf-8')
+    original_read = Path.read_text
+    def read_text(path, *args, **kwargs):
+        return 'VERSION_ID="22.04"' if path == Path('/etc/os-release') else original_read(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'read_text', read_text)
+    monkeypatch.setattr(cli.platform, 'machine', lambda: 'x86_64')
+    monkeypatch.setattr(cli.sys, 'version_info', (3, 10, 12))
+    monkeypatch.setenv('ROS_DISTRO', 'humble')
+    with pytest.raises(ValueError, match='ARM64'):
+        cli.main(['--config', str(config_file), 'install', '--bundle', str(bundle), '--setup-env'])
+    assert not Path(cfg.install_root).exists()
+    assert not Path(cfg.state_root).exists()

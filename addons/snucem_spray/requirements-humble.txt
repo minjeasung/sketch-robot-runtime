@@ -1,4 +1,6 @@
 # Add-on venv only; apt ROS/OpenCV and external stack are never pip-modified.
+# CPython 3.10 / Linux ARM64 wheels. GPU work stays in the installed
+# Jetson camera environment (CUDA 12.6 / ZED SDK 5.3.1), outside this venv.
 numpy==1.26.4
 scipy==1.15.3
 shapely==2.1.2

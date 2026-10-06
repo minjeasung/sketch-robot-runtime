@@ -1,12 +1,14 @@
-# SNUCEM Humble 애드온 검증 기록
+# SNUCEM ARM64 Humble 애드온 검증 기록
 
 대상 브랜치: `codex/snucem-spray-addon`. 원본 기준:
 `JongHyunSeo11/SNUCEM_Robot_22.04@7b0a2edcc3d1659bdc2dcb495d4dd63f75899f1c`.
 원본은 GitHub connector로 읽기만 했으며 원본 소스는 배포물에 포함하지 않았습니다.
+현재 배포 대상은 Jetson AGX Orin Developer Kit / ARM64 / CUDA 12.6 / ZED SDK 5.3.1입니다.
+JetPack/L4T 세부 버전 및 실제 GPU·카메라 동작은 원격으로 확인하지 못했습니다.
 
 ## 로컬 검증
 
-Windows / Python 3.12에서 다음 명령은 **218 passed, 2 skipped**였습니다.
+Windows / Python 3.12에서 다음 명령은 **231 passed, 2 skipped**였습니다.
 skip은 Windows symlink 권한과 설치되지 않은 rclpy입니다.
 의존성의 AnyIO deprecated alias 경고 1개가 있으며 테스트 실패는 아닙니다.
 
@@ -44,7 +46,7 @@ symlink 권한, 기존 테스트의 기본 cp949 인코딩 등 환경 의존 실
 
 최종 리뷰에서 남은 critical/important 지적은 없었습니다.
 
-## Humble CI
+## ARM64 전환 전 Humble CI 기록
 
 `.github/workflows/snucem-humble.yml`은 `ros:humble-ros-base-jammy`에서
 실제 ROS 메시지와 synthetic URDF/SRDF로 모듈 import, 노드 생성,
@@ -63,6 +65,15 @@ live 상태 누락 시 물리 dispatch 차단을 검사합니다.
 기존 접촉 도장 fixture 누락 및 오래된 취소 동작 기대값의 실패를 숨기지 않으며,
 이 suite 자체를 전체 통과로 표시하지 않습니다. 비교 XML/JSON은 CI artifact에 포함합니다.
 경량 배포물 생성·업로드도 성공했습니다.
+
+## ARM64 전환 검증
+
+CI runner를 `ubuntu-22.04-arm`으로 변경했습니다. 같은 Humble 컨테이너를 native ARM64로
+실행하며 `uname -m` 및 실제 Python 플랫폼 검사를 통과해야 다음 단계로 진행합니다.
+모든 pip 의존성은 `--only-binary=:all:`로 설치합니다. 실제 ROS 메시지/노드 생성,
+설치된 경량 배포물의 별도 프로세스 실행, 기존 접촉 도장 비교는 동일하게 유지합니다.
+이 CI에는 Jetson GPU·CUDA·ZED 카메라가 없으므로 GPU 운전 검증과 구별합니다.
+현재 변경의 CI 결과는 검증 후 이 절에 기록합니다.
 
 ## 현장 확인
 

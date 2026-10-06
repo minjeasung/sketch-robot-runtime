@@ -41,7 +41,50 @@ def test_only_humble_spray_profiles_and_owned_environment(tmp_path):
         m.AddonConfig(str(upstream), str(tmp_path/'addon'), str(tmp_path/'state'), profile='paint')
     with pytest.raises(ValueError):
         m.check_platform('24.04', 'jazzy', (3, 12))
-    m.check_platform('22.04', 'humble', (3, 10))
+    m.check_platform('22.04', 'humble', (3, 10), 'aarch64')
+
+
+@pytest.mark.parametrize('machine', ['aarch64', 'arm64'])
+def test_arm64_humble_is_an_installable_platform(machine):
+    module('config').check_platform('22.04', 'humble', (3, 10), machine)
+
+
+@pytest.mark.parametrize('machine', ['x86_64', 'AMD64', 'armv7l', 'arm', ''])
+def test_other_architectures_are_rejected_before_runtime_start(machine):
+    with pytest.raises(ValueError, match='ARM64'):
+        module('config').check_platform('22.04', 'humble', (3, 10), machine)
+
+
+def test_platform_check_uses_actual_machine_by_default(monkeypatch):
+    import platform
+    monkeypatch.setattr(platform, 'machine', lambda: 'x86_64')
+    with pytest.raises(ValueError, match='ARM64'):
+        module('config').check_platform('22.04', 'humble', (3, 10))
+
+
+@pytest.mark.parametrize('machine,supported', [('aarch64', True), ('x86_64', False)])
+def test_doctor_reports_arm64_support_without_loading_camera_sdk(tmp_path, monkeypatch, machine, supported):
+    cli = module('cli')
+    upstream = tmp_path/'up'
+    upstream.mkdir()
+    calibration = tmp_path/'calibration.yaml'
+    calibration.write_text('measured: true')
+    cfg = module('config').AddonConfig(str(upstream), str(tmp_path/'install'), str(tmp_path/'state'),
+                                     calibration_file=str(calibration))
+    original_read = Path.read_text
+    def read_text(path, *args, **kwargs):
+        return 'VERSION_ID="22.04"' if path == Path('/etc/os-release') else original_read(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'read_text', read_text)
+    monkeypatch.setattr(cli.platform, 'machine', lambda: machine)
+    monkeypatch.setattr(cli.platform, 'system', lambda: 'Linux')
+    monkeypatch.setattr(cli.sys, 'version_info', (3, 10, 12))
+    monkeypatch.setenv('ROS_DISTRO', 'humble')
+    monkeypatch.setattr(cli, 'check_upstream', lambda root: {'compatible': True})
+    # These are separately installed ROS/upstream dependencies, not GPU SDK imports.
+    monkeypatch.setattr(cli.importlib.util, 'find_spec', lambda name: None if name in ('pyzed', 'cuda') else object())
+    report = cli.doctor(cfg)
+    assert report['platform']['supported'] is supported
+    assert report['ok'] is supported
 
 
 def test_symlink_write_alias_is_rejected(tmp_path):

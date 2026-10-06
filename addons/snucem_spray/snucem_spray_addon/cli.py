@@ -10,7 +10,7 @@ import subprocess
 import sys
 import threading
 
-from .config import AddonConfig, check_platform, runtime_environment, owned_path
+from .config import AddonConfig, TARGET_PLATFORM, check_platform, runtime_environment, owned_path
 from .compatibility import check_upstream
 from .runtime import Runtime, repository_root
 
@@ -32,16 +32,22 @@ def bootstrap(config):
 
 def doctor(config):
     checks = {'upstream': check_upstream(config.upstream_root)}
-    checks['platform'] = dict(system=platform.system(), python=platform.python_version(), ros=os.environ.get('ROS_DISTRO'))
+    checks['platform'] = dict(system=platform.system(), machine=platform.machine(),
+                              python=platform.python_version(), ros=os.environ.get('ROS_DISTRO'),
+                              target=TARGET_PLATFORM)
     try:
         release = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines() if '=' in line)
         check_platform(release.get('VERSION_ID', '').strip('"'), os.environ.get('ROS_DISTRO'), sys.version_info)
-        checks['platform']['supported'] = platform.machine() in ('x86_64', 'AMD64')
+        checks['platform']['supported'] = platform.system() == 'Linux'
     except (OSError, ValueError):
         checks['platform']['supported'] = False
     checks['dependencies'] = {name: importlib.util.find_spec(name) is not None for name in
         ('rclpy', 'moveit_msgs', 'controller_manager_msgs', 'cv2', 'scipy', 'numpy', 'shapely', 'fastapi', 'trimesh', 'rb20_spray')}
     checks['calibration_present'] = Path(config.calibration_file).is_file()
+    # GPU libraries belong to the existing camera environment, which may be
+    # a separate process/container. Never claim that target metadata detects it.
+    checks['camera_environment'] = dict(cuda_target=TARGET_PLATFORM['cuda'],
+        zed_sdk_target=TARGET_PLATFORM['zed_sdk'], verified=False, managed_by_addon=False)
     checks['ok'] = bool(checks['upstream']['compatible'] and checks['platform']['supported']
                         and checks['calibration_present'] and all(checks['dependencies'].values()))
     checks['hardware_verified'] = False
@@ -128,14 +134,15 @@ def main(argv=None):
     config = AddonConfig.load(args.config)
     if args.command == 'install':
         from .install import install_bundle, activate_version
-        result = install_bundle(args.bundle, config, activate=False)
         if args.setup_env:
             release = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines() if '=' in line)
             check_platform(release.get('VERSION_ID', '').strip('"'), os.environ.get('ROS_DISTRO'), sys.version_info)
+        result = install_bundle(args.bundle, config, activate=False)
+        if args.setup_env:
             venv = owned_path(config.install_root, 'envs/'+result['version'])
             subprocess.run([sys.executable, '-m', 'venv', '--system-site-packages', str(venv)], check=True,
                            env=runtime_environment(config))
-            subprocess.run([str(venv/'bin/python'), '-m', 'pip', 'install', '-r',
+            subprocess.run([str(venv/'bin/python'), '-m', 'pip', 'install', '--only-binary=:all:', '-r',
                 str(Path(result['version_root'])/'addons/snucem_spray/requirements-humble.txt')], check=True,
                 env=runtime_environment(config))
         activate_version(config, result['version'], Path(result['version_root']))

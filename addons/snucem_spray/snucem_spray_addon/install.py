@@ -5,7 +5,7 @@ from pathlib import Path, PurePosixPath
 import shutil
 import tarfile
 import tempfile
-from .config import validate_paths, owned_path
+from .config import TARGET_PLATFORM, validate_paths, owned_path
 
 
 def verified_members(bundle):
@@ -25,8 +25,9 @@ def verified_members(bundle):
     try:
         manifest_bytes = contents.pop('manifest.json')
         manifest = json.loads(manifest_bytes)
-        if (manifest['schema_version'] != 1 or manifest['ros_distro'] != 'humble'
-                or manifest['ubuntu'] != '22.04' or set(manifest['files']) != set(contents)):
+        if (manifest['schema_version'] != 2 or any(manifest.get(key) != TARGET_PLATFORM[key]
+                for key in ('ubuntu', 'ros_distro', 'python', 'architecture', 'cuda', 'zed_sdk'))
+                or set(manifest['files']) != set(contents)):
             raise ValueError('manifest does not match archive')
         for name, data in contents.items():
             if hashlib.sha256(data).hexdigest() != manifest['files'][name]:
