@@ -4,6 +4,10 @@
 작업영역 지정, 경로 생성·검증·자동 실행을 연결합니다. 대상 환경은
 Ubuntu 22.04 x86_64, ROS 2 Humble, Python 3.10입니다.
 
+원본의 카메라 컨테이너 기준은 ZED SDK **5.3.1**, CUDA **13.0**,
+CPython **3.11.16**입니다 (`research/jammy/Dockerfile`). ROS 애드온과
+카메라 SDK는 분리된 환경이며 애드온이 SDK/CUDA를 설치하거나 변경하지 않습니다.
+
 지원 인터페이스 기준은 `7b0a2edcc3d1659bdc2dcb495d4dd63f75899f1c`입니다.
 애드온은 원본 저장소를 clone/build/patch하지 않습니다. 배포 파일에 원본 소스,
 로봇 mesh, 카메라 SDK, ROS 또는 Python 의존성은 포함하지 않습니다.
@@ -54,8 +58,8 @@ tar -xzf snucem-spray-humble.tar.gz -C "$HOME/snucem-sketch-bootstrap"
   "ros_domain_id": 0,
   "rosbridge_url": "ws://127.0.0.1:9090",
   "own_rosbridge": false,
-  "image_topic": "/zed/zed_node/rgb/color/rect/image",
-  "camera_info_topic": "/zed/zed_node/rgb/color/rect/camera_info",
+  "image_topic": "/zed/zed_node/left/color/rect/image",
+  "camera_info_topic": "/zed/zed_node/left/color/rect/camera_info",
   "points_topic": "/rb/spray/zed/points",
   "api_host": "127.0.0.1",
   "api_port": 8081,

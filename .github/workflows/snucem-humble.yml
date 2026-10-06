@@ -17,6 +17,9 @@ jobs:
       ROS_LOCALHOST_ONLY: '1'
       SNUCEM_ISOLATED_ROS_TEST: '1'
       PYTHONDONTWRITEBYTECODE: '1'
+      # ROS launch_testing eagerly imports unrelated tests during collection.
+      # This suite uses normal pytest fixtures and real ROS directly.
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
     defaults:
       run:
         shell: bash

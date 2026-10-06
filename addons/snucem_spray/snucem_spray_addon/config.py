@@ -53,8 +53,8 @@ class AddonConfig:
     profile: str = 'preview'
     ros_domain_id: int = 0
     rosbridge_url: str = 'ws://127.0.0.1:9090'
-    image_topic: str = '/zed/zed_node/rgb/color/rect/image'
-    camera_info_topic: str = '/zed/zed_node/rgb/color/rect/camera_info'
+    image_topic: str = '/zed/zed_node/left/color/rect/image'
+    camera_info_topic: str = '/zed/zed_node/left/color/rect/camera_info'
     points_topic: str = '/rb/spray/zed/points'
     model_id: str = 'rb20_1900es'
     api_host: str = '127.0.0.1'
