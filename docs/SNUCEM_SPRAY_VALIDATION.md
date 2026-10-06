@@ -1,0 +1,63 @@
+# SNUCEM Humble 애드온 검증 기록
+
+대상 브랜치: `codex/snucem-spray-addon`. 원본 기준:
+`JongHyunSeo11/SNUCEM_Robot_22.04@7b0a2edcc3d1659bdc2dcb495d4dd63f75899f1c`.
+원본은 GitHub connector로 읽기만 했으며 원본 소스는 배포물에 포함하지 않았습니다.
+
+## 로컬 검증
+
+Windows / Python 3.12에서 다음 명령은 **215 passed, 2 skipped**였습니다.
+skip은 Windows symlink 권한과 설치되지 않은 rclpy입니다.
+의존성의 AnyIO deprecated alias 경고 1개가 있으며 테스트 실패는 아닙니다.
+
+```bash
+export PYTHONPATH="$PWD/addons/snucem_spray:$PWD/src/sketch_control:$PWD/src/rbpodo_painting_control"
+python -m pytest -q addons/snucem_spray/tests \
+  src/sketch_control/test/test_zed_spray_projection.py \
+  src/sketch_control/test/test_zed_spray_generation.py \
+  src/sketch_control/test/test_polygon_work_area.py \
+  src/rbpodo_painting_control/test/test_spray_eoat.py
+node --test web/test/*.test.js
+```
+
+브라우저 테스트는 **65 passed**. `git diff --check` 통과.
+Python 소스는 Python3.10 문법으로 parse 검사했습니다.
+번들 재생성 결과가 바이트 단위로 같고, 파일별 해시/경로 검증, 설치 실패/실행 중
+업그레이드 거절, 설정·원본 파일 보존을 검사했습니다.
+
+전체 `src` suite를 Windows에서 실행한 결과는 665 passed, 18 skipped,
+14 failed, 23 errors였습니다. ROS 메시지/ament 미설치, Windows의 SIGKILL 부재,
+symlink 권한, 기존 테스트의 기본 cp949 인코딩 등 환경 의존 실패가 포함됩니다.
+이를 전체 suite 통과로 표시하지 않습니다. 관련 기능의 집중 회귀 범위는 위와 같습니다.
+
+## 독립 코드 리뷰
+
+읽기 전용 리뷰에서 발견한 세 문제를 수정하고 재검사했습니다.
+
+1. 오래되거나 TF 검증에 실패한 cloud 수신만으로 기존 평면의 freshness가 연장되는 문제:
+   원본의 성공한 `_patch_observations` 시각만 사용합니다.
+2. 같은 잠긴 평면의 measured support 재표본화/통과 품질값 변화가 작업을 취소하는 문제:
+   여전히 관측으로 덮이는 보수적 고정 footprint를 유지하고 품질값을 기하 ID에서 분리했습니다.
+3. Humble 기본 SIGINT 핸들러가 취소 전에 ROS context를 종료하는 문제:
+   context를 유지해 OFF/취소를 먼저 요청하고 제한 시간 동안 결과를 처리합니다.
+
+최종 리뷰에서 남은 critical/important 지적은 없었습니다.
+
+## Humble CI와 현장 확인
+
+`.github/workflows/snucem-humble.yml`은 `ros:humble-ros-base-jammy`에서
+실제 ROS 메시지와 synthetic URDF/SRDF로 모듈 import, 노드 생성,
+live 상태 누락 시 물리 dispatch 차단을 검사합니다. 현재 작성 시점 실행 결과는 대기 중입니다.
+외부 원본 접근 권한이나 실제 로봇을 사용하는 작업은 아닙니다.
+
+현장에서는 다음 순서의 별도 검증이 필요합니다.
+
+1. 원본 Git 상태 및 파일 hash를 저장하고 설치/종료 후 비교.
+2. `doctor`, 실제 URDF/SRDF/mesh 모델 fingerprint, CameraInfo·stamped TF·보정 파일 일치 확인.
+3. preview에서 면/작업영역/자유선/자동 채우기/clear/reselect, 셀 사이 빈 공간 거절 확인.
+4. 외부 fake hardware stack의 dry_run에서 MoveIt 충돌검증 및 FJT 명령 미전송 확인.
+5. 실제 이동이 허용된 시운전 환경의 motion_test에서 정지·취소·경쟁 실행기·관측 소실·모델 변경 차단 확인.
+6. 독립 건 OFF 기본값/lease 만료/실제 ACK 검증 후 spray profile 운전.
+
+실제 ROS 그래프에서 원본 wrapper가 동작하는지, MoveIt 전체 경로가 실행되는지,
+실물 로봇과 분사 건의 정지·취소가 확인되는지는 이 Windows 작업에서 검증하지 못했습니다.

@@ -194,7 +194,7 @@ def _projector_without_ros(monkeypatch):
         "geometry_msgs": {},
         "geometry_msgs.msg": dict(Pose=Pose, PoseArray=PoseArray, PoseStamped=PoseStamped),
         "sensor_msgs": {},
-        "sensor_msgs.msg": dict(Image=Image, CameraInfo=type("CameraInfo", (), {})),
+        "sensor_msgs.msg": dict(Image=Image, CompressedImage=Image, CameraInfo=type("CameraInfo", (), {})),
         "std_msgs": {},
         "std_msgs.msg": dict(Empty=type("Empty", (), {}), String=String),
         "tf2_ros": dict(Buffer=object, TransformListener=object,

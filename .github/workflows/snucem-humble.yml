@@ -1,0 +1,40 @@
+name: SNUCEM Humble add-on
+on:
+  push:
+    branches: [codex/snucem-spray-addon]
+  pull_request:
+    paths: ['addons/snucem_spray/**', 'src/sketch_control/**', 'src/rbpodo_painting_control/**', 'web/**', '.github/workflows/snucem-humble.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  humble:
+    runs-on: ubuntu-22.04
+    container: ros:humble-ros-base-jammy
+    timeout-minutes: 20
+    env:
+      ROS_DOMAIN_ID: '179'
+      ROS_LOCALHOST_ONLY: '1'
+      SNUCEM_ISOLATED_ROS_TEST: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install isolated CI dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends python3-pip python3-opencv ros-humble-moveit-msgs ros-humble-controller-manager-msgs ros-humble-control-msgs ros-humble-tf2-ros ros-humble-visualization-msgs
+          python3 -m pip install -r addons/snucem_spray/requirements-humble.txt pytest==8.3.5 httpx==0.28.1
+      - name: Real Humble import, initialization and regression checks
+        run: |
+          source /opt/ros/humble/setup.bash
+          export PYTHONPATH="$PWD/addons/snucem_spray:$PWD/src/sketch_control:$PWD/src/rbpodo_painting_control:$PYTHONPATH"
+          python3 -m pytest -q addons/snucem_spray/tests src/sketch_control/test/test_zed_spray_projection.py src/sketch_control/test/test_zed_spray_generation.py src/sketch_control/test/test_polygon_work_area.py src/rbpodo_painting_control/test/test_spray_eoat.py
+      - name: Build deterministic distribution
+        run: python3 scripts/package_snucem_spray.py --output /tmp/snucem-spray-humble.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snucem-spray-humble
+          path: /tmp/snucem-spray-humble.tar.gz*

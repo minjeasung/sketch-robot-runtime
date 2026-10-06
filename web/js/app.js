@@ -9,9 +9,9 @@ let processModePending = true;
 let multiPlaneBusy = false;
 let stopRequested = false;
 
-const WS_URL = `ws://${window.location.hostname || "localhost"}:9090`;
+const WS_URL = window.SKETCH_RUNTIME?.rosbridge_url || `ws://${window.location.hostname || "localhost"}:9090`;
 const WORK_AREA_CORNERS_TOPIC = "/perception/work_area_corners";
-const ZED_LEFT_IMAGE_TOPIC = "/zed/zed_node/rgb/color/rect/image";
+const ZED_LEFT_IMAGE_TOPIC = window.SKETCH_RUNTIME?.image_topic || "/zed/zed_node/rgb/color/rect/image";
 const D405_REFINEMENT_STATUS_TOPIC = "/perception/d405_surface_refinement_status";
 const ZED_TARGET_LOCK_TOPIC = "/perception/zed_target_lock";
 const ZED_SURFACE_STATUS_TOPIC = "/perception/zed_surface_status";

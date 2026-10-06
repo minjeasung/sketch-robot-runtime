@@ -177,6 +177,18 @@ def validate_visible_work_area(corners, intrinsics, rotation, translation, image
         raise ValueError("work area is outside ZED image; select within the visible region")
 
 
+def validate_measured_work_boundary(target, extent, view_size, boundary):
+    """External finite cells constrain the actual polygon, including its interior."""
+    if 'support_cells' not in target:
+        return
+    from snucem_spray_addon.planes import require_supported_polygon
+    width, height = view_size
+    if min(width, height) <= 1:
+        raise ValueError('front view unavailable')
+    points = [bilinear_quad_point(np.asarray(extent), u/(width-1), v/(height-1)) for u, v in boundary]
+    require_supported_polygon(points, target['support_cells'], target['normal'])
+
+
 def select_work_area(extent, view_size, pixels):
     """Return the metric envelope of a validated Wall Front boundary.
 

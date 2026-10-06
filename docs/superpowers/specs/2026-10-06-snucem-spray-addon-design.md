@@ -1,15 +1,18 @@
 # SNUCEM Spray Add-on 설계
 
 작성일: 2026-10-06
-상태: 구현 전 검토용 설계
+상태: Humble 애드온 구현 및 로컬 회귀 검증 완료, ROS 통합/실기 검증은 검증 기록 참조
 개발 저장소: minjeasung/sketch-robot-runtime
 개발 브랜치: codex/snucem-spray-addon
 기준 커밋: ebc36dd676602ad913a187b32762b3aedd15b88f
-연동 기준: JongHyunSeo11/SNUCEM_Robot @ fe7531f2a3738d1e690371fc5d56f5f0a12932fd
+연동 기준: JongHyunSeo11/SNUCEM_Robot_22.04 @ 7b0a2edcc3d1659bdc2dcb495d4dd63f75899f1c
+
+구현 사용법: [SNUCEM_SPRAY_ADDON.md](../../SNUCEM_SPRAY_ADDON.md)
+검증 근거: [SNUCEM_SPRAY_VALIDATION.md](../../SNUCEM_SPRAY_VALIDATION.md)
 
 ## 1. 사용자가 정한 범위
 
-새 컴퓨터에 SNUCEM_Robot을 먼저 설치한다. 그 환경의 카메라, 다중 평면 추출,
+새 컴퓨터에 SNUCEM_Robot_22.04를 먼저 설치한다. 그 환경의 카메라, 다중 평면 추출,
 로봇·공구 3D 모델, MoveIt, 드라이버를 사용한다.
 우리 웹 화면, 면 선택, 작업영역, 자유선·직선 경로, 자동 채우기, 경로 검증,
 로봇 자동 실행·중단을 작은 추가 패키지로 설치한다.
@@ -150,10 +153,10 @@ FastAPI 관리 API와 rosbridge 메시지를 유지한다.
 
 ## 8. 설치·갱신
 
-지원 설치 대상은 기존 저장소와 동일하게 Ubuntu 24.04 x86_64 / ROS 2 Jazzy / Python 3.12로 둔다.
+지원 설치 대상은 기존 저장소와 동일하게 Ubuntu 22.04 x86_64 / ROS 2 Humble / Python 3.10로 둔다.
 다른 환경에는 자동 호환을 주장하지 않는다. 새 PC 실환경은 설치 전 검사한다.
 
-1. 사용자가 SNUCEM_Robot을 설치·빌드하고 카메라/로봇 모델 구성을 완료한다.
+1. 사용자가 SNUCEM_Robot_22.04를 설치·빌드하고 카메라/로봇 모델 구성을 완료한다.
 2. add-on 배포물과 SHA256 manifest를 가져와 설치된 SNUCEM 경로를 지정한다.
 3. installer가 경로·버전·의존성·소스 인터페이스를 검사한다.
 4. SNUCEM ROS 환경을 underlay로 사용해 필요한 add-on만 구성한다.

@@ -2,19 +2,21 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans for native execution, or superpowers:subagent-driven-development if the user selects delegation. Steps use checkbox syntax for tracking.
 
-**Goal:** Install our complete Spray web/sketch/path/automatic-execution workflow as a small add-on to an existing SNUCEM_Robot installation, without modifying any JongHyun file.
+**Goal:** Install our complete Spray web/sketch/path/automatic-execution workflow as a small add-on to an existing SNUCEM_Robot_22.04 installation, without modifying any JongHyun file.
+
+**Execution record:** [Humble ledger](2026-10-06-snucem-humble-ledger.md) and [validation](../../SNUCEM_SPRAY_VALIDATION.md) are the authoritative completion/evidence record. The task-level checklists below preserve the original intended sequence; consolidated module/test names and commits are mapped in the ledger. Real ROS/robot acceptance is not inferred from implementation completion.
 
 **Architecture:** The add-on owns its files, processes and settings. A wrapper imports the installed SNUCEM perception class and exports immutable finite plane snapshots. Our adapter, path generation and executor use that data and the external stack's actual model, while retaining the existing HTTP-management/ROS-workflow separation.
 
-**Tech Stack:** Ubuntu 24.04 x86_64, ROS 2 Jazzy, Python 3.12, FastAPI/Uvicorn, NumPy/SciPy/OpenCV, existing browser JavaScript and rosbridge.
+**Tech Stack:** Ubuntu 22.04 x86_64, ROS 2 Humble, Python 3.10, FastAPI/Uvicorn, NumPy/SciPy/OpenCV, existing browser JavaScript and rosbridge.
 
 **Spec:** ../specs/2026-10-06-snucem-spray-addon-design.md
 
 ## Global Constraints
 
 - All tracked changes belong to minjeasung/sketch-robot-runtime, branch codex/snucem-spray-addon.
-- JongHyunSeo11/SNUCEM_Robot and its installed files must not be modified.
-- Supported upstream reference: fe7531f2a3738d1e690371fc5d56f5f0a12932fd; validate the imported interface/files before starting.
+- JongHyunSeo11/SNUCEM_Robot_22.04 and its installed files must not be modified.
+- Supported upstream reference: 7b0a2edcc3d1659bdc2dcb495d4dd63f75899f1c; validate the imported interface/files before starting.
 - No upstream source/model copies in the distribution. No git clone, upstream build, driver installation or camera SDK installation in the add-on installer.
 - Disable Python bytecode writes in upstream imports; logs, caches, model snapshots, locks and configuration live under the add-on installation/state root.
 - Spray only. D405, roller force control, Isaac Sim and our plane extraction variants are not launched.
@@ -176,7 +178,7 @@ Use an explicit bundle allowlist to include selected existing source files and s
 - [ ] Add a contract smoke test that drives exported planes -> request-bound selection -> work polygon -> manual/auto generated path -> model-bound validation -> fake action dispatch/cancel.
 - [ ] Provide an Ubuntu ROS integration command using an already-running external fake stack; do not start or mutate a real robot or upstream checkout.
 - [ ] Run all feasible Python/browser/package checks, inspect complete exit codes and distinguish environmental setup errors from behavioral failures.
-- [ ] On an available Ubuntu Jazzy environment, run actual external fake-stack smoke and record the model, topics/actions and results. If unavailable, label it unverified; do not mark hardware readiness complete.
+- [ ] On an available Ubuntu Humble environment, run actual external fake-stack smoke and record the model, topics/actions and results. If unavailable, label it unverified; do not mark hardware readiness complete.
 - [ ] Obtain one fresh whole-branch review after implementation, fix material findings with reproducing tests and rerun affected suites.
 - [ ] Verify git diff contains no upstream copies or changes; verify the upstream repository is read-only throughout.
 - [ ] Push commits only to codex/snucem-spray-addon, open a draft PR in minjeasung/sketch-robot-runtime and attach it to this chat. Do not merge main.
