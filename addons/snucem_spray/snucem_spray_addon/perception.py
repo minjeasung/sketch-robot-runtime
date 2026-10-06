@@ -6,7 +6,7 @@ import uuid
 
 from .compatibility import require_upstream
 from .model import file_hash
-from .planes import measured_cells, snapshot, StableSupport
+from .planes import measured_cells, SnapshotBuilder, StableSupport
 
 
 def run(config):
@@ -38,6 +38,7 @@ def run(config):
             self.source_session = uuid.uuid4().hex
             self.export_at = float('-inf')
             self.stable_support = StableSupport()
+            self.snapshots = SnapshotBuilder()
             self.export_pub = None
             super().__init__(parsed)
             self.export_pub = self.create_publisher(String, '/snucem_sketch/plane_catalog',
@@ -74,8 +75,11 @@ def run(config):
                             inlier_count=len(support), rms_m=rms))
                 session = self.source_session+':'+str(revision)
                 entries = self.stable_support.update(entries, session)
-                data = snapshot(entries, session,
+                data = self.snapshots.build(entries, session,
                                 self.get_clock().now().nanoseconds, file_hash(calibration))
+                with self._observation_lock:
+                    if self._workcell_revision != revision or time.monotonic()-observation[1] > 1.0:
+                        raise ValueError('observation changed or expired during export')
             except (ValueError, OSError, KeyError) as exc:
                 data = dict(schema_version=1, planes=[], revision='', error=str(exc),
                             source_session=self.source_session)

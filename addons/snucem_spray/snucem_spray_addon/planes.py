@@ -3,6 +3,7 @@ import hashlib
 import copy
 import json
 import numpy as np
+import shapely
 from scipy.spatial import Delaunay, QhullError
 from shapely.geometry import Polygon, box
 from shapely.ops import unary_union
@@ -59,17 +60,27 @@ def support_shape(cells, normal, origin):
     uv = basis(normal)
     if not isinstance(cells, list) or not 1 <= len(cells) <= 12000:
         raise ValueError('finite measured support required')
-    polygons = []
+    groups = {}
     for cell in cells:
-        a = np.asarray(cell, float)
-        if a.ndim != 2 or a.shape[1] != 3 or not 3 <= len(a) <= 64:
+        if not isinstance(cell, (list, tuple)) or not 3 <= len(cell) <= 64:
+            raise ValueError('invalid support cell')
+        groups.setdefault(len(cell), []).append(cell)
+    polygons = []
+    for count, group in groups.items():
+        a = np.asarray(group, float)
+        if a.shape != (len(group), count, 3):
             raise ValueError('invalid support cell')
         if not np.isfinite(a).all() or np.max(abs(a)) > 10 or np.max(abs((a-origin) @ normal)) > .002:
             raise ValueError('nonfinite/nonplanar support')
-        p = Polygon((a-origin) @ uv)
-        if not p.is_valid or p.area < 1e-10 or abs(p.convex_hull.area-p.area) > 1e-9:
+        # NumPy/Shapely batch operations keep thousands of measured triangles
+        # within the live source heartbeat budget. The geometric checks match
+        # the scalar path, including concavity and invalid/self-crossing cells.
+        group_polygons = shapely.polygons((a-origin) @ uv)
+        areas = shapely.area(group_polygons)
+        if (not np.all(shapely.is_valid(group_polygons)) or np.any(areas < 1e-10)
+                or np.any(abs(shapely.area(shapely.convex_hull(group_polygons))-areas) > 1e-9)):
             raise ValueError('degenerate/nonconvex support cell')
-        polygons.append(p)
+        polygons.extend(group_polygons)
     return unary_union(polygons), uv
 
 
@@ -96,23 +107,33 @@ class StableSupport:
     def __init__(self):
         self.session = None
         self.entries = {}
+        self.shapes = {}
+        self.inputs = {}
 
     def update(self, entries, session):
         previous = self.entries if session == self.session else {}
-        stable = {}
+        stable, shapes, inputs = {}, {}, {}
         for entry in entries:
             value = copy.deepcopy(entry)
-            old = previous.get(entry['plane_id'])
-            if old is not None and all(np.allclose(old[k], entry[k], atol=1e-10, rtol=0)
-                                       for k in ('center', 'normal')):
-                origin = np.asarray(old['center'])
-                shape, _ = support_shape(entry['cells'], entry['normal'], origin)
-                retained, _ = support_shape(old['cells'], old['normal'], origin)
-                if shape.buffer(1e-8).covers(retained):
+            ident = entry['plane_id']
+            if ident in stable:
+                raise ValueError('duplicate plane identity')
+            old = previous.get(ident)
+            inputs[ident] = fingerprint({k:entry[k] for k in ('center', 'normal', 'cells')})
+            if old is not None and inputs[ident] == self.inputs.get(ident):
+                value['cells'] = copy.deepcopy(old['cells'])
+                value['center'], value['normal'] = old['center'], old['normal']
+                shape = self.shapes[ident]
+            else:
+                shape, _ = support_shape(entry['cells'], entry['normal'], np.asarray(entry['center']))
+                if (old is not None and old['center'] == entry['center'] and old['normal'] == entry['normal']
+                        and shape.buffer(1e-8).covers(self.shapes[ident])):
                     value['cells'] = copy.deepcopy(old['cells'])
                     value['center'], value['normal'] = old['center'], old['normal']
-            stable[entry['plane_id']] = value
+                    shape = self.shapes[ident]
+            stable[ident], shapes[ident] = value, shape
         self.session, self.entries = session, stable
+        self.shapes, self.inputs = shapes, inputs
         return list(stable.values())
 
 
@@ -147,6 +168,29 @@ def snapshot(entries, source_session, stamp_ns, calibration_id, frame_id='link0'
     geometric = dict(identity, planes=[{k:v for k, v in p.items() if k not in ('inlier_count', 'rms_m')}
                                        for p in clean])
     return dict(identity, revision=fingerprint(geometric), stamp_ns=stamp_ns)
+
+
+class SnapshotBuilder:
+    """Reuse validated immutable geometry, never freshness or quality checks."""
+    def __init__(self):
+        self.key, self.value = None, None
+
+    def build(self, entries, source_session, stamp_ns, calibration_id):
+        if type(stamp_ns) is not int or stamp_ns <= 0:
+            raise ValueError('positive source timestamp required')
+        for entry in entries:
+            count, rms = entry['inlier_count'], entry['rms_m']
+            if type(count) is not int or count < 80 or not np.isfinite(rms) or not 0 <= rms <= .015:
+                raise ValueError('insufficient measured plane quality')
+        key = fingerprint(dict(session=source_session, calibration=calibration_id,
+            planes=[{k:v for k, v in e.items() if k not in ('inlier_count', 'rms_m')} for e in entries]))
+        if key != self.key:
+            self.value = snapshot(entries, source_session, stamp_ns, calibration_id)
+            self.key = key
+        quality = {e['plane_id']:e for e in entries}
+        planes = [dict(p, inlier_count=quality[p['id']]['inlier_count'], rms_m=quality[p['id']]['rms_m'])
+                  for p in self.value['planes']]
+        return dict(self.value, stamp_ns=stamp_ns, planes=planes)
 
 
 def project_catalogue(data, intrinsics, size, transform, generation, selection):

@@ -42,6 +42,22 @@ def test_verified_hold_preserves_frozen_measured_support_but_loss_revokes():
     assert tracker.update([], 'workcell:1') == []
 
 
+def test_cached_snapshot_still_validates_quality_and_calibration():
+    m = module('planes')
+    builder = m.SnapshotBuilder()
+    first = builder.build([entry()], 'session', 1, 'cal')
+    e = entry()
+    e['rms_m'], e['inlier_count'] = .005, 200
+    second = builder.build([e], 'session', 2, 'cal')
+    assert second['revision'] == first['revision']
+    assert second['stamp_ns'] == 2 and second['planes'][0]['inlier_count'] == 200
+    assert first['planes'][0]['inlier_count'] == 120
+    assert builder.build([e], 'session', 3, 'new')['revision'] != first['revision']
+    e['rms_m'] = .1
+    with pytest.raises(ValueError):
+        builder.build([e], 'session', 4, 'new')
+
+
 def test_support_rejects_gap_and_crossing_even_when_endpoints_are_inside():
     m = module('planes')
     cells = entry()['cells']
