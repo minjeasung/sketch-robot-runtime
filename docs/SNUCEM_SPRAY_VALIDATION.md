@@ -6,7 +6,7 @@
 
 ## 로컬 검증
 
-Windows / Python 3.12에서 다음 명령은 **215 passed, 2 skipped**였습니다.
+Windows / Python 3.12에서 다음 명령은 **218 passed, 2 skipped**였습니다.
 skip은 Windows symlink 권한과 설치되지 않은 rclpy입니다.
 의존성의 AnyIO deprecated alias 경고 1개가 있으며 테스트 실패는 아닙니다.
 
@@ -20,10 +20,11 @@ python -m pytest -q addons/snucem_spray/tests \
 node --test web/test/*.test.js
 ```
 
-브라우저 테스트는 **65 passed**. `git diff --check` 통과.
+브라우저 테스트는 **66 passed**. `git diff --check` 통과.
 Python 소스는 Python3.10 문법으로 parse 검사했습니다.
 번들 재생성 결과가 바이트 단위로 같고, 파일별 해시/경로 검증, 설치 실패/실행 중
-업그레이드 거절, 설정·원본 파일 보존을 검사했습니다.
+업그레이드 거절, 의존성 설치 실패 시 이전 활성 버전 유지, 설정·원본 파일 보존을 검사했습니다.
+상태 파일의 symlink와 hardlink도 거절합니다.
 
 전체 `src` suite를 Windows에서 실행한 결과는 665 passed, 18 skipped,
 14 failed, 23 errors였습니다. ROS 메시지/ament 미설치, Windows의 SIGKILL 부재,
@@ -43,12 +44,27 @@ symlink 권한, 기존 테스트의 기본 cp949 인코딩 등 환경 의존 실
 
 최종 리뷰에서 남은 critical/important 지적은 없었습니다.
 
-## Humble CI와 현장 확인
+## Humble CI
 
 `.github/workflows/snucem-humble.yml`은 `ros:humble-ros-base-jammy`에서
 실제 ROS 메시지와 synthetic URDF/SRDF로 모듈 import, 노드 생성,
-live 상태 누락 시 물리 dispatch 차단을 검사합니다. 현재 작성 시점 실행 결과는 대기 중입니다.
+live 상태 누락 시 물리 dispatch 차단을 검사합니다.
+2026-10-06의 [CI 실행](https://github.com/minjeasung/sketch-robot-runtime/actions/runs/37434249227)은
+런타임 커밋 `51de13a1933681ff11bc7671d347638312610d51`에서 **전체 절차 성공**입니다.
+핵심 회귀 검사는 **285 passed**, 환경 skip 없음, AnyIO 경고 1개입니다.
+압축 배포물을 설치한 별도 Python 프로세스에서도 원래 checkout의 모듈을 가져오지 않고
+실행기·projector·generator·preview 노드를 생성하고 명령 차단을 확인했습니다.
 외부 원본 접근 권한이나 실제 로봇을 사용하는 작업은 아닙니다.
+
+별도로 기존 `test_moveit_executor_fail_closed.py`의 119개를 변경 전
+`ebc36dd676602ad913a187b32762b3aedd15b88f` 및 현재 코드에서 같은 Humble 환경으로 실행했습니다.
+두 결과 모두 **109 passed, 10 failed**이고 실패한 테스트 이름도 동일합니다.
+비교 보고서는 **new_regressions: [], missing: []**입니다.
+기존 접촉 도장 fixture 누락 및 오래된 취소 동작 기대값의 실패를 숨기지 않으며,
+이 suite 자체를 전체 통과로 표시하지 않습니다. 비교 XML/JSON은 CI artifact에 포함합니다.
+경량 배포물 생성·업로드도 성공했습니다.
+
+## 현장 확인
 
 현장에서는 다음 순서의 별도 검증이 필요합니다.
 
@@ -60,4 +76,4 @@ live 상태 누락 시 물리 dispatch 차단을 검사합니다. 현재 작성 
 6. 독립 건 OFF 기본값/lease 만료/실제 ACK 검증 후 spray profile 운전.
 
 실제 ROS 그래프에서 원본 wrapper가 동작하는지, MoveIt 전체 경로가 실행되는지,
-실물 로봇과 분사 건의 정지·취소가 확인되는지는 이 Windows 작업에서 검증하지 못했습니다.
+실물 로봇과 분사 건의 정지·취소가 확인되는지는 로컬 검사와 이번 CI에서 검증하지 못했습니다.

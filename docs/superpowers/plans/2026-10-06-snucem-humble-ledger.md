@@ -35,7 +35,7 @@ Ruling: finite measured support is exported independently from inferred support.
 - [x] Task 4: guarded automatic execution (`execution.py`, `execution_guard.py`, opt-in existing executor hooks; real robot acceptance remains pending).
 - [x] Task 5: Spray-only management and web integration (`runtime.py`, `api.py`, `cli.py`, `web/addon.html`, existing Sketch page injection).
 - [x] Task 6: deterministic distribution and installer (`packaging.py`, `install.py`, launcher scripts, `test_packaging.py`).
-- [ ] Task 7: regression, integration harness, review and delivery.
+- [x] Task 7: regression, isolated Humble integration harness, review and delivery (physical stack acceptance remains pending).
 
 ## Execution decisions and evidence
 
@@ -46,5 +46,8 @@ Ruling: finite measured support is exported independently from inferred support.
 - Existing projector ROS stub lacked CompressedImage on Windows; reproduced 49 setup errors, then repaired only the fixture. Runtime behavior unchanged by this test repair.
 - Additional owned-child path escape test reproduced missing validation, then passed after destination validation was added to writes.
 - Fresh read-only code reviewer identified cloud freshness, verified_hold remeshing and shutdown-context problems; all corrected and rechecked. No remaining critical/important finding in the reviewed snapshot.
-- Concentrated Windows Python verification: 215 passed, 2 skipped (symlink privilege; rclpy absent). Browser: 65 passed. Full cross-platform suite limitations documented separately.
+- Concentrated Windows Python verification: 218 passed, 2 skipped (symlink privilege; rclpy absent). Browser: 66 passed. Full cross-platform suite limitations documented separately.
 - Added `.github/workflows/snucem-humble.yml` using Ubuntu22.04 / real Humble messages and an isolated ROS domain. `test_ros_smoke.py` checks constructors and blocked dispatch; it does not substitute for MoveIt/FJT/hardware acceptance.
+- Humble CI run `37434249227` at runtime commit `51de13a`: 285 passed; installed compact bundle imports and initializes nodes in a separate interpreter. Packaging/upload succeeded.
+- Legacy contact suite differential against unchanged parent `ebc36dd`: 119 cases, 109 passed and the same 10 existing failures on both versions. No new regressions or missing cases. Reports are attached to the CI artifact.
+- Delivery remains on `codex/snucem-spray-addon`, draft PR #2. The upstream repository and target main branch were not modified. The Korean guide and validation record separate CI results from pending real MoveIt/FJT/robot/gun acceptance.
