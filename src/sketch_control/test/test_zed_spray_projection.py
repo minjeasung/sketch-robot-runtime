@@ -381,8 +381,12 @@ def _image(sec=11):
     rgb[:, :, 0] = np.arange(640, dtype=np.uint16)[None, :] // 3
     rgb[:, :, 1] = np.arange(480, dtype=np.uint16)[:, None] // 2
     rgb[:, :, 2] = 33
+    # Preserve the real builtin_interfaces/Time type on ROS hosts; the
+    # transport-only fallback supplies its compatible stamp object here.
+    stamp = PoseArray().header.stamp
+    stamp.sec, stamp.nanosec = sec, 0
     return SimpleNamespace(
-        header=SimpleNamespace(frame_id="zed_optical", stamp=SimpleNamespace(sec=sec, nanosec=0)),
+        header=SimpleNamespace(frame_id="zed_optical", stamp=stamp),
         width=640, height=480, encoding="rgb8", data=rgb.tobytes(), step=640 * 3)
 
 

@@ -34,7 +34,7 @@ jobs:
         run: |
           source /opt/ros/humble/setup.bash
           export PYTHONPATH="$PWD/addons/snucem_spray:$PWD/src/sketch_control:$PWD/src/rbpodo_painting_control:$PYTHONPATH"
-          python3 -m pytest -q addons/snucem_spray/tests src/sketch_control/test/test_zed_spray_projection.py src/sketch_control/test/test_zed_spray_generation.py src/sketch_control/test/test_polygon_work_area.py src/rbpodo_painting_control/test/test_spray_eoat.py
+          python3 -m pytest -q addons/snucem_spray/tests src/sketch_control/test/test_zed_spray_projection.py src/sketch_control/test/test_zed_spray_generation.py src/sketch_control/test/test_polygon_work_area.py src/rbpodo_painting_control/test/test_spray_eoat.py src/sketch_control/test/test_moveit_executor_fail_closed.py src/sketch_control/test/test_executor_plan_identity.py src/sketch_control/test/test_spray_motion_test.py src/sketch_control/test/test_contact_collision_acm.py src/sketch_control/test/test_multi_plane_spray.py
       - name: Build deterministic distribution
         run: python3 scripts/package_snucem_spray.py --output /tmp/snucem-spray-humble.tar.gz
       - uses: actions/upload-artifact@v4
