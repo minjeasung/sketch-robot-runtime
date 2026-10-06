@@ -52,3 +52,30 @@ def test_installer_rejects_traversal_before_creating_files(tmp_path):
     with pytest.raises(ValueError):
         installer.install_bundle(archive, cfg)
     assert not (tmp_path/'escape').exists()
+
+
+def test_environment_setup_failure_does_not_activate_new_version(tmp_path, monkeypatch):
+    from dataclasses import asdict
+    import subprocess
+    cli = module('cli')
+    bundle, _ = module('packaging').build_bundle(ROOT, tmp_path/'bundle.tar.gz')
+    up = tmp_path/'up'
+    up.mkdir()
+    cfg = module('config').AddonConfig(str(up), str(tmp_path/'install'), str(tmp_path/'state'))
+    state = Path(cfg.state_root)
+    state.mkdir()
+    active = state/'active-version.json'
+    active.write_text('{"version":"previous"}')
+    config_file = state/'config.json'
+    config_file.write_text(json.dumps(asdict(cfg)), encoding='utf-8')
+    original_read = Path.read_text
+    def read_text(path, *args, **kwargs):
+        return 'VERSION_ID="22.04"' if path == Path('/etc/os-release') else original_read(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'read_text', read_text)
+    monkeypatch.setattr(cli, 'check_platform', lambda *args: None)
+    def setup_failure(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, args[0])
+    monkeypatch.setattr(cli.subprocess, 'run', setup_failure)
+    with pytest.raises(subprocess.CalledProcessError):
+        cli.main(['--config', str(config_file), 'install', '--bundle', str(bundle), '--setup-env'])
+    assert json.loads(active.read_text()) == {'version': 'previous'}

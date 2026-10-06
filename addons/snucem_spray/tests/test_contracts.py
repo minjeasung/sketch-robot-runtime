@@ -1,6 +1,7 @@
 import ast
 import importlib
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -80,6 +81,22 @@ def test_owned_child_rejects_traversal_and_escaped_resolution(tmp_path, monkeypa
     monkeypatch.setattr(Path, 'resolve', resolve)
     with pytest.raises(ValueError):
         m.owned_path(root, 'logs')
+
+
+def test_hardlink_write_alias_is_rejected(tmp_path):
+    m = module('config')
+    up, state = tmp_path/'up', tmp_path/'state'
+    up.mkdir()
+    state.mkdir()
+    original = up/'original'
+    original.write_text('preserve')
+    try:
+        os.link(original, state/'active-version.tmp')
+    except OSError:
+        pytest.skip('filesystem does not support hard links')
+    with pytest.raises(ValueError, match='hard link'):
+        m.owned_path(state, 'active-version.tmp')
+    assert original.read_text() == 'preserve'
 
 
 def test_python_sources_compile_as_python310():

@@ -38,9 +38,9 @@ jobs:
       - name: Compare legacy contact failures with the unchanged parent
         run: |
           source /opt/ros/humble/setup.bash
-          git fetch --depth=1 origin ebc36dd676602ad913a187b32762b3aedd15b88f
+          git -c safe.directory="$PWD" fetch --depth=1 origin ebc36dd676602ad913a187b32762b3aedd15b88f
           mkdir -p "$RUNNER_TEMP/snucem-parent"
-          git archive ebc36dd676602ad913a187b32762b3aedd15b88f src | tar -x -C "$RUNNER_TEMP/snucem-parent"
+          git -c safe.directory="$PWD" archive ebc36dd676602ad913a187b32762b3aedd15b88f src | tar -x -C "$RUNNER_TEMP/snucem-parent"
           python3 scripts/check_snucem_baseline.py --baseline "$RUNNER_TEMP/snucem-parent" --current "$PWD" --reports /tmp/snucem-regression-reports
       - name: Build deterministic distribution
         run: python3 scripts/package_snucem_spray.py --output /tmp/snucem-spray-humble.tar.gz

@@ -4,7 +4,10 @@ No MoveIt/FJT server or physical driver is started. This checks constructors,
 real message APIs and the command boundary, not robot integration success.
 """
 import os
+import json
 from pathlib import Path
+import subprocess
+import sys
 import pytest
 from test_contracts import ROOT, module
 from test_model_guard import robot, semantic, limits
@@ -57,3 +60,39 @@ def test_real_humble_nodes_and_blocked_dispatch(tmp_path, monkeypatch):
         for node in reversed(nodes):
             node.destroy_node()
         rclpy.shutdown()
+    # A separate interpreter proves the compact archive is self-contained;
+    # imports must not fall back to this checkout's unshipped files/assets.
+    root = Path(installed['version_root'])
+    inherited = [p for p in os.environ.get('PYTHONPATH', '').split(os.pathsep) if p
+                 and not Path(p).resolve().is_relative_to(ROOT)]
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join([
+        str(root/'addons/snucem_spray'), str(root/'src/sketch_control'),
+        str(root/'src/rbpodo_painting_control'), *inherited]),
+        ROS_HOME=str(tmp_path/'ros'), ROS_LOG_DIR=str(tmp_path/'logs'))
+    code = '''
+import json, sys
+from pathlib import Path
+import rclpy
+import snucem_spray_addon.execution as external
+import sketch_control.moveit_executor as execution
+from sketch_control.wall_projector_node import WallProjectorNode
+from sketch_control.zed_preview_node import ZedPreviewNode
+from sketch_control import sketch_to_waypoints_node as generator
+root = Path(sys.argv[1])
+assert Path(external.__file__).is_relative_to(root)
+assert Path(execution.__file__).is_relative_to(root)
+rclpy.init(args=json.loads(sys.argv[2]))
+nodes = []
+try:
+    nodes.append(external.executor_class()())
+    generator.WORLD_FRAME = 'link0'
+    nodes.extend([WallProjectorNode(), generator.SketchToWaypointsNode(), ZedPreviewNode()])
+    assert nodes[0]._external_motion_blockers()
+finally:
+    for node in reversed(nodes):
+        node.destroy_node()
+    rclpy.shutdown()
+'''
+    result = subprocess.run([sys.executable, '-B', '-c', code, str(root), json.dumps(args)],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout+'\n'+result.stderr

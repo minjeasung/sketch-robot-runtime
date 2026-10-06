@@ -37,6 +37,8 @@ def owned_path(root, relative):
     path = root/relative
     if not path.resolve().is_relative_to(root):
         raise ValueError('write path escapes its owned root')
+    if path.is_file() and path.stat().st_nlink > 1:
+        raise ValueError('owned write files must not have hard links')
     for part in [path, *path.parents]:
         if part == root:
             break
