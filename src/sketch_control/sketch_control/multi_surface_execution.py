@@ -301,6 +301,9 @@ class MultiSurfaceMixin(D405ScanSelectionMixin):
             center=plane["center"], normal=plane["normal"], corners=plane["corners"],
             inlier_count=plane["inlier_count"], rms_m=plane["rms_m"],
             stamp=dict(sec=stamp.sec, nanosec=stamp.nanosec))
+        if 'support_cells' in plane:
+            self._zed_target_lock['support_cells'] = copy.deepcopy(plane['support_cells'])
+            self._zed_target_lock['source_revision'] = self._multi_catalog.get('source_revision', '')
         self._multi_active_id = plane_id
         # All selected faces already have RANSAC estimates; activation never moves the arm.
         self._multi_refined = {pid: None for pid in self._multi_selected}

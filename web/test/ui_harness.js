@@ -6,7 +6,7 @@ const vm = require("node:vm");
 
 // Only browser drawing and ROS transport are replaced. Production scripts own
 // every handler, state transition, outgoing message, and disabled control.
-function loadUI(page = "index.html", fetch) {
+function loadUI(page = "index.html", fetch, runtime) {
   const html = fs.readFileSync(path.join(__dirname, "..", page), "utf8");
   const elements = new Map();
   const radios = [];
@@ -78,7 +78,7 @@ function loadUI(page = "index.html", fetch) {
   const topics = [];
   let ros;
   class Ros {
-    constructor() { if (!ros) ros = this; connections.push(this); this.listeners = {}; }
+    constructor(options = {}) { if (!ros) ros = this; connections.push(this); this.listeners = {}; this.initialUrl = options.url; }
     connect(url) { this.connectCalls = [...(this.connectCalls || []), url]; }
     callOnConnection(packet) { this.packets = [...(this.packets || []), packet]; }
     on(event, fn) { (this.listeners[event] ||= []).push(fn); }
@@ -111,6 +111,7 @@ function loadUI(page = "index.html", fetch) {
     URL, fetch,
   });
   context.window = context;
+  context.SKETCH_RUNTIME = runtime;
   for (const [, src] of html.matchAll(/<script src="([^"]+)"/g)) {
     if (src.endsWith("roslib.min.js")) continue;
     const name = src.replace(/^\/sketch\//, "").split("?")[0];

@@ -179,6 +179,9 @@ def _load_profile(path, model_id, tool_axis):
     path = Path(path).expanduser().resolve()
     config = json.loads(_read_bounded(path, 1_000_000).decode("utf-8-sig"),
                         object_pairs_hook=_unique_keys)
+    if isinstance(config, dict) and config.get('kind') == 'snucem_external':
+        from snucem_spray_addon.model import external_profile
+        return external_profile(path, model_id, tool_axis)
     if not isinstance(config, dict) or type(config.get("schema_version")) is not int:
         raise ValueError("spray EOAT profile requires integer schema_version")
     if config["schema_version"] != 1:

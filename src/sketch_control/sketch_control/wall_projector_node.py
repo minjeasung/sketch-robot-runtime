@@ -44,6 +44,7 @@ from sketch_control.work_area_geometry import work_area_polygon
 from sketch_control.zed_spray_projection import (
     plane_orientation, project_target_rectangle, select_work_area, stamp_ns,
     validate_target_lock, validate_work_area_request, validate_visible_work_area,
+    validate_measured_work_boundary,
 )
 
 
@@ -600,6 +601,7 @@ class WallProjectorNode(Node):
             if self._zed_front_camera is None:
                 raise ValueError("selection requires current ZED camera geometry")
             validate_visible_work_area(corners, *self._zed_front_camera)
+            validate_measured_work_boundary(target, self.front_view_extent, self.front_view_size, boundary)
             payload = self._zed_surface_payload("work_area", corners, str(selection))
             payload["boundary_pixels"] = boundary.tolist()
         except (ValueError, TypeError, OverflowError) as exc:

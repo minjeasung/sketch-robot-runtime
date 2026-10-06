@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SNUCEM 스케치 뿜칠</title>
+<style>body{font:16px/1.6 system-ui,sans-serif;max-width:820px;margin:6vh auto;padding:24px;background:#f3f5f8;color:#142335}h1{font-size:30px}section{background:white;border:1px solid #dae0e8;border-radius:16px;padding:24px;margin:20px 0}button,a.button{display:inline-block;background:#155cbd;color:white;border:0;border-radius:8px;padding:12px 20px;font:inherit;text-decoration:none;margin:4px;cursor:pointer}button.secondary{background:#43556d}input{font:inherit;padding:10px;border:1px solid #bdc8d4;border-radius:6px}pre{white-space:pre-wrap;font:14px/1.6 ui-monospace,monospace}.error{color:#a22820}</style>
+<h1>SNUCEM 스케치 뿜칠</h1><p>Ubuntu 22.04 · ROS 2 Humble</p>
+<section><h2>작업 준비</h2><p>외부 로봇 스택과 카메라가 실행된 상태에서 추가 기능을 시작하세요. 준비가 끝나면 스케치 화면에서 평면·작업영역·경로를 지정합니다.</p>
+<p id="profile"></p><label>관리 토큰 <input id="token" type="password" autocomplete="off" placeholder="설정한 경우 입력"></label><p>
+<button id="prepare">추가 기능 시작</button><a class="button" href="/sketch/" target="_blank" rel="noopener">스케치 화면 열기 ↗</a><button class="secondary" id="shutdown">추가 기능 종료</button></p>
+<p>실제 로봇 실행은 스케치 화면의 검증·작업 시작으로 별도 승인합니다. 종료 버튼은 이 추가 기능이 시작한 프로세스만 종료합니다.</p><p id="message" role="status"></p></section>
+<section><h2>현재 상태</h2><pre id="status">확인 중…</pre></section>
+<script>
+const el=id=>document.getElementById(id);
+async function refresh(){try{const r=await fetch('/status');const s=await r.json();el('profile').textContent='실행 모드: '+s.configuration.profile+' · 로봇: '+s.configuration.model_id;el('status').textContent=Object.entries(s.owned).map(([name,p])=>name+': '+(p.running?'실행 중':'종료됨')).join('\n')||'추가 기능 정지';if(s.error)el('status').textContent+='\n'+s.error;}catch(e){el('status').textContent='관리 서버에 연결할 수 없습니다.';}}
+for(const action of ['prepare','shutdown'])el(action).onclick=async()=>{el('prepare').disabled=el('shutdown').disabled=true;el('message').textContent='처리 중…';try{const r=await fetch('/'+action,{method:'POST',headers:{Authorization:'Bearer '+el('token').value}});const s=await r.json();if(!r.ok)throw Error(s.detail||'요청 실패');el('message').textContent=action==='prepare'?'추가 기능이 시작되었습니다.':'추가 기능이 종료되었습니다.';}catch(e){el('message').textContent=e.message;}finally{el('prepare').disabled=el('shutdown').disabled=false;refresh();}};
+refresh();setInterval(refresh,2000);
+</script></html>

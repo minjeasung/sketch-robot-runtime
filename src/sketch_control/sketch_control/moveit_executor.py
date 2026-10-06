@@ -551,7 +551,20 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         self.model_id = validate_model(self.declare_parameter(
             "model_id", DEFAULT_MODEL, ParameterDescriptor(read_only=True)
         ).value)
-        self._robot_joint_limits = model_joint_limits(self.model_id)
+        external_profile_path = str(self.declare_parameter(
+            "external_stack_model", "", ParameterDescriptor(read_only=True)).value)
+        self._external_stack_model = None
+        if external_profile_path:
+            from snucem_spray_addon.model import load_descriptor
+            self._external_stack_model = load_descriptor(external_profile_path)
+            if self._external_stack_model['model_id'] != self.model_id:
+                raise ValueError('external stack robot model mismatch')
+            if not callable(getattr(self, '_external_motion_blockers', None)):
+                raise ValueError('external stack requires the guarded add-on executor')
+            self._robot_joint_limits = {name: (limit['lower'], limit['upper'])
+                for name, limit in self._external_stack_model['joint_limits'].items()}
+        else:
+            self._robot_joint_limits = model_joint_limits(self.model_id)
 
         self.execution_backend = str(
             self.declare_parameter(
@@ -1189,6 +1202,8 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         self._acm_health_query_timer = None
         self._latest_allowed_collision_matrix = None
         self._required_acm_allowed_pairs = (
+            tuple(map(tuple, self._external_stack_model['collision_pairs']))
+            if self._external_stack_model else
             MoveItExecutor._load_srdf_allowed_collision_pairs(self.model_id)
         )
         if not self._required_acm_allowed_pairs:
@@ -2360,6 +2375,11 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
     def _motion_dispatch_inhibited_reason(
         self, *, requires_contact_acm=False, contact_acm_context=None
     ):
+        external_guard = getattr(self, '_external_motion_blockers', None)
+        if external_guard is not None:
+            reasons = external_guard()
+            if reasons:
+                return ','.join(reasons)
         if getattr(self, "_hardware_motion_inhibited", False):
             return "HARDWARE_MOTION_INHIBITED_RELAUNCH_REQUIRED"
         if getattr(self, "_fjt_motion_state_unknown", False):
@@ -4033,6 +4053,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         # 첫 Submit 안전성: READY_POSE 가 아니면 먼저 collision-aware joint plan 으로
         # READY_POSE 로 복귀한 뒤 같은 sketch execute 를 다시 시작한다.
         if (START_FROM_READY_BEFORE_SKETCH
+                and not getattr(self, '_external_stack_model', None)
                 and getattr(self, "model_id", DEFAULT_MODEL) == DEFAULT_MODEL
                 and not self._is_at_ready_pose()):
             self.get_logger().warn(
@@ -9966,10 +9987,11 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         self._stale_dynamic_obstacle_ids.clear()
 
         # --- 활성 물체 전부 ---
-        world_to_base = self._lookup_transform_to_base("World", timeout_s=0.05)
+        scene_frame = BASE_FRAME if getattr(self, '_external_stack_model', None) else "World"
+        world_to_base = self._lookup_transform_to_base(scene_frame, timeout_s=0.05)
         if world_to_base is None:
             self.get_logger().warn(
-                f"[SCENE] {BASE_FRAME}<-World TF 미수신 -> scene publish 보류",
+                f"[SCENE] {BASE_FRAME}<-{scene_frame} TF 미수신 -> scene publish 보류",
                 throttle_duration_sec=2.0)
             return
 
@@ -10070,10 +10092,10 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
                 return
             ps.world.collision_objects.extend(objects)
 
-        if spray_profile is not None:
+        if spray_profile is not None and not getattr(self, '_external_stack_model', None):
             ps.robot_state.attached_collision_objects.append(
                 self._spray_eoat_collision_object(spray_profile))
-        else:
+        elif spray_profile is None:
             eoat_aco = self._paint_eoat_collision_object()
             if PUBLISH_EOAT_ATTACHED_OBJECT:
                 ps.robot_state.attached_collision_objects.append(eoat_aco)
