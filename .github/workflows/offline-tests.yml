@@ -1,0 +1,29 @@
+name: Offline checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    name: Python + UI (no ROS or hardware)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install isolated test dependency
+        run: python3 -m pip install --disable-pip-version-check "pytest>=8,<10"
+      - name: Run offline-only tests
+        run: bash scripts/ci/offline_tests.sh
+
