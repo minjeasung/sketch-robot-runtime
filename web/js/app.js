@@ -4,6 +4,7 @@
 let processMode = "paint";
 let sprayMotionTest = false;
 let planningOnly = false;
+let executionRuntime = {simulation: false, spray_standoff_m: null};
 let backendPreview = null;
 let processModePending = true;
 let multiPlaneBusy = false;
@@ -47,13 +48,25 @@ const ros = new ROSLIB.Ros({ url: WS_URL });
 const imageRos = new ROSLIB.Ros({ url: WS_URL });
 let rosConnected = false;
 let zedImageReliable = false;
+let controlReconnectTimer = null;
+
+function sprayStandoffText() {
+  const metres = executionRuntime.spray_standoff_m;
+  return typeof metres === 'number' && Number.isFinite(metres) && metres > 0
+    ? `${Math.round(metres * 10000) / 100} cm` : '설정된 거리';
+}
 
 async function refreshImageTransport() {
   if (typeof fetch !== "function") return;
   try {
     const response = await fetch(new URL("/status", window.location.href));
     if (!response.ok) return;
-    const {configuration} = await response.json();
+    const {configuration, runtime} = await response.json();
+    executionRuntime = {
+      simulation: runtime?.simulation === true || ['isaac_construct', 'fake'].includes(configuration?.profile),
+      spray_standoff_m: runtime?.spray_standoff_m ?? null,
+    };
+    if (typeof renderProcessModeState === 'function') renderProcessModeState();
     const reliable = configuration?.camera_backend === "outpost" && configuration?.profile !== "fake";
     if (zedImageReliable !== reliable) {
       zedImageReliable = reliable;
@@ -63,6 +76,8 @@ async function refreshImageTransport() {
 }
 
 ros.on("connection", () => {
+  clearTimeout(controlReconnectTimer);
+  controlReconnectTimer = null;
   rosConnected = true;
   requireFreshAuthoritativeState("ROS connected; awaiting fresh backend status");
   setStatus("connected", "connected");
@@ -89,6 +104,14 @@ ros.on("close", () => {
   logEvent("connection closed");
   resetFreeSpaceConfirmation("ROS disconnected", false);
   refreshPaintingUI();
+  // The page may open before rosbridge finishes starting. Restore control
+  // subscriptions too; an image-only reconnect leaves mode acknowledgement
+  // pending and every sketch input locked. Existing connection handling still
+  // requires fresh backend state and never resumes a previous execution.
+  if (controlReconnectTimer === null) controlReconnectTimer = setTimeout(() => {
+    controlReconnectTimer = null;
+    if (!rosConnected) ros.connect(WS_URL);
+  }, 1000);
 });
 
 setStatus("connecting", "connecting…");
@@ -678,6 +701,7 @@ for (const topicName of [D405_REFINEMENT_STATUS_TOPIC, PLAN_STATUS_TOPIC, READIN
 }
 
 function paintingDerivedState() {
+  if (processMode === "weld" && window.WeldWorkflow) return WeldWorkflow.derived();
   const surface = currentSurfaceStatus();
   const plan = paintingState.plan;
   const readiness = paintingState.readiness;
@@ -864,6 +888,10 @@ function buttonBlockReason(derived, kind) {
 }
 
 function refreshPaintingUI() {
+  if (window.ProcessSettings) ProcessSettings.setMode(processMode);
+  if (processMode === "weld" && window.WeldWorkflow) return WeldWorkflow.render();
+  $("btn-set-target").textContent = "평면 추출";
+  $("btn-refine-planes").hidden = false;
   const derived = paintingDerivedState();
   const local = paintingState.local;
   const spray = processMode === "spray";
@@ -1036,6 +1064,7 @@ function resizeImageCanvas(width, height) {
 }
 
 function handleImageMsg(msg) {
+  if (currentView === "zed_raw" && window.WeldWorkflow) WeldWorkflow.setImageHeader(msg.header);
   try {
     const imgData = decodeImageData(msg);
     resizeImageCanvas(msg.width, msg.height);
@@ -1048,7 +1077,8 @@ function handleImageMsg(msg) {
   imageDisplayed(msg.width, msg.height, msg.encoding);
 }
 
-function handlePreviewImage(image) {
+function handlePreviewImage(image, msg) {
+  if (currentView === "zed_raw" && window.WeldWorkflow) WeldWorkflow.setImageHeader(msg?.header);
   resizeImageCanvas(image.width, image.height);
   zedCtx.drawImage(image, 0, 0);
   imageDisplayed(image.width, image.height, "JPEG preview");
@@ -1077,8 +1107,8 @@ function subscribeView(viewName) {
     onRaw: msg => {
       if (currentImageSub === sub && currentView === viewName) handleImageMsg(msg);
     },
-    onPreview: image => {
-      if (currentImageSub === sub && currentView === viewName) handlePreviewImage(image);
+    onPreview: (image, msg) => {
+      if (currentImageSub === sub && currentView === viewName) handlePreviewImage(image, msg);
     },
     onError: error => logEvent(`image decode 실패: ${error.message || error}`),
   });
@@ -1516,7 +1546,7 @@ function switchWorkflow(mode) {
     document.querySelector('input[name="sketch-mode"][value="freehand"]').checked = true;
   }
   // Work area pixels always refer to the projector's Wall Front view.
-  const targetView = mode === "target" ? "zed_raw" : "wall_front";
+  const targetView = mode === "target" || processMode === "weld" ? "zed_raw" : "wall_front";
   switchView(targetView);
   redrawSketch();
 }
@@ -1767,6 +1797,7 @@ function publishPixels(pub, topicName, frameId, strokes, stamp = null) {
 }
 
 $("btn-set-target").addEventListener("click", () => {
+  if (processMode === "weld") { WeldWorkflow.requestTarget(); return; }
   if (workflowMode !== "target" || currentView !== "zed_raw") return;
   if (zedFrameCount === 0) return;
   if (!rosConnected || processModePending || paintingDerivedState().running || !currentStrokes().length) return;
@@ -1850,6 +1881,7 @@ $("btn-set-work-area").addEventListener("click", () => {
 });
 
 $("btn-fill-work-area").addEventListener("click", () => {
+  if (processMode === "weld") { WeldWorkflow.requestPlan(); return; }
   const derived = paintingDerivedState();
   const blockers = buttonBlockReason(derived, "path");
   if (workflowMode !== "path" || currentView !== "wall_front" || blockers.length) {
@@ -1896,6 +1928,7 @@ $("btn-execute").addEventListener("click", () => {
 
 // ---- Run Robot: confirm 후 /sketch_execute Bool(true) publish ----
 $("btn-run-robot").addEventListener("click", () => {
+  if (processMode === "weld") { WeldWorkflow.execute(); return; }
   const derived = refreshPaintingUI();
   const blockers = buttonBlockReason(derived, "run");
   if (!derived.ready || blockers.length) {
@@ -1906,13 +1939,15 @@ $("btn-run-robot").addEventListener("click", () => {
   const forceNumber = Number(derived.targetForce);
   const forceText = Number.isFinite(forceNumber) ? `${forceNumber.toFixed(2)} N` : "missing";
   const ok = window.confirm(
-    "로봇 실제 실행을 승인합니까?\n\n" +
+    (executionRuntime.simulation ? "로봇 시뮬레이션 실행을 승인합니까?\n\n" : "로봇 실제 실행을 승인합니까?\n\n") +
     `작업 방식: ${processMode === "spray" ? "내화뿜칠" : "롤러 도장"}\n` +
     (processMode === "paint" ? `목표 접촉력: ${forceText}\n\n` : "\n") +
     (processMode === "spray"
-      ? (sprayMotionTest
-        ? "현재 EOAT로 작업면에서 50 cm 이격하여 실제 이동합니다. 뿜칠건 미장착 이동 검증이며 분사 출력은 항상 OFF입니다."
-        : "로봇이 작업면에서 50 cm 이격하여 이동합니다. 도포 경로에서만 뿜칠건이 켜집니다.")
+      ? (executionRuntime.simulation
+        ? `시뮬레이션 로봇이 작업면에서 ${sprayStandoffText()} 이격하여 이동합니다. 실제 분사 출력은 없습니다.`
+        : sprayMotionTest
+        ? `현재 EOAT로 작업면에서 ${sprayStandoffText()} 이격하여 실제 이동합니다. 뿜칠건 미장착 이동 검증이며 분사 출력은 항상 OFF입니다.`
+        : `로봇이 작업면에서 ${sprayStandoffText()} 이격하여 이동합니다. 도포 경로에서만 뿜칠건이 켜집니다.`)
       : "로봇이 즉시 움직입니다. 10 mm pre-contact에서 정지한 후 간격을 확인하고 F/T tare를 수행합니다."),
   );
   if (!ok) {

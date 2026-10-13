@@ -82,3 +82,14 @@ SKETCH_PROCESS_MODE=spray
 ```
 
 코드 갱신 후에는 `sketch_control`을 다시 빌드하고 웹 서버를 재시작해야 새 실행 모드가 적용됩니다.
+
+## Construct 양팔 로봇 — Isaac Sim
+
+Downloads의 Construct description/MoveIt 설정 기반 14축 시뮬레이션은
+[Construct 실행 안내](docs/CONSTRUCT_ISAAC_SIM.md)를 참고하세요.
+
+
+Construct의 영상 스케치 제어는 `bash scripts/run_system_api.sh --construct`로 실행합니다.
+원래 작업관리 `http://127.0.0.1:8081/`에서 전체 시작 후 원래 스케치 창을 여세요.
+같은 UI·평면/경로 처리·실행기를 재사용하며, `isaac_construct`는 장비 연결 설정만 분리합니다.
+[Construct 영상 스케치 실행 안내](docs/CONSTRUCT_ISAAC_SIM.md#기존-스케치-런타임으로-construct-실행-2026-10-13)

@@ -1,6 +1,6 @@
 "use strict";
 const byId = id => document.getElementById(id);
-let pending = false, latest = null, settingsLoaded = false, token = "";
+let pending = false, stopping = false, latest = null, settingsLoaded = false, token = "";
 const labels = {STOPPED: "종료", STARTING: "기동 중", RUNNING: "실행 중", STOPPING: "종료 중", FAILED: "오류", EXITED: "종료됨"};
 const processLabels = {robot_control: "robot control"};
 const processLabel = name => processLabels[name] || name;
@@ -23,8 +23,21 @@ async function api(path, method = "GET", body) {
   return payload;
 }
 function profileHelp() {
+  const isaac = byId("profile").value === "isaac_construct";
   if (["spray_motion_test", "zed_preview"].includes(byId("profile").value)) byId("process-mode").value = "spray";
+  for (const item of byId("model-id").options) item.disabled = item.value.startsWith("construct_") !== isaac;
+  if (byId("model-id").value.startsWith("construct_") !== isaac) byId("model-id").value = isaac ? "construct_left" : "rb10_1300e_u";
+  if (isaac && !["spray", "weld"].includes(byId("process-mode").value)) byId("process-mode").value="spray";
+  if (isaac) {
+    byId("camera-backend").value = "outpost";
+    byId("outpost-http").value = "http://127.0.0.1:8100";
+    byId("outpost-zed-serial").value = "stream://127.0.0.1:30000";
+    const configured = latest && latest.configuration;
+    byId("spray-eoat-profile").value = configured && configured.profile === "isaac_construct" && configured.model_id === byId("model-id").value
+      ? configured.spray_eoat_profile : `isaac_assets/${byId("model-id").value}_eoat.json`;
+  }
   byId("profile-help").textContent = {
+    isaac_construct: "Construct Isaac Sim의 ZED 스트림을 기존 Outpost·Michelo·스케치 작업 흐름에 연결합니다. 선택한 팔로 뿜칠 또는 용접 경로를 실행합니다. 시뮬레이션 준비는 최대 5분 걸릴 수 있습니다.",
     zed_preview: "로봇 없이 ZED에서 대상·작업영역·도포 경로를 생성합니다. 로봇 도달성·충돌 검증과 이동 실행은 하지 않습니다.",
     dry_run: "실제 로봇·카메라에 연결하지만 작업 경로와 힘 출력은 모의 실행합니다.",
     work: "실제 이동과 도장 힘 제어를 허용합니다. 작업 실행은 스케치 화면에서 진행합니다.",
@@ -34,22 +47,27 @@ function profileHelp() {
 }
 function controls() {
   const active = latest && latest.processes.some(p => p.pid !== null);
-  byId("start").disabled = pending || !latest || latest.system_prepared;
-  byId("stop").disabled = pending || !latest || (!active && !latest.degraded);
+  const starting = latest && latest.processes.some(p => p.pid !== null && p.state === 'STARTING');
+  byId("start").disabled = pending || stopping || !latest || latest.system_prepared;
+  byId("stop").disabled = stopping || (pending && !starting) || !latest || (!active && !latest.degraded);
   for (const id of ["profile", "process-mode", "spray-eoat-profile", "robot-ip", "model-id", "zed", "d405", "rviz", 'camera-backend',
     'outpost-http', 'outpost-zed-hw-id', 'outpost-zed-serial', 'outpost-d405-hw-id', 'outpost-d405-serial',
-    'outpost-load', 'outpost-zed-select', 'outpost-d405-select']) byId(id).disabled = pending || active;
+    'outpost-load', 'outpost-zed-select', 'outpost-d405-select']) byId(id).disabled = pending || stopping || active;
   if (byId('camera-backend').value === 'outpost') {
     for (const id of ['zed', 'd405']) { byId(id).checked = false; byId(id).disabled = true; }
   }
   if (["spray_motion_test", "zed_preview"].includes(byId("profile").value)) byId("process-mode").disabled = true;
-  if (byId("profile").value === "zed_preview") {
+  if (["zed_preview", "isaac_construct"].includes(byId("profile").value)) {
     byId('camera-backend').value = 'outpost';
     for (const id of ['robot-ip', 'rviz', 'zed', 'd405', 'camera-backend']) byId(id).disabled = true;
     for (const id of ['rviz', 'zed', 'd405']) byId(id).checked = false;
   }
+  if (byId("profile").value === "isaac_construct") {
+    for (const id of ['spray-eoat-profile', 'outpost-http', 'outpost-zed-hw-id', 'outpost-zed-serial',
+      'outpost-d405-hw-id', 'outpost-d405-serial', 'outpost-load', 'outpost-zed-select', 'outpost-d405-select']) byId(id).disabled = true;
+  }
   byId('outpost-settings').hidden = byId('camera-backend').value !== 'outpost';
-  for (const button of document.querySelectorAll(".process-row button")) button.disabled = pending || !latest;
+  for (const button of document.querySelectorAll(".process-row button")) button.disabled = pending || stopping || !latest;
 }
 function renderProcesses(state) {
   const box = byId("processes"); box.replaceChildren();
@@ -90,9 +108,12 @@ async function refresh() {
       byId("zed").checked = c.launch_zed_driver; byId("d405").checked = c.launch_d405_driver; byId("rviz").checked = c.launch_rviz;
       settingsLoaded = true; profileHelp();
     }
+    if (state.configuration.profile === 'isaac_construct' && byId('profile').value === 'isaac_construct') {
+      byId('outpost-zed-hw-id').value = state.configuration.outpost_zed_hw_id || '';
+    }
     byId("state").textContent = state.degraded ? "프로세스 오류" : state.system_prepared ? "전체 프로세스 실행 중" : "API 연결됨";
     byId("domain").textContent = `ROS domain ${state.ros_domain_id}`;
-    byId("detail").textContent = `로봇: ${state.configuration.model_id || "rb10_1300e_u"} · 서버 실행 모드: ${state.configuration.profile} · 작업 방식: ${state.configuration.process_mode === "spray" || state.configuration.profile === "spray_motion_test" ? "내화뿜칠" : "롤러 도장"} · ${state.processes.filter(p => p.state === "RUNNING").length}/${state.processes.length} 실행 중`;
+    byId("detail").textContent = `로봇: ${state.configuration.model_id || "rb10_1300e_u"} · 서버 실행 모드: ${state.configuration.profile} · 작업 방식: ${state.configuration.process_mode === "weld" ? "용접" : state.configuration.process_mode === "spray" || state.configuration.profile === "spray_motion_test" ? "내화뿜칠" : "롤러 도장"} · ${state.processes.filter(p => p.state === "RUNNING").length}/${state.processes.length} 실행 중`;
     byId("readiness").textContent = state.ros.readiness ? JSON.stringify(state.ros.readiness) : "최신 ROS 작업 준비 상태를 기다리는 중입니다.";
     byId("status-json").textContent = JSON.stringify(state, null, 2);
     renderProcesses(state);
@@ -107,7 +128,7 @@ async function refresh() {
   }
 }
 async function perform(operation) {
-  if (pending) return;
+  if (pending || stopping) return;
   pending = true; controls(); byId("error").textContent = "";
   try { await operation(); } catch (error) { byId("error").textContent = error.message; }
   finally { pending = false; await refresh(); }
@@ -117,15 +138,26 @@ byId("start").addEventListener("click", () => perform(async () => {
   if (!latest.processes.some(p => p.pid !== null)) await api("/configuration", "POST", options());
   await api("/prepare-system", "POST");
 }));
-byId("stop").addEventListener("click", () => perform(() => api("/shutdown-system", "POST")));
+byId("stop").addEventListener("click", async () => {
+  const starting = latest && latest.processes.some(p => p.pid !== null && p.state === 'STARTING');
+  if (stopping || !latest || (pending && !starting)) return;
+  stopping = true; controls(); byId("error").textContent = "";
+  try { await api("/shutdown-system", "POST"); }
+  catch (error) { byId("error").textContent = error.message; }
+  finally { stopping = false; await refresh(); }
+});
 byId("profile").addEventListener("change", () => {
-  for (const id of ["zed", "d405", "rviz"]) byId(id).checked = !["fake", "zed_preview"].includes(byId("profile").value);
+  for (const id of ["zed", "d405", "rviz"]) byId(id).checked = !["fake", "zed_preview", "isaac_construct"].includes(byId("profile").value);
+  if (byId("profile").value === "isaac_construct" || byId("outpost-zed-serial").value === "stream://127.0.0.1:30000") {
+    for (const id of ['outpost-zed-hw-id', 'outpost-zed-serial', 'outpost-d405-hw-id', 'outpost-d405-serial', 'spray-eoat-profile']) byId(id).value = '';
+  }
   profileHelp();
-  if (byId("process-mode").value === "spray") byId("d405").checked = false;
+  if (["spray", "weld"].includes(byId("process-mode").value)) byId("d405").checked = false;
   controls();
 });
+byId("model-id").addEventListener("change", () => { profileHelp(); controls(); });
 byId("process-mode").addEventListener("change", () => {
-  if (byId("process-mode").value === "spray") byId("d405").checked = false;
+  if (["spray", "weld"].includes(byId("process-mode").value)) byId("d405").checked = false;
   controls();
 });
 byId('camera-backend').addEventListener('change', controls);
@@ -148,7 +180,7 @@ for (const name of ['zed', 'd405']) byId(`outpost-${name}-select`).addEventListe
   byId(`outpost-${name}-hw-id`).value = item.value;
   byId(`outpost-${name}-serial`).value = item.dataset.serial;
 });
-const micheloUrl = new URL(location.href); micheloUrl.port = '8101'; micheloUrl.pathname = '/console/'; micheloUrl.search = ''; micheloUrl.hash = '';
+const micheloUrl = new URL(location.href); micheloUrl.port = '8101'; micheloUrl.pathname = '/test/manual/camera/'; micheloUrl.search = ''; micheloUrl.hash = '';
 byId('michelo-link').href = micheloUrl.href;
 async function poll() { await refresh(); setTimeout(poll, 1500); }
 poll();

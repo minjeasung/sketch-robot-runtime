@@ -1,0 +1,262 @@
+--- a/outpost/adapters.py
++++ b/outpost/adapters.py
+@@ -46,6 +46,11 @@
+ def build_library_adapter(cfg: dict[str, Any]) -> CameraLike:
+     """hw_interfaces entry 모양의 dict → library 어댑터. lazy import — SDK 는 첫 connect 때만."""
+     from michelo_library.hw_interface.vision.facade.adapters import create_camera_interface
++
++    if cfg.get("camera_type") == "zed" and str(cfg.get("camera_id", "")).startswith("stream:"):
++        from outpost.zed_stream import ZedStreamAdapter
++
++        return ZedStreamAdapter(cfg)
+ 
+     adapter = create_camera_interface(cfg)
+     if adapter is None:
+--- /dev/null
++++ b/outpost/zed_stream.py
+@@ -0,0 +1,94 @@
++"""Local network-input extension of the delivered Michelo ZED adapter.
++
++Only device opening changes. Frame conversion, capture settings, lifecycle,
++depth normalization and streaming remain in michelo-library; HTTP/WS/IPC remain
++in the official Outpost daemon. This is a local extension, not an upstream release.
++The protected ZED hooks/handle layout are pinned to michelo-library 0.87.0.
++"""
++from __future__ import annotations
++
++import time
++from importlib.metadata import version
++from ipaddress import IPv4Address
++from urllib.parse import urlsplit
++
++from michelo_library.hw_interface.vision.zed.adapter import (
++    CameraConnectionError,
++    CameraDisconnected,
++    CaptureError,
++    ZedCameraAdapter,
++    ZedDeviceHandle,
++    require_pyzed,
++)
++
++
++def stream_address(identity: str) -> tuple[str, int]:
++    """Explicit numeric IPv4 URI; never interpret a bad stream URI as USB."""
++    uri = urlsplit(identity)
++    if (uri.scheme != "stream" or uri.username is not None or uri.password is not None
++            or uri.path or uri.query or uri.fragment or uri.port is None):
++        raise ValueError("ZED stream camera_id must be stream://IPv4:port")
++    host = str(IPv4Address(uri.hostname or ""))
++    if not 1 <= uri.port <= 65535:
++        raise ValueError("ZED stream port must be in 1..65535")
++    return host, uri.port
++
++
++class ZedStreamAdapter(ZedCameraAdapter):
++    """Use SDK set_from_stream instead of ZedSession's USB serial selection."""
++
++    def __init__(self, cfg: dict):
++        if version("michelo-library") != "0.87.0":
++            raise RuntimeError("ZED stream extension requires michelo-library 0.87.0; revalidate before upgrading")
++        identity = str(cfg["camera_id"])
++        self.stream_host, self.stream_port = stream_address(identity)
++        if cfg.get("manufacturer") not in (None, "stereolabs"):
++            raise ValueError("ZED stream manufacturer must be stereolabs")
++        super().__init__(hw_id=cfg["id"], serial=identity, config=cfg.get("config"))
++        self._last_stream_timestamp_ns = 0
++
++    def _do_connect_blocking(self) -> None:
++        sl = require_pyzed()
++        params = self._build_init_params(sl)
++        params.set_from_stream(self.stream_host, self.stream_port)
++        camera = sl.Camera()
++        # Retain ownership even if open or cleanup raises, so the base lifecycle
++        # can retry cleanup. The serial here is bookkeeping, never SDK selection.
++        self._handle = ZedDeviceHandle(serial=0, camera=camera)
++        try:
++            status = camera.open(params)
++            if status != sl.ERROR_CODE.SUCCESS:
++                raise CameraConnectionError(f"ZED stream {self.camera_id}: SDK open failed: {status}")
++            self._handle.serial = int(camera.get_camera_information().serial_number)
++            self._apply_gain_blocking(sl, self._handle)
++            self._fetch_cancel.clear()
++            self._last_stream_timestamp_ns = 0
++        except BaseException:
++            self._do_disconnect_blocking()
++            raise
++
++    def _do_disconnect_blocking(self) -> None:
++        self._fetch_cancel.set()
++        if self._handle is not None:
++            self._handle.camera.close()
++            self._handle._open = False
++            self._handle = None
++
++    def _grab_until(self, sl, handle, runtime, timeout_s):
++        # A paused source must not look fresh just because the library stamps a
++        # returned FramePacket with software wall time. Do not replace the wire
++        # clock with Isaac's wall-anchored simulation clock; compare it only for
++        # progression, and retain the library's documented software timestamp.
++        deadline = time.monotonic() + timeout_s
++        while True:
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise CaptureError("ZED stream timed out waiting for a new frame")
++            super()._grab_until(sl, handle, runtime, remaining)
++            stamp = int(handle.camera.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds())
++            if stamp <= 0 or stamp < self._last_stream_timestamp_ns:
++                raise CameraDisconnected("ZED stream source clock reset; reconnect required")
++            if stamp > self._last_stream_timestamp_ns:
++                self._last_stream_timestamp_ns = stamp
++                return
++            time.sleep(min(.005, remaining))
+--- /dev/null
++++ b/tests/test_zed_stream.py
+@@ -0,0 +1,148 @@
++"""Network input must never fall back to selecting a USB device."""
++from types import SimpleNamespace
++
++import pytest
++
++from outpost.adapters import build_library_adapter
++
++
++def make_adapter(camera_id="stream://127.0.0.1:30000"):
++    return build_library_adapter({
++        "id": "ZED-SIM", "camera_type": "zed", "camera_id": camera_id,
++        "config": {"resolution": "HD720", "depth_mode": "NEURAL_LIGHT"},
++    })
++
++
++def test_stream_identity_selects_network_adapter_without_changing_capture_settings():
++    adapter = make_adapter()
++    assert type(adapter).__name__ == "ZedStreamAdapter"
++    assert adapter.camera_id == "stream://127.0.0.1:30000"
++    assert adapter._settings.resolution == "HD720"
++
++
++@pytest.mark.parametrize("uri", [
++    "stream://127.0.0.1", "stream://127.0.0.1:0", "stream://127.0.0.1:65536",
++    "stream://user@127.0.0.1:30000", "stream://127.0.0.1:30000/path",
++    "stream://127.0.0.1:30000?usb=1", "stream://bad-host:30000",
++])
++def test_invalid_stream_identity_is_rejected_before_sdk_access(uri):
++    with pytest.raises(ValueError):
++        make_adapter(uri)
++
++
++def test_usb_serial_still_uses_original_library_adapter():
++    adapter = make_adapter("38852954")
++    assert type(adapter).__name__ == "ZedCameraAdapter"
++
++
++def fake_sdk(monkeypatch, adapter, *, open_result=0, gain_error=False):
++    from michelo_library.hw_interface.vision.zed import adapter as library_adapter
++
++    from outpost import zed_stream
++
++    selected = []
++    params = SimpleNamespace(set_from_stream=lambda host, port: selected.append((host, port)))
++    calls = []
++    camera = SimpleNamespace(
++        open=lambda p: calls.append(("open", p)) or open_result,
++        close=lambda: calls.append(("close",)),
++        get_camera_information=lambda: SimpleNamespace(serial_number=27706147),
++    )
++    sl = SimpleNamespace(Camera=lambda: camera, ERROR_CODE=SimpleNamespace(SUCCESS=0))
++    monkeypatch.setattr(zed_stream, "require_pyzed", lambda: sl)
++    monkeypatch.setattr(library_adapter, "require_pyzed", lambda: sl)
++    monkeypatch.setattr(adapter, "_build_init_params", lambda sdk: params)
++    def gain(sdk, handle):
++        if gain_error:
++            raise RuntimeError("gain failure")
++    monkeypatch.setattr(adapter, "_apply_gain_blocking", gain)
++    return selected, calls
++
++
++def test_open_uses_stream_and_disconnect_closes_the_owned_handle(monkeypatch):
++    adapter = make_adapter()
++    selected, calls = fake_sdk(monkeypatch, adapter)
++    adapter._fetch_cancel.set()
++    adapter._do_connect_blocking()
++    assert selected == [("127.0.0.1", 30000)]
++    assert adapter._handle.serial == 27706147
++    assert not adapter._fetch_cancel.is_set()
++    adapter._do_disconnect_blocking()
++    adapter._do_disconnect_blocking()
++    assert sum(c[0] == "close" for c in calls) == 1
++
++
++@pytest.mark.parametrize("open_result,gain_error", [(1, False), (0, True)])
++def test_failed_connect_closes_native_camera_and_leaves_no_handle(monkeypatch, open_result, gain_error):
++    from michelo_library.hw_interface.vision.zed.adapter import CameraConnectionError
++
++    adapter = make_adapter()
++    _, calls = fake_sdk(monkeypatch, adapter, open_result=open_result, gain_error=gain_error)
++    with pytest.raises(RuntimeError if gain_error else CameraConnectionError):
++        adapter._do_connect_blocking()
++    assert adapter._handle is None
++    assert sum(c[0] == "close" for c in calls) == 1
++
++
++def timestamp_sdk(monkeypatch, timestamps):
++    from michelo_library.hw_interface.vision.zed.adapter import ZedCameraAdapter
++    current = [0]
++    it = iter(timestamps)
++    def grab(*args, **kwargs):
++        current[0] = next(it, current[0])
++    monkeypatch.setattr(ZedCameraAdapter, "_grab_until", grab)
++    stamp = SimpleNamespace(get_nanoseconds=lambda: current[0])
++    handle = SimpleNamespace(camera=SimpleNamespace(get_timestamp=lambda ref: stamp))
++    sl = SimpleNamespace(TIME_REFERENCE=SimpleNamespace(IMAGE=0))
++    return sl, handle
++
++
++def test_duplicate_sdk_frame_is_not_published_with_a_new_software_timestamp(monkeypatch):
++    adapter = make_adapter()
++    sl, handle = timestamp_sdk(monkeypatch, [100, 100, 101])
++    adapter._grab_until(sl, handle, None, 1.)
++    adapter._grab_until(sl, handle, None, 1.)
++    assert handle.camera.get_timestamp(0).get_nanoseconds() == 101
++
++
++def test_frozen_stream_times_out_instead_of_republishing_cached_image(monkeypatch):
++    from michelo_library.hw_interface.vision.zed.adapter import CaptureError
++    adapter = make_adapter()
++    sl, handle = timestamp_sdk(monkeypatch, [100])
++    adapter._grab_until(sl, handle, None, .02)
++    with pytest.raises(CaptureError, match="new frame"):
++        adapter._grab_until(sl, handle, None, .02)
++
++
++def test_sender_clock_reset_requires_reconnect(monkeypatch):
++    from michelo_library.hw_interface.vision.zed.adapter import CameraDisconnected
++    adapter = make_adapter()
++    sl, handle = timestamp_sdk(monkeypatch, [100, 90])
++    adapter._grab_until(sl, handle, None, 1.)
++    with pytest.raises(CameraDisconnected, match="clock"):
++        adapter._grab_until(sl, handle, None, 1.)
++
++
++@pytest.mark.asyncio
++async def test_failed_close_keeps_ownership_and_prevents_a_second_open(monkeypatch):
++    adapter = make_adapter()
++    _, calls = fake_sdk(monkeypatch, adapter, open_result=1)
++    from outpost import zed_stream
++
++    camera = zed_stream.require_pyzed().Camera()
++    def fail_close():
++        raise RuntimeError("close failed")
++    camera.close = fail_close
++    try:
++        with pytest.raises(Exception, match="close failed"):
++            await adapter.connect()
++        owned = adapter._handle
++        assert owned is not None and adapter._needs_cleanup
++        with pytest.raises(Exception, match="close failed"):
++            await adapter.connect()
++        assert adapter._handle is owned
++        assert sum(c[0] == "open" for c in calls) == 1
++    finally:
++        camera.close = lambda: calls.append(("close",))
++        await adapter.aclose()
++    assert adapter._handle is None

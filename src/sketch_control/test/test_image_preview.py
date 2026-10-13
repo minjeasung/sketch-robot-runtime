@@ -6,7 +6,7 @@ import numpy as np
 from std_msgs.msg import Header
 
 from sketch_control.image_preview import ImagePreview
-from sketch_control.outpost_bridge_node import OutpostBridge
+from sketch_control.outpost_bridge_node import FrameStampPolicy, OutpostBridge
 
 
 class Publisher:
@@ -74,8 +74,16 @@ def test_outpost_keeps_raw_rgb_and_depth_when_adding_preview():
     rgb = np.arange(24 * 32 * 3, dtype=np.uint8).reshape(24, 32, 3)
     depth = np.full((24, 32), 1.2345, np.float32)
     publishers = [Publisher(), Publisher(0), Publisher(), Publisher(0), Publisher(0)]
-    camera = dict(image_frame='optical', publishers=publishers, preview=preview)
-    OutpostBridge.publish_frame(SimpleNamespace(), camera, (42_000_000_000, 1, rgb, depth, None))
+    camera = dict(name='zed', status={'generation': 1}, image_frame='optical', publishers=publishers, preview=preview)
+    bridge = SimpleNamespace(
+        stamp_policy=FrameStampPolicy('capture', use_sim_time=False),
+        _zed_identity_pub=Publisher(),
+        get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=99_000_000_000)),
+    )
+    OutpostBridge.publish_frame(bridge, camera, (42_000_000_000, 1, rgb, depth, None))
     assert bytes(publishers[0].messages[0].data) == rgb.tobytes()
     assert bytes(publishers[2].messages[0].data) == depth.tobytes()
     assert len(node.publisher.messages) == 1
+    for message in (publishers[0].messages[0], publishers[2].messages[0], node.publisher.messages[0]):
+        assert message.header.frame_id == 'optical'
+        assert (message.header.stamp.sec, message.header.stamp.nanosec) == (42, 0)

@@ -2,6 +2,10 @@
 set -eo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROBOT_WORKSPACE="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+if [[ "${1:-}" == "--construct" ]]; then
+    shift
+    exec bash "$SCRIPT_DIR/run_construct_system.sh" "$@"
+fi
 if [[ -f "$ROBOT_WORKSPACE/config/sketch_runtime.env" ]]; then
     set -a
     source "$ROBOT_WORKSPACE/config/sketch_runtime.env"

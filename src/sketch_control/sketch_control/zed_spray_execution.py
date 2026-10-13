@@ -193,7 +193,7 @@ class ZedSprayExecutionMixin:
                                           plane_tolerance_m=.002)):
             return
         frame = self._canonical_world_frame(payload["frame_id"])
-        if frame != "link0":
+        if frame != getattr(self, "base_frame", "link0"):
             transform = self._lookup_transform_to_base(frame, timeout_s=.2)
             if transform is None:
                 return

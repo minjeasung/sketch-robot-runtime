@@ -99,3 +99,27 @@ test("ZED preview start config excludes native drivers and robot controls", asyn
   assert.equal(config.camera_backend, "outpost");
   assert.equal(config.launch_rviz, false);
 });
+
+test('Stop remains callable while Start awaits managed simulation readiness', async () => {
+  const {ui, state, requests} = await supervisor({profile: 'isaac_construct', model_id: 'construct_left'});
+  ui.evaluate(`const originalFetch = fetch;
+    fetch = async (url, options) => {
+      if (url === '/prepare-system') {
+        window.prepareCalls = (window.prepareCalls || 0) + 1;
+        return await new Promise(resolve => { window.finishPrepare = () => resolve({ok: true, json: async () => ({})}); });
+      }
+      return originalFetch(url, options);
+    };`);
+  const starting = ui.element('start').fire('click');
+  await new Promise(setImmediate);
+  state.processes = [{name: 'simulation', pid: 123, state: 'STARTING'}];
+  await ui.evaluate('refresh()');
+  assert.equal(ui.element('start').disabled, true);
+  assert.equal(ui.element('stop').disabled, false);
+  await ui.element('start').fire('click');
+  assert.equal(ui.evaluate('prepareCalls'), 1);
+  await ui.element('stop').fire('click');
+  assert.equal(requests.filter(request => request.url === '/shutdown-system').length, 1);
+  ui.evaluate('finishPrepare()');
+  await starting;
+});

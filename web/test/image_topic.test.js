@@ -62,3 +62,19 @@ for (const [backend, profile, expected] of [
   await ui.evaluate("refreshImageTransport()");
   assert.equal(ui.evaluate("zedImageReliable"), expected);
 });
+
+test('compressed preview preserves the source message header', async () => {
+  const previous = globalThis.Image;
+  globalThis.Image = class { set src(value) { queueMicrotask(() => this.onload()); } };
+  const callbacks = {};
+  const library = {Topic: class { constructor(o) {this.name=o.name;} subscribe(cb) {callbacks[this.name]=cb;} unsubscribe() {} }};
+  const {createPreviewStream} = require('../js/image_topic.js');
+  let received;
+  const stream=createPreviewStream({ros:{callOnConnection(){}},name:'/zed',onRaw(){},onPreview(image,msg){received=msg;}},library);
+  try {
+    const msg={format:'jpeg',data:'abc',header:{stamp:{sec:5,nanosec:7},frame_id:'optical'}};
+    callbacks['/zed/compressed'](msg);
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.deepEqual(received?.header,msg.header);
+  } finally {stream.unsubscribe(); globalThis.Image=previous;}
+});

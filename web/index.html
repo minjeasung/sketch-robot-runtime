@@ -45,7 +45,7 @@
     <aside class="task-panel" aria-label="작업 설정과 실행">
       <section class="task-section">
         <label class="field-label" for="process-mode">작업 방식</label>
-        <select id="process-mode"><option value="paint">롤러 도장</option><option value="spray">내화뿜칠</option></select>
+        <select id="process-mode"><option value="paint">롤러 도장</option><option value="spray">내화뿜칠</option><option value="weld">용접</option></select>
         <p id="process-mode-state" class="field-help">작업면에 접촉하여 도장합니다.</p>
         <div id="active-plane-field" hidden><label class="field-label" for="active-plane">작업할 평면</label><select id="active-plane" disabled><option value="">측정 후 선택</option></select></div>
       </section>
@@ -69,6 +69,13 @@
         <button id="btn-fill-work-area" class="primary wide" disabled>영역 자동 채우기</button>
         <button id="btn-execute" class="wide secondary-action" disabled>그린 경로 사용</button>
       </section>
+
+      <details id="process-settings" class="task-section" open>
+        <summary>Settings · 공정 설정</summary>
+        <div id="settings-fields" class="settings-fields"></div>
+        <p id="settings-state" class="field-help" aria-live="polite">서버 설정을 기다립니다.</p>
+        <button id="settings-apply" class="wide" disabled>설정 적용</button>
+      </details>
 
       <section class="task-section execution-section">
         <h2>실행</h2>
@@ -100,5 +107,7 @@
   <script src="js/image_topic.js?v=jpeg-preview-1"></script>
   <script src="js/app.js?v=manual-spray-1"></script>
   <script src="js/plane_workflow.js"></script>
+  <script src="js/process_settings.js"></script>
+  <script src="js/weld_workflow.js?v=draw-transport-2"></script>
 </body>
 </html>

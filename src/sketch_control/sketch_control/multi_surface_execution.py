@@ -353,7 +353,7 @@ class MultiSurfaceMixin(D405ScanSelectionMixin):
                 continue
             center = corners.mean(axis=0) - .01*n
             co = CollisionObject(); co.id = 'sketch_plane_'+plane['id']; ids.add(co.id)
-            co.header.frame_id = 'link0'; co.operation = CollisionObject.ADD
+            co.header.frame_id = getattr(self, 'base_frame', 'link0'); co.operation = CollisionObject.ADD
             prim = SolidPrimitive(); prim.type = SolidPrimitive.BOX
             prim.dimensions = [float(width+.02),float(height+.02),.02]
             pose=Pose(); pose.position.x,pose.position.y,pose.position.z=map(float,center)
@@ -361,6 +361,6 @@ class MultiSurfaceMixin(D405ScanSelectionMixin):
             pose.orientation.x,pose.orientation.y,pose.orientation.z,pose.orientation.w=map(float,rot)
             co.primitives=[prim]; co.primitive_poses=[pose]; out.append(co)
         for stale in self._multi_scene_ids-ids:
-            co=CollisionObject(); co.id=stale; co.header.frame_id='link0'; co.operation=CollisionObject.REMOVE; out.append(co)
+            co=CollisionObject(); co.id=stale; co.header.frame_id=getattr(self, 'base_frame', 'link0'); co.operation=CollisionObject.REMOVE; out.append(co)
         self._multi_scene_pending_ids = (int(self._scene_revision), ids)
         return out

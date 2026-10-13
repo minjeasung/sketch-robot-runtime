@@ -22,6 +22,7 @@ setup(
     zip_safe=True,
     entry_points={
         'console_scripts': [
+            'weld_input = sketch_control.weld_input_node:main',
             'outpost_bridge = sketch_control.outpost_bridge_node:main',
             'zed_preview = sketch_control.zed_preview_node:main',
             'sketch_ui = sketch_control.sketch_ui:main',

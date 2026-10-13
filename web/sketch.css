@@ -113,3 +113,14 @@
   .drawing-tools label > span { padding: 6px 10px; }
   .camera-empty > span:last-child { font-size: 10px; }
 }
+
+/* Shared process settings extend the existing sidebar. */
+.settings-fields { display:grid; gap:10px; margin-top:14px; }
+.settings-field { display:grid; grid-template-columns:1fr 92px; align-items:center; gap:10px; font-size:13px; }
+.settings-field input { width:100%; min-width:0; padding:6px; box-sizing:border-box; }
+.settings-field input[type="checkbox"] { width:auto; justify-self:end; }
+.settings-field select { grid-column:1 / -1; width:100%; min-width:0; padding:6px; font:inherit; }
+#process-settings summary { cursor:pointer; font-weight:600; }
+.seam-row { display:flex; align-items:center; flex-wrap:wrap; gap:6px; padding:8px 0; }
+.seam-row label { flex:1; font-size:13px; }
+.seam-row button { padding:4px 6px; font-size:12px; }

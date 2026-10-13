@@ -128,8 +128,8 @@ function loadUI(page = "index.html", fetch) {
       runTimers(1500);
       this.emit(name, { width: 100, height: 80, encoding: "rgb8", data: Buffer.alloc(24000).toString("base64") }, true);
     },
-    async previewFrame(name, width=320, height=240) {
-      this.emit(name+'/compressed', {format:'jpeg', data:'fixture'}, true);
+    async previewFrame(name, width=320, height=240, header) {
+      this.emit(name+'/compressed', {format:'jpeg', data:'fixture', header}, true);
       const image = images.at(-1);
       image.width = width; image.height = height; image.onload();
       await new Promise(setImmediate);

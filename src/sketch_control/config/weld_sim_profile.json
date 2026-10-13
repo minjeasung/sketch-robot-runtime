@@ -1,0 +1,6 @@
+{
+  "profile_id": "construct-weld-demo", "revision": "1", "simulation_only": true,
+  "models": ["construct_left", "construct_right"],
+  "tip_translation_m": [0, 0, 0.15], "tip_quaternion_xyzw": [0, 0, 0, 1],
+  "reference_up": [0, -1, 0], "radius_m": 0.006
+}

@@ -313,3 +313,27 @@ test("dry-run spray cannot use D405 acceptance or a backend plan without ZED sel
   assert.equal(ui.element("btn-run-robot").disabled, true);
   assert.equal(ui.evaluate("paintingDerivedState().surfaceAccepted"), false);
 });
+
+for (const [profile, simulation, standoff, distance, motionLabel] of [
+  ['isaac_construct', true, 0.3, '30 cm', '시뮬레이션'],
+  ['work', false, 0.47, '47 cm', '실제'],
+]) {
+  test(`${profile} labels and Run confirmation use supervisor runtime distance`, async () => {
+    const ui = await selectTarget();
+    await selectArea(ui);
+    validate(ui);
+    const status = {configuration: {profile, camera_backend: 'outpost'},
+      runtime: {simulation, spray_standoff_m: standoff}};
+    ui.evaluate(`fetch = async () => ({ok: true, json: async () => (${JSON.stringify(status)})});
+      window.confirmations = []; window.confirm = text => { confirmations.push(text); return true; };`);
+    await ui.evaluate('refreshImageTransport()');
+    assert.match(ui.element('process-mode-state').textContent, new RegExp(distance));
+    if (simulation) assert.match(ui.element('process-mode-state').textContent, /시뮬레이션/);
+    await ui.element('btn-run-robot').fire('click');
+    const confirmation = ui.evaluate('confirmations.at(-1)');
+    assert.match(confirmation, new RegExp(distance));
+    assert.match(confirmation, new RegExp(motionLabel));
+    if (simulation) assert.doesNotMatch(confirmation, /실제 실행|실제 이동|뿜칠건이 켜집니다/);
+    assert.equal(ui.published.at(-1).name, '/sketch_execute');
+  });
+}

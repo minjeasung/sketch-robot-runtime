@@ -13,6 +13,7 @@ import pytest
 from rbpodo_painting_control.spray_eoat import compensate_spray_endpoint, load_spray_eoat_profile
 from rbpodo_painting_control.segment_path import SegmentWaypoint, segment_waypoint_position
 from rbpodo_painting_control.spray_path import rotation_from_spray_path
+from sketch_control.robot_models import DEFAULT_MODEL, CONSTRUCT_MODEL_LABELS
 from sketch_control.rotation_utils import quat_to_matrix, quat_from_matrix
 
 
@@ -40,7 +41,8 @@ def executor():
     cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef)
                 and (n.name in methods or n.name.startswith('_spray_eoat')
                      or n.name == '_spray_endpoint_to_tcp')]
-    scope = dict(np=np, copy=copy, time=time, replace=replace, SegmentPathError=ValueError,
+    scope = dict(DEFAULT_MODEL=DEFAULT_MODEL, CONSTRUCT_MODEL_LABELS=CONSTRUCT_MODEL_LABELS,
+                 np=np, copy=copy, time=time, replace=replace, SegmentPathError=ValueError,
                  EE_LINK='tcp', EOAT_TOUCH_LINKS=['tcp'], MOTION_MODES={'SPRAY'},
                  Pose=pose, Point=lambda: NS(x=0., y=0., z=0.),
                  Mesh=lambda: NS(vertices=[], triangles=[]),
@@ -379,3 +381,49 @@ def test_late_startup_inventory_cannot_erase_new_attachment(executor):
     node._spray_eoat_published = True
     query.set_result(NS(scene=NS(robot_state=NS(attached_collision_objects=[]))))
     assert node._spray_eoat_published is True
+
+
+def test_removing_selected_catalog_plane_is_applied_once_and_acknowledged(executor):
+    """A /planning_scene publication is a mutation, not a passive RViz preview."""
+    node = executor
+    scene_transport(node)
+    stale_id = 'sketch_plane_generation:1'
+    world_ids = {stale_id}
+    node._multi_catalog = {}
+    node._multi_scene_ids = {stale_id}
+    removal = collision()
+    removal.id, removal.operation = stale_id, 1
+    def catalog_diff():
+        node._multi_scene_pending_ids = (node._scene_revision, set())
+        return [removal]
+    node._multi_collision_objects = catalog_diff
+    attempts = []
+
+    def apply(scene):
+        success = True
+        for obj in scene.world.collision_objects:
+            if obj.operation == 1:
+                attempts.append(obj.id)
+                if obj.id not in world_ids:
+                    success = False
+                world_ids.discard(obj.id)
+            else:
+                world_ids.add(obj.id)
+        return success
+
+    node.scene_pub = NS(publish=apply)
+
+    def send(request):
+        node.requests.append(request)
+        response = Future()
+        response.set_result(NS(success=apply(request.scene)))
+        return response
+
+    node.apply_scene_client.call_async = send
+    node.publish_scene_periodic()
+    assert node.scene_confirmed
+    assert attempts == [stale_id]
+    assert node._multi_scene_ids == set()
+    assert world_ids == set()
+    node.publish_scene_periodic()
+    assert len(node.requests) == 1

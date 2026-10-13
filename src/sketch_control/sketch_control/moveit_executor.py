@@ -37,7 +37,7 @@ from action_msgs.msg import GoalStatus
 from controller_manager_msgs.srv import ListControllers
 from geometry_msgs.msg import Point, PoseArray, Pose, PoseStamped
 from rcl_interfaces.msg import ParameterDescriptor
-from sketch_control.robot_models import DEFAULT_MODEL, validate_model, model_joint_limits, model_srdf
+from sketch_control.robot_models import DEFAULT_MODEL, CONSTRUCT_MODEL_LABELS, validate_model, model_joint_limits, model_srdf, model_execution_contract
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Float64, String
 from std_srvs.srv import Trigger
@@ -545,13 +545,33 @@ from sketch_control.multi_surface_execution import MultiSurfaceMixin
 from sketch_control.d405_view_geometry import measurement_samples, camera_view
 
 
-class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMixin, Node):
+from sketch_control.weld_execution import WeldExecutionMixin
+
+
+class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMixin, Node):
     def __init__(self):
         super().__init__("moveit_executor")
         self.model_id = validate_model(self.declare_parameter(
             "model_id", DEFAULT_MODEL, ParameterDescriptor(read_only=True)
         ).value)
+        contract = model_execution_contract(self.model_id)
+        for name, value in contract.items():
+            setattr(self, name, value)
         self._robot_joint_limits = model_joint_limits(self.model_id)
+        initial_process = self.declare_parameter("process_mode", "paint", ParameterDescriptor(read_only=True)).value
+        if initial_process == "weld":
+            self._init_weld_execution()
+            return
+        self.robot_link_frames = list(ROBOT_LINK_FRAMES)
+        self.robot_link_capsule_radius = dict(ROBOT_LINK_CAPSULE_RADIUS)
+        self.spray_eoat_touch_links = list(SPRAY_EOAT_TOUCH_LINKS)
+        if self.model_id in CONSTRUCT_MODEL_LABELS:
+            self.robot_link_frames = ['robot_base_link', 'robot_head_base_link', 'robot_head_rev_link1', 'robot_head_rev_link2']
+            self.robot_link_capsule_radius = {}
+            for arm in ('left', 'right'):
+                chain = [f'{arm}_manipulator_base_link'] + [f'{arm}_manipulator_link{i}' for i in range(1, 7)] + [f'{arm}_manipulator_ee_point']
+                self.robot_link_frames.extend(chain)
+                self.robot_link_capsule_radius.update({(a, b): 0.20 for a, b in zip(chain, chain[1:])})
 
         self.execution_backend = str(
             self.declare_parameter(
@@ -571,7 +591,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         self.follow_joint_trajectory_action = str(
             self.declare_parameter(
                 "follow_joint_trajectory_action",
-                DEFAULT_FOLLOW_JOINT_TRAJECTORY_ACTION,
+                contract["follow_joint_trajectory_action"],
             ).value
         ).strip()
         self.use_eoat_segments = bool(
@@ -1265,6 +1285,12 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
 
         # ---- Target registry ----
         self.cfg = load_objects_config()
+        if self.model_id in CONSTRUCT_MODEL_LABELS:
+            # Construct's fixtures and camera geometry already live in its URDF.
+            # Retain the target registry; its measured surface is authoritative.
+            self.cfg = copy.deepcopy(self.cfg)
+            active = self.cfg.get("active_target", "wall")
+            self.cfg["objects"] = [obj for obj in self.cfg["objects"] if obj["name"] == active]
         self.active_target_name = self.cfg.get("active_target", "wall")
         self._enabled_ids = set(
             o["name"] for o in self.cfg["objects"] if o.get("enabled", True)
@@ -1291,6 +1317,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         self.spray_eoat_profile = str(self.declare_parameter(
             "spray_eoat_profile", "", ParameterDescriptor(read_only=True)).value)
         self._init_multi_surface()
+        self._init_legacy_process_settings()
         self.create_timer(0.5, self._update_and_publish_readiness)
 
         self.get_logger().info(
@@ -1301,17 +1328,20 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
 
     def _log_current_tcp(self):
         """world → tcp TF 를 주기적으로 로그. 수동 캘리브레이션 시 사용."""
+        # This diagnostic runs in the same executor as compliance and abort
+        # subscriptions. A missing TF alias must never block their callbacks
+        # for the full 300ms compliance freshness window.
         try:
             tf = self.tf_buffer.lookup_transform(
-                "world", EE_LINK, rclpy.time.Time(),
-                timeout=Duration(seconds=0.3),
+                "world", getattr(self, 'ee_link', EE_LINK), rclpy.time.Time(),
+                timeout=Duration(seconds=0.0),
             )
         except Exception:
             # world 프레임 없으면 World 대문자 시도
             try:
                 tf = self.tf_buffer.lookup_transform(
-                    "World", EE_LINK, rclpy.time.Time(),
-                    timeout=Duration(seconds=0.3),
+                    "World", getattr(self, 'ee_link', EE_LINK), rclpy.time.Time(),
+                    timeout=Duration(seconds=0.0),
                 )
             except Exception:
                 return
@@ -1468,10 +1498,16 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         return tcp
 
     def _spray_eoat_collision_object(self, profile):
+        if getattr(self, "model_id", DEFAULT_MODEL) in CONSTRUCT_MODEL_LABELS:
+            # Both Construct EOAT assemblies are fixed collision links in the
+            # active full URDF. Do not overlay a second attached copy, which
+            # would change native self/inter-arm collision behavior. Profile
+            # endpoint/hash validation and scene confirmation remain required.
+            return None
         attached = AttachedCollisionObject()
-        attached.link_name = EE_LINK
+        attached.link_name = getattr(self, 'ee_link', EE_LINK)
         attached.object.id = "spray_eoat"
-        attached.object.header.frame_id = EE_LINK
+        attached.object.header.frame_id = getattr(self, 'ee_link', EE_LINK)
         mesh = Mesh()
         for xyz in profile.vertices_tcp_m:
             vertex = Point()
@@ -1486,7 +1522,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         attached.object.meshes.append(mesh)
         attached.object.mesh_poses.append(origin)
         attached.object.operation = CollisionObject.ADD
-        attached.touch_links = list(SPRAY_EOAT_TOUCH_LINKS)
+        attached.touch_links = list(getattr(self, 'spray_eoat_touch_links', SPRAY_EOAT_TOUCH_LINKS))
         return attached
 
     def _spray_eoat_reconcile_paint_startup(self):
@@ -1536,8 +1572,8 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
             reason = self._spray_eoat_blocker(path)
             if reason:
                 return reason
-        if str(getattr(path, "frame_id", "")) != BASE_FRAME:
-            return f"segment frame must be {BASE_FRAME}"
+        if str(getattr(path, "frame_id", "")) != getattr(self, 'base_frame', BASE_FRAME):
+            return f"segment frame must be {getattr(self, 'base_frame', BASE_FRAME)}"
         try:
             point = np.asarray(self.dynamic_surface_point, dtype=float)
             normal = np.asarray(self.dynamic_surface_normal, dtype=float)
@@ -1631,13 +1667,13 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         # sketch_to_waypoints 는 Isaac World 좌표로 waypoint 를 만든다.
         # MoveIt planning frame 은 URDF link0 이다. World/world 는 실제 RB10 base 이므로
         # static TF(world->link0 +90deg) 변환을 거쳐 보관한다.
-        frame = self._canonical_world_frame(msg.header.frame_id or BASE_FRAME)
+        frame = self._canonical_world_frame(msg.header.frame_id or getattr(self, 'base_frame', BASE_FRAME))
         transform = None
-        if frame != BASE_FRAME:
+        if frame != getattr(self, 'base_frame', BASE_FRAME):
             transform = self._lookup_transform_to_base(frame, timeout_s=0.5)
             if transform is None:
                 self.get_logger().error(
-                    f"/sketch_waypoints TF 실패 ({BASE_FRAME}<-{frame}) "
+                    f"/sketch_waypoints TF 실패 ({getattr(self, 'base_frame', BASE_FRAME)}<-{frame}) "
                     "-> waypoint 폐기")
                 return
 
@@ -1663,7 +1699,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
             return
         self.get_logger().info(
             f"{len(self.current_waypoints)}개 웨이포인트 수신 "
-            f"({frame}->{BASE_FRAME}: 첫 점 "
+            f"({frame}->{getattr(self, 'base_frame', BASE_FRAME)}: 첫 점 "
             f"x={self.current_waypoints[0].position.x:.2f} "
             f"y={self.current_waypoints[0].position.y:.2f} "
             f"z={self.current_waypoints[0].position.z:.2f})")
@@ -1707,12 +1743,12 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
                 reason = self._spray_eoat_blocker(path)
                 if reason:
                     raise SegmentPathError(reason)
-            if path.frame_id != BASE_FRAME:
+            if path.frame_id != getattr(self, 'base_frame', BASE_FRAME):
                 frame = self._canonical_world_frame(path.frame_id)
                 transform = self._lookup_transform_to_base(frame, timeout_s=0.5)
                 if transform is None:
                     raise SegmentPathError(
-                        f"TF unavailable: {BASE_FRAME} <- {frame}"
+                        f"TF unavailable: {getattr(self, 'base_frame', BASE_FRAME)} <- {frame}"
                     )
                 q = transform.transform.rotation
                 t = transform.transform.translation
@@ -1720,7 +1756,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
                     path,
                     (q.x, q.y, q.z, q.w),
                     (t.x, t.y, t.z),
-                    BASE_FRAME,
+                    getattr(self, 'base_frame', BASE_FRAME),
                 )
             unsafe_clearance = [
                 row
@@ -2542,7 +2578,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
                 return ("EXECUTION_SNAPSHOT_PATH_MISSING",)
             if path is not self._active_segment_path:
                 blockers.append("ACTIVE_PATH_NOT_EXECUTION_SNAPSHOT")
-            if str(getattr(path, "frame_id", "")) != BASE_FRAME:
+            if str(getattr(path, "frame_id", "")) != getattr(self, 'base_frame', BASE_FRAME):
                 blockers.append("EXECUTION_SNAPSHOT_FRAME_INVALID")
             try:
                 validate_segment_path_for_real_execution(
@@ -2706,7 +2742,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
                 blockers.append("CONTROLLER_FAULT")
         if self._current_tcp_pose_np() is None:
             blockers.append("TCP_TF_INVALID")
-        required_controllers = ["joint_trajectory_controller"]
+        required_controllers = [getattr(self, "trajectory_controller", "joint_trajectory_controller")]
         if self.painting_force_enabled:
             required_controllers.append("admittance_controller")
         for required_controller in required_controllers:
@@ -2824,7 +2860,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
             self._controller_states_time > 0.0
             and now - self._controller_states_time <= 2.0
         )
-        required_controllers = ["joint_trajectory_controller"]
+        required_controllers = [getattr(self, "trajectory_controller", "joint_trajectory_controller")]
         if self.painting_force_enabled:
             required_controllers.append("admittance_controller")
         controller_active = (
@@ -3167,7 +3203,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         return str(source), canonical_point, normal
 
     def _set_active_surface(self, msg: PoseStamped, source: str):
-        frame = msg.header.frame_id or BASE_FRAME
+        frame = msg.header.frame_id or getattr(self, 'base_frame', BASE_FRAME)
         pos = np.array([
             msg.pose.position.x,
             msg.pose.position.y,
@@ -3179,7 +3215,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         ], [0.0, 0.0, 1.0])
 
         frame = self._canonical_world_frame(frame)
-        if frame == BASE_FRAME:
+        if frame == getattr(self, 'base_frame', BASE_FRAME):
             point = pos
             normal = normal_local
         else:
@@ -3188,7 +3224,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
                 self._pending_surface_msg = msg
                 self._pending_surface_source = source
                 self.get_logger().warn(
-                    f"[SURFACE] TF 실패 ({BASE_FRAME}<-{frame})",
+                    f"[SURFACE] TF 실패 ({getattr(self, 'base_frame', BASE_FRAME)}<-{frame})",
                     throttle_duration_sec=2.0)
                 return
             t = tf.transform.translation
@@ -3275,13 +3311,13 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
             return
         if len(msg.poses) < 4:
             return
-        frame = msg.header.frame_id or BASE_FRAME
+        frame = msg.header.frame_id or getattr(self, 'base_frame', BASE_FRAME)
         pts = np.array([
             [p.position.x, p.position.y, p.position.z]
             for p in msg.poses[:4]
         ], dtype=float)
         frame = self._canonical_world_frame(frame)
-        if frame == BASE_FRAME:
+        if frame == getattr(self, 'base_frame', BASE_FRAME):
             if self._set_dynamic_work_area_corners(pts):
                 MoveItExecutor._mark_scene_dirty(self)
             return
@@ -3289,7 +3325,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         if tf is None:
             self._pending_corners_msg = msg
             self.get_logger().warn(
-                f"[SURFACE] corners TF 실패 ({BASE_FRAME}<-{frame})",
+                f"[SURFACE] corners TF 실패 ({getattr(self, 'base_frame', BASE_FRAME)}<-{frame})",
                 throttle_duration_sec=2.0)
             return
         t = tf.transform.translation
@@ -3452,13 +3488,13 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
                 "(현재 plan/collision 기준 고정)",
                 throttle_duration_sec=2.0)
             return
-        frame = self._canonical_world_frame(msg.header.frame_id or BASE_FRAME)
+        frame = self._canonical_world_frame(msg.header.frame_id or getattr(self, 'base_frame', BASE_FRAME))
         transform = None
-        if frame != BASE_FRAME:
+        if frame != getattr(self, 'base_frame', BASE_FRAME):
             transform = self._lookup_transform_to_base(frame, timeout_s=0.2)
             if transform is None:
                 self.get_logger().warn(
-                    f"[SCENE] planes TF 실패 ({BASE_FRAME}<-{frame})",
+                    f"[SCENE] planes TF 실패 ({getattr(self, 'base_frame', BASE_FRAME)}<-{frame})",
                     throttle_duration_sec=2.0)
                 return
 
@@ -3562,7 +3598,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
                 f"[SCENE] ZED dynamic obstacles 갱신: {len(obstacles)}개")
 
     def _marker_to_base_collision(self, marker, index):
-        frame = marker.header.frame_id or BASE_FRAME
+        frame = marker.header.frame_id or getattr(self, 'base_frame', BASE_FRAME)
         pos = np.array([
             marker.pose.position.x,
             marker.pose.position.y,
@@ -3578,14 +3614,14 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
             q_marker = np.array([0.0, 0.0, 0.0, 1.0])
 
         frame = self._canonical_world_frame(frame)
-        if frame == BASE_FRAME:
+        if frame == getattr(self, 'base_frame', BASE_FRAME):
             base_pos = pos
             base_q = q_marker
         else:
             tf = self._lookup_transform_to_base(frame, timeout_s=0.2)
             if tf is None:
                 self.get_logger().warn(
-                    f"[SCENE] obstacle TF 실패 ({BASE_FRAME}<-{frame})")
+                    f"[SCENE] obstacle TF 실패 ({getattr(self, 'base_frame', BASE_FRAME)}<-{frame})")
                 return None
             t = tf.transform.translation
             q = tf.transform.rotation
@@ -3614,7 +3650,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
     def _lookup_transform_to_base(self, source_frame, timeout_s=0.2):
         try:
             return self.tf_buffer.lookup_transform(
-                BASE_FRAME,
+                getattr(self, 'base_frame', BASE_FRAME),
                 source_frame,
                 rclpy.time.Time(),
                 timeout=Duration(seconds=timeout_s),
@@ -3673,7 +3709,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
             return True
 
         p = np.asarray(point_base, dtype=float)
-        for pair, radius in ROBOT_LINK_CAPSULE_RADIUS.items():
+        for pair, radius in getattr(self, 'robot_link_capsule_radius', ROBOT_LINK_CAPSULE_RADIUS).items():
             if pair[0] not in frames or pair[1] not in frames:
                 continue
             dist = self._distance_to_segment(p, frames[pair[0]], frames[pair[1]])
@@ -3683,13 +3719,13 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
 
     def _lookup_robot_link_points(self):
         out = {}
-        for frame in ROBOT_LINK_FRAMES:
-            if frame == BASE_FRAME:
+        for frame in getattr(self, 'robot_link_frames', ROBOT_LINK_FRAMES):
+            if frame == getattr(self, 'base_frame', BASE_FRAME):
                 out[frame] = np.zeros(3, dtype=float)
                 continue
             try:
                 tf = self.tf_buffer.lookup_transform(
-                    BASE_FRAME, frame, rclpy.time.Time(),
+                    getattr(self, 'base_frame', BASE_FRAME), frame, rclpy.time.Time(),
                     timeout=Duration(seconds=0.05))
             except Exception:
                 continue
@@ -4374,7 +4410,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
     def _current_tcp_pose_np(self):
         try:
             tf = self.tf_buffer.lookup_transform(
-                BASE_FRAME, EE_LINK, rclpy.time.Time(),
+                getattr(self, 'base_frame', BASE_FRAME), getattr(self, 'ee_link', EE_LINK), rclpy.time.Time(),
                 timeout=Duration(seconds=0.1),
             )
         except Exception:
@@ -4391,8 +4427,8 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
 
         try:
             transform = self.tf_buffer.lookup_transform(
-                BASE_FRAME,
-                EE_LINK,
+                getattr(self, 'base_frame', BASE_FRAME),
+                getattr(self, 'ee_link', EE_LINK),
                 rclpy.time.Time(),
                 timeout=Duration(seconds=0.1),
             )
@@ -4742,14 +4778,14 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
 
         for index, candidate in enumerate(context["candidates"]):
             request = GetPositionIK.Request()
-            request.ik_request.group_name = PLANNING_GROUP
+            request.ik_request.group_name = getattr(self, 'planning_group', PLANNING_GROUP)
             # Both requests use the same immutable measured seed.  Callback
             # order therefore cannot change the selected orientation.
             request.ik_request.robot_state.joint_state = copy.deepcopy(seed_state)
             request.ik_request.robot_state.is_diff = False
             request.ik_request.avoid_collisions = True
-            request.ik_request.ik_link_name = EE_LINK
-            request.ik_request.pose_stamped.header.frame_id = BASE_FRAME
+            request.ik_request.ik_link_name = getattr(self, 'ee_link', EE_LINK)
+            request.ik_request.pose_stamped.header.frame_id = getattr(self, 'base_frame', BASE_FRAME)
             request.ik_request.pose_stamped.header.stamp = (
                 self.get_clock().now().to_msg()
             )
@@ -4999,7 +5035,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
 
     def _send_d405_orientation_plan(self, context, record):
         goal = MoveGroup.Goal()
-        goal.request.group_name = PLANNING_GROUP
+        goal.request.group_name = getattr(self, 'planning_group', PLANNING_GROUP)
         start_state = RobotState()
         start_state.joint_state = copy.deepcopy(context["seed_state"])
         start_state.is_diff = False
@@ -5112,7 +5148,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         if (
             len(names) != len(first)
             or len(set(names)) != len(names)
-            or not set(READY_POSE_JOINTS).issubset(set(names))
+            or not set(getattr(self, 'arm_joint_names', READY_POSE_JOINTS)).issubset(set(names))
         ):
             return False, "START_TRAJECTORY_JOINT_ARRAY_INVALID"
 
@@ -5141,7 +5177,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
             if not math.isfinite(value):
                 return False, f"START_TRAJECTORY_NONFINITE:{name}"
             first_by_name[name] = value
-        for name in READY_POSE_JOINTS:
+        for name in getattr(self, 'arm_joint_names', READY_POSE_JOINTS):
             if name not in measured or name not in seed or name not in first_by_name:
                 return False, f"START_STATE_MISSING:{name}"
             if (
@@ -6378,6 +6414,9 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
     def _load_srdf_allowed_collision_pairs(model_id=DEFAULT_MODEL):
         """Load the semantic collision baseline used by the active MoveIt config."""
 
+        if model_id in CONSTRUCT_MODEL_LABELS:
+            root = ET.fromstring(model_srdf(model_id))
+            return tuple((e.attrib['link1'], e.attrib['link2']) for e in root.iter('disable_collisions'))
         candidates = []
         if get_package_share_directory is not None:
             try:
@@ -7631,10 +7670,10 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         target.position.z -= float(distance_m * normal[2])
 
         request = GetCartesianPath.Request()
-        request.header.frame_id = BASE_FRAME
+        request.header.frame_id = getattr(self, 'base_frame', BASE_FRAME)
         request.header.stamp = self.get_clock().now().to_msg()
-        request.group_name = PLANNING_GROUP
-        request.link_name = EE_LINK
+        request.group_name = getattr(self, 'planning_group', PLANNING_GROUP)
+        request.link_name = getattr(self, 'ee_link', EE_LINK)
         state = RobotState()
         seed_state = copy.deepcopy(self.current_joint_state)
         state.joint_state = copy.deepcopy(seed_state)
@@ -8517,10 +8556,10 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
                 return
 
         req = GetCartesianPath.Request()
-        req.header.frame_id = BASE_FRAME
+        req.header.frame_id = getattr(self, 'base_frame', BASE_FRAME)
         req.header.stamp = self.get_clock().now().to_msg()
-        req.group_name = PLANNING_GROUP
-        req.link_name = EE_LINK
+        req.group_name = getattr(self, 'planning_group', PLANNING_GROUP)
+        req.link_name = getattr(self, 'ee_link', EE_LINK)
         rs = RobotState()
         seed_state = copy.deepcopy(self.current_joint_state)
         rs.joint_state = copy.deepcopy(seed_state)
@@ -9960,7 +9999,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         for stale_id in sorted(self._stale_dynamic_obstacle_ids):
             co = CollisionObject()
             co.id = stale_id
-            co.header.frame_id = BASE_FRAME
+            co.header.frame_id = getattr(self, 'base_frame', BASE_FRAME)
             co.operation = CollisionObject.REMOVE
             ps.world.collision_objects.append(co)
         self._stale_dynamic_obstacle_ids.clear()
@@ -9969,7 +10008,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         world_to_base = self._lookup_transform_to_base("World", timeout_s=0.05)
         if world_to_base is None:
             self.get_logger().warn(
-                f"[SCENE] {BASE_FRAME}<-World TF 미수신 -> scene publish 보류",
+                f"[SCENE] {getattr(self, 'base_frame', BASE_FRAME)}<-World TF 미수신 -> scene publish 보류",
                 throttle_duration_sec=2.0)
             return
 
@@ -9989,7 +10028,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
 
             co = CollisionObject()
             co.id = obj["name"]
-            co.header.frame_id = BASE_FRAME
+            co.header.frame_id = getattr(self, 'base_frame', BASE_FRAME)
 
             use_mesh = str(obj.get("moveit_shape", "")).strip().lower() == "mesh"
             if use_mesh:
@@ -9999,7 +10038,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
                         mesh_frame, timeout_s=0.05)
                     if mesh_tf is None:
                         raise RuntimeError(
-                            f"{BASE_FRAME}<-{mesh_frame} TF unavailable")
+                            f"{getattr(self, 'base_frame', BASE_FRAME)}<-{mesh_frame} TF unavailable")
                     mesh = _load_static_collision_mesh(obj["mesh_resource"])
                     mesh_pose = self._transform_xyz_quat_to_pose(
                         obj.get("mesh_position", [0.0, 0.0, 0.0]),
@@ -10044,7 +10083,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         for obstacle in self.dynamic_obstacles:
             co = CollisionObject()
             co.id = obstacle["id"]
-            co.header.frame_id = BASE_FRAME
+            co.header.frame_id = getattr(self, 'base_frame', BASE_FRAME)
             prim = SolidPrimitive()
             prim.type = SolidPrimitive.BOX
             prim.dimensions = [
@@ -10071,26 +10110,30 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
             ps.world.collision_objects.extend(objects)
 
         if spray_profile is not None:
-            ps.robot_state.attached_collision_objects.append(
-                self._spray_eoat_collision_object(spray_profile))
+            spray_attachment = self._spray_eoat_collision_object(spray_profile)
+            if spray_attachment is not None:
+                ps.robot_state.attached_collision_objects.append(spray_attachment)
         else:
             eoat_aco = self._paint_eoat_collision_object()
             if PUBLISH_EOAT_ATTACHED_OBJECT:
                 ps.robot_state.attached_collision_objects.append(eoat_aco)
             if getattr(self, "_spray_eoat_published", False):
                 removal = AttachedCollisionObject()
-                removal.link_name = EE_LINK
+                removal.link_name = getattr(self, 'ee_link', EE_LINK)
                 removal.object.id = "spray_eoat"
-                removal.object.header.frame_id = EE_LINK
+                removal.object.header.frame_id = getattr(self, 'ee_link', EE_LINK)
                 removal.object.operation = CollisionObject.REMOVE
                 ps.robot_state.attached_collision_objects.append(removal)
         ps.robot_state.is_diff = True
 
-        # publish 도 유지 (RViz 시각화 용)
         if spray_profile is not None:
-            self._spray_eoat_published = True
-        self.scene_pub.publish(ps)
+            self._spray_eoat_published = spray_attachment is not None
 
+        # /planning_scene is a MoveIt mutation input, not a passive preview.
+        # Publishing this diff there before applying it through the service
+        # removes stale objects twice: the second REMOVE returns success=False
+        # and prevents the acknowledged catalog IDs from ever advancing.
+        # Apply once through the service; RViz sees /monitored_planning_scene.
         # ApplyPlanningScene service 로 진짜 등록 (MoveIt 의 collision detection 에 반영)
         if self.apply_scene_client.wait_for_service(timeout_sec=1.0):
             req = ApplyPlanningScene.Request()
@@ -10114,7 +10157,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
 
         if not self.scene_initialized:
             self.get_logger().info(
-                "PlanningScene: 물체 publish + apply 시도 "
+                "PlanningScene: 물체 apply 시도 "
                 + (f"(Spray selected mesh {spray_profile.sha256})"
                    if spray_profile is not None
                    else "(EOAT collision 은 robot_description 고정 링크)"))
@@ -10123,9 +10166,9 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
     def _paint_eoat_collision_object(self):
         # --- EoAT (tcp -> AFT200 -> EOAT no-camera mesh -> D405, tcp 에 attached) ---
         eoat_aco = AttachedCollisionObject()
-        eoat_aco.link_name = EE_LINK  # "tcp"
+        eoat_aco.link_name = getattr(self, 'ee_link', EE_LINK)  # "tcp"
         eoat_aco.object.id = "eoat"
-        eoat_aco.object.header.frame_id = EE_LINK
+        eoat_aco.object.header.frame_id = getattr(self, 'ee_link', EE_LINK)
 
         # mesh[0] — AFT200 F/T sensor. Isaac Sim 과 같은 실제 collision STL.
         try:
@@ -10289,7 +10332,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
 
         co = CollisionObject()
         co.id = obj["name"]
-        co.header.frame_id = BASE_FRAME
+        co.header.frame_id = getattr(self, 'base_frame', BASE_FRAME)
         prim = SolidPrimitive()
         prim.type = SolidPrimitive.BOX
         prim.dimensions = [float(width), float(height), float(thickness)]
@@ -10448,7 +10491,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
                 f"[JOINT LIMIT] {label}: duplicate joint name"
             )
             return False
-        if not set(READY_POSE_JOINTS).issubset(set(joint_state.name)):
+        if not set(getattr(self, 'arm_joint_names', READY_POSE_JOINTS)).issubset(set(joint_state.name)):
             self.get_logger().error(
                 f"[JOINT LIMIT] {label}: required arm joint missing"
             )
@@ -10484,7 +10527,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
                 f"[JOINT LIMIT] {label}: trajectory points empty"
             )
             return False
-        if not set(READY_POSE_JOINTS).issubset(set(jt.joint_names)):
+        if not set(getattr(self, 'arm_joint_names', READY_POSE_JOINTS)).issubset(set(jt.joint_names)):
             self.get_logger().error(
                 f"[JOINT LIMIT] {label}: required arm joint missing"
             )
@@ -11715,7 +11758,9 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         out.position.z += distance * float(n[2])
         return out
 
-    def _make_pose_constraints(self, pose, link_name=EE_LINK, frame=BASE_FRAME):
+    def _make_pose_constraints(self, pose, link_name=None, frame=None):
+        link_name = link_name or getattr(self, 'ee_link', EE_LINK)
+        frame = frame or getattr(self, 'base_frame', BASE_FRAME)
         """Pose 를 MoveGroup goal 의 Constraints 로 변환."""
         c = Constraints()
 
@@ -11749,11 +11794,12 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         return c
 
     @staticmethod
-    def _nearest_joint_equivalent(name, value, current):
+    def _nearest_joint_equivalent(name, value, current, joint_limits=None):
         """Choose the equivalent revolute angle closest to current state."""
-        if name not in JOINT_LIMITS:
+        limits = JOINT_LIMITS if joint_limits is None else joint_limits
+        if name not in limits:
             return float(value)
-        lower, upper = JOINT_LIMITS[name]
+        lower, upper = limits[name]
         candidates = []
         for k in range(-2, 3):
             candidate = float(value) + 2.0 * math.pi * k
@@ -11779,7 +11825,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
             if name not in goal_map or name not in current_names:
                 continue
             position = self._nearest_joint_equivalent(
-                name, goal_map[name], current_map.get(name, goal_map[name]))
+                name, goal_map[name], current_map.get(name, goal_map[name]), getattr(self, '_robot_joint_limits', JOINT_LIMITS))
             jc = JointConstraint()
             jc.joint_name = name
             jc.position = float(position)
@@ -11798,10 +11844,10 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         ))
         goal = dict(zip(goal_joint_state.name, goal_joint_state.position))
         deltas = []
-        for name in READY_POSE_JOINTS.keys():
+        for name in getattr(self, 'arm_joint_names', READY_POSE_JOINTS):
             if name in current and name in goal:
                 goal_pos = self._nearest_joint_equivalent(
-                    name, goal[name], current[name])
+                    name, goal[name], current[name], getattr(self, '_robot_joint_limits', JOINT_LIMITS))
                 d = abs(float(goal_pos) - float(current[name]))
                 deltas.append((name, d))
         if not deltas:
@@ -12298,12 +12344,12 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
             return
 
         req = GetPositionIK.Request()
-        req.ik_request.group_name = PLANNING_GROUP
+        req.ik_request.group_name = getattr(self, 'planning_group', PLANNING_GROUP)
         req.ik_request.robot_state.joint_state = self.current_joint_state
         req.ik_request.robot_state.is_diff = False
         req.ik_request.avoid_collisions = True
-        req.ik_request.ik_link_name = EE_LINK
-        req.ik_request.pose_stamped.header.frame_id = BASE_FRAME
+        req.ik_request.ik_link_name = getattr(self, 'ee_link', EE_LINK)
+        req.ik_request.pose_stamped.header.frame_id = getattr(self, 'base_frame', BASE_FRAME)
         req.ik_request.pose_stamped.header.stamp = self.get_clock().now().to_msg()
         req.ik_request.pose_stamped.pose = self._safety_tcp_pose
         req.ik_request.timeout = Duration(seconds=STAGE1_IK_TIMEOUT_S).to_msg()
@@ -12318,7 +12364,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
 
         if seed_state is None:
             seed_state = self._stage1_ik_seed_state
-        required = tuple(READY_POSE_JOINTS.keys())
+        required = tuple(getattr(self, 'arm_joint_names', READY_POSE_JOINTS))
         if seed_state is None:
             return None, "IK_SEED_UNAVAILABLE"
         if (
@@ -12346,7 +12392,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
             current = float(seed_map[name])
             if not math.isfinite(raw_goal) or not math.isfinite(current):
                 return None, f"IK_NONFINITE:{name}"
-            goal = self._nearest_joint_equivalent(name, raw_goal, current)
+            goal = self._nearest_joint_equivalent(name, raw_goal, current, getattr(self, '_robot_joint_limits', JOINT_LIMITS))
             lower, upper = getattr(self, "_robot_joint_limits", JOINT_LIMITS)[name]
             if (
                 not math.isfinite(goal)
@@ -12398,7 +12444,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
 
         for index, candidate in enumerate(self._stage1_orientation_candidates):
             req = GetPositionIK.Request()
-            req.ik_request.group_name = PLANNING_GROUP
+            req.ik_request.group_name = getattr(self, 'planning_group', PLANNING_GROUP)
             # Both candidates use the exact same captured measured seed so
             # callback timing cannot bias the comparison.
             req.ik_request.robot_state.joint_state = copy.deepcopy(
@@ -12408,8 +12454,8 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
             # This evaluates the complete MoveIt robot state, including the
             # D405, AFT cable guard and EOAT collision geometry in the URDF.
             req.ik_request.avoid_collisions = True
-            req.ik_request.ik_link_name = EE_LINK
-            req.ik_request.pose_stamped.header.frame_id = BASE_FRAME
+            req.ik_request.ik_link_name = getattr(self, 'ee_link', EE_LINK)
+            req.ik_request.pose_stamped.header.frame_id = getattr(self, 'base_frame', BASE_FRAME)
             req.ik_request.pose_stamped.header.stamp = (
                 self.get_clock().now().to_msg()
             )
@@ -12661,7 +12707,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         joint_goal = self._make_joint_goal_constraints(
             resp.solution.joint_state,
             tolerance=STAGE1_JOINT_GOAL_TOL,
-            joint_names=list(READY_POSE_JOINTS.keys()),
+            joint_names=list(getattr(self, 'arm_joint_names', READY_POSE_JOINTS)),
         )
         if not joint_goal.joint_constraints:
             self.get_logger().warn(
@@ -12691,10 +12737,10 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
             f"(fraction>={STAGE1_CARTESIAN_FRACTION*100:.1f}% 필요)")
 
         req = GetCartesianPath.Request()
-        req.header.frame_id = BASE_FRAME
+        req.header.frame_id = getattr(self, 'base_frame', BASE_FRAME)
         req.header.stamp = self.get_clock().now().to_msg()
-        req.group_name = PLANNING_GROUP
-        req.link_name = EE_LINK
+        req.group_name = getattr(self, 'planning_group', PLANNING_GROUP)
+        req.link_name = getattr(self, 'ee_link', EE_LINK)
         rs = RobotState()
         rs.joint_state = self.current_joint_state
         rs.is_diff = False
@@ -12719,7 +12765,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         candidate_rank_index=None,
     ):
         goal = MoveGroup.Goal()
-        goal.request.group_name = PLANNING_GROUP
+        goal.request.group_name = getattr(self, 'planning_group', PLANNING_GROUP)
         rs = RobotState()
         rs.joint_state = self.current_joint_state
         rs.is_diff = False
@@ -13019,10 +13065,10 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         _, n = self._active_surface_plane(target)
 
         req = GetCartesianPath.Request()
-        req.header.frame_id = BASE_FRAME
+        req.header.frame_id = getattr(self, 'base_frame', BASE_FRAME)
         req.header.stamp = self.get_clock().now().to_msg()
-        req.group_name = PLANNING_GROUP
-        req.link_name = EE_LINK
+        req.group_name = getattr(self, 'planning_group', PLANNING_GROUP)
+        req.link_name = getattr(self, 'ee_link', EE_LINK)
 
         rs = RobotState()
         rs.joint_state = self.current_joint_state
@@ -13044,8 +13090,8 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         tol = [0.2, 0.2, 0.2]
         tol[free_axis] = 3.14
         oc = OrientationConstraint()
-        oc.header.frame_id = BASE_FRAME
-        oc.link_name = EE_LINK
+        oc.header.frame_id = getattr(self, 'base_frame', BASE_FRAME)
+        oc.link_name = getattr(self, 'ee_link', EE_LINK)
         oc.orientation.x = float(ee_q[0])
         oc.orientation.y = float(ee_q[1])
         oc.orientation.z = float(ee_q[2])
@@ -13230,10 +13276,10 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         )
 
         req = GetCartesianPath.Request()
-        req.header.frame_id = BASE_FRAME
+        req.header.frame_id = getattr(self, 'base_frame', BASE_FRAME)
         req.header.stamp = self.get_clock().now().to_msg()
-        req.group_name = PLANNING_GROUP
-        req.link_name = EE_LINK
+        req.group_name = getattr(self, 'planning_group', PLANNING_GROUP)
+        req.link_name = getattr(self, 'ee_link', EE_LINK)
 
         rs = RobotState()
         rs.joint_state = self.current_joint_state
@@ -13255,8 +13301,8 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         tol = [0.2, 0.2, 0.2]
         tol[free_axis] = 3.14
         oc = OrientationConstraint()
-        oc.header.frame_id = BASE_FRAME
-        oc.link_name = EE_LINK
+        oc.header.frame_id = getattr(self, 'base_frame', BASE_FRAME)
+        oc.link_name = getattr(self, 'ee_link', EE_LINK)
         oc.orientation.x = float(ee_q[0])
         oc.orientation.y = float(ee_q[1])
         oc.orientation.z = float(ee_q[2])
@@ -13339,10 +13385,10 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         _, n = self._active_surface_plane(target)
 
         req = GetCartesianPath.Request()
-        req.header.frame_id = BASE_FRAME
+        req.header.frame_id = getattr(self, 'base_frame', BASE_FRAME)
         req.header.stamp = self.get_clock().now().to_msg()
-        req.group_name = PLANNING_GROUP
-        req.link_name = EE_LINK
+        req.group_name = getattr(self, 'planning_group', PLANNING_GROUP)
+        req.link_name = getattr(self, 'ee_link', EE_LINK)
 
         rs = RobotState()
         rs.joint_state = self.current_joint_state
@@ -13366,8 +13412,8 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         tol = [0.2, 0.2, 0.2]
         tol[free_axis] = 3.14
         oc = OrientationConstraint()
-        oc.header.frame_id = BASE_FRAME
-        oc.link_name = EE_LINK
+        oc.header.frame_id = getattr(self, 'base_frame', BASE_FRAME)
+        oc.link_name = getattr(self, 'ee_link', EE_LINK)
         oc.orientation.x = float(ee_q[0])
         oc.orientation.y = float(ee_q[1])
         oc.orientation.z = float(ee_q[2])
@@ -13512,7 +13558,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         }
 
         goal = MoveGroup.Goal()
-        goal.request.group_name = PLANNING_GROUP
+        goal.request.group_name = getattr(self, 'planning_group', PLANNING_GROUP)
         rs = RobotState()
         rs.joint_state = self.current_joint_state
         rs.is_diff = False
@@ -13565,7 +13611,7 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         }
 
         goal = MoveGroup.Goal()
-        goal.request.group_name = PLANNING_GROUP
+        goal.request.group_name = getattr(self, 'planning_group', PLANNING_GROUP)
         rs = RobotState()
         rs.joint_state = self.current_joint_state
         rs.is_diff = False
@@ -13745,10 +13791,10 @@ class MoveItExecutor(ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMi
         self._d405_cartesian_context = attempt
 
         req = GetCartesianPath.Request()
-        req.header.frame_id = BASE_FRAME
+        req.header.frame_id = getattr(self, 'base_frame', BASE_FRAME)
         req.header.stamp = self.get_clock().now().to_msg()
-        req.group_name = PLANNING_GROUP
-        req.link_name = EE_LINK
+        req.group_name = getattr(self, 'planning_group', PLANNING_GROUP)
+        req.link_name = getattr(self, 'ee_link', EE_LINK)
         rs = RobotState()
         rs.joint_state = copy.deepcopy(root_context["seed_state"])
         rs.is_diff = False

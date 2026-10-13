@@ -22,8 +22,8 @@ class SprayExecutionMixin:
             raise ValueError('spray_motion_test must be a boolean')
         if self.spray_motion_test and self.painting_force_enabled:
             raise ValueError('spray_motion_test requires painting_force_enabled=false')
-        self.initial_process_mode = str(self.declare_parameter(
-            "process_mode", "paint", ParameterDescriptor(read_only=True)).value)
+        self.initial_process_mode = str((self.get_parameter("process_mode") if self.has_parameter("process_mode") else self.declare_parameter(
+            "process_mode", "paint", ParameterDescriptor(read_only=True))).value)
         if self.initial_process_mode not in {"paint", "spray"}:
             raise ValueError("process_mode must be paint or spray")
         self.process_mode = "spray" if self.spray_motion_test else self.initial_process_mode

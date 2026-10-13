@@ -6,6 +6,7 @@ wrist camera, while this module still supports camera_name=all for offline
 smoke tests and backwards-compatible manual use.
 """
 import math
+import json
 import time
 
 import numpy as np
@@ -13,7 +14,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
-from std_msgs.msg import Header
+from std_msgs.msg import Header, String
 import zmq
 
 from .outpost_camera import camera_status, decode_frame, FrameGuard
@@ -48,6 +49,31 @@ CAMERA_SPECS = {
 }
 
 
+class FrameStampPolicy:
+    """Keep capture time by default; simulation can explicitly use receipt time.
+
+    Outpost's Unix capture freshness is checked before this conversion. The
+    simulation option approximates ROS receipt, not exposure time; use it only
+    with a stationary camera head during perception and sketch planning.
+    """
+
+    def __init__(self, mode, *, use_sim_time):
+        if mode not in ('capture', 'ros_clock'):
+            raise ValueError('stamp_mode must be capture or ros_clock')
+        if mode == 'ros_clock' and not use_sim_time:
+            raise ValueError('ros_clock stamp_mode requires use_sim_time=true')
+        self.mode = mode
+        self.last_ros_stamp = 0
+
+    def stamp(self, capture_stamp, ros_now):
+        if self.mode == 'capture':
+            return capture_stamp
+        if ros_now <= self.last_ros_stamp:
+            return None
+        self.last_ros_stamp = ros_now
+        return ros_now
+
+
 def sample_pointcloud_grid(cloud, rgb, stride, camera_name=None):
     """Pair strided XYZ with RGB and apply the public cloud frame convention."""
     stride = int(stride)
@@ -71,6 +97,10 @@ def sample_pointcloud_grid(cloud, rgb, stride, camera_name=None):
 class OutpostBridge(Node):
     def __init__(self, **kwargs):
         super().__init__("sketch_outpost_bridge", **kwargs)
+        self.stamp_policy = FrameStampPolicy(
+            str(self.declare_parameter('stamp_mode', 'capture').value),
+            use_sim_time=bool(self.get_parameter('use_sim_time').value),
+        )
         self.origin = self.declare_parameter(
             "outpost_http", "http://127.0.0.1:8100"
         ).value
@@ -99,6 +129,7 @@ class OutpostBridge(Node):
         self.max_frame_age = max_frame_age
         self.status_period = status_period
         self.cameras = []
+        self._zed_identity_pub = self.create_publisher(String, "/perception/zed_frame_identity", 10)
         self._zmq_context = zmq.Context()
 
         # Keep the established reliable depth-1 contract.  Heavy copies are
@@ -214,6 +245,9 @@ class OutpostBridge(Node):
 
     def publish_frame(self, camera, data):
         stamp, _, rgb, depth, cloud = data
+        stamp = self.stamp_policy.stamp(stamp, self.get_clock().now().nanoseconds)
+        if stamp is None:
+            return
         header = Header(frame_id=camera["image_frame"])
         header.stamp.sec, header.stamp.nanosec = divmod(stamp, 1_000_000_000)
         h, w = depth.shape
@@ -255,6 +289,12 @@ class OutpostBridge(Node):
                 pubs[3].publish(info)
 
         camera["preview"].publish(rgb, header)
+        if camera["name"] == "zed":
+            self._zed_identity_pub.publish(String(data=json.dumps(dict(
+                generation=str(camera["status"]["generation"]), frame_id=header.frame_id,
+                stamp=dict(sec=header.stamp.sec, nanosec=header.stamp.nanosec),
+                clock_domain="ros" if self.stamp_policy.mode == "ros_clock" else "wall",
+                width=w, height=h))))
 
         # The global ZED cloud can be sparse without losing sketch pixel
         # precision because sketch ROI reconstruction uses full depth+CameraInfo.

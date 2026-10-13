@@ -5,6 +5,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import ipaddress
+import json
 import os
 from pathlib import Path
 import signal
@@ -49,18 +50,28 @@ def build_specs(workspace, options=None):
             raise SupervisorError('spray_eoat_profile normalized path exceeds 4096 characters', 400)
         options['spray_eoat_profile'] = eoat_profile
     profile = options.setdefault("profile", "dry_run")
-    if profile not in ("dry_run", "work", "fake", "spray_motion_test", "zed_preview"):
-        raise SupervisorError("profile must be dry_run, work, fake, spray_motion_test or zed_preview", 400)
+    if profile not in ("dry_run", "work", "fake", "spray_motion_test", "zed_preview", "isaac_construct"):
+        raise SupervisorError("profile must be dry_run, work, fake, spray_motion_test, zed_preview or isaac_construct", 400)
     try:
         process_mode = validate_process_mode(options.setdefault(
-            'process_mode', 'spray' if profile in ('spray_motion_test', 'zed_preview') else 'paint'))
+            'process_mode', 'spray' if profile in ('spray_motion_test', 'zed_preview', 'isaac_construct') else 'paint'))
     except ValueError as exc:
         raise SupervisorError(str(exc), 400) from None
+    if process_mode == 'weld' and profile != 'isaac_construct':
+        raise SupervisorError('Weld hardware driver is unavailable; use Isaac Construct', 400)
+    if profile == 'isaac_construct' and process_mode not in ('spray', 'weld'):
+        raise SupervisorError('Construct requires process_mode=spray or weld', 400)
     if profile in ('spray_motion_test', 'zed_preview') and process_mode != 'spray':
         raise SupervisorError(profile + ' requires process_mode=spray', 400)
     robot_ip = options.setdefault("robot_ip", "10.0.2.7")
+    construct_models = ('construct_left', 'construct_right')
+    model_id = options.setdefault('model_id', 'construct_left' if profile == 'isaac_construct' else DEFAULT_MODEL)
+    if profile == 'isaac_construct' and model_id not in construct_models:
+        raise SupervisorError('isaac_construct requires model_id=construct_left or construct_right', 400)
+    if model_id in construct_models and profile != 'isaac_construct':
+        raise SupervisorError('Construct models require profile=isaac_construct; no physical driver is configured', 400)
     try:
-        validate_model(options.setdefault("model_id", DEFAULT_MODEL))
+        validate_model(model_id)
     except ValueError as exc:
         raise SupervisorError(str(exc), 400) from None
     try:
@@ -76,18 +87,56 @@ def build_specs(workspace, options=None):
         options['outpost_http'] = validate_origin(options.get('outpost_http', 'http://127.0.0.1:8100'))
     except (ValueError, TypeError) as exc:
         raise SupervisorError(str(exc), 400) from None
+    if profile == 'isaac_construct':
+        if backend != 'outpost':
+            raise SupervisorError('isaac_construct requires camera_backend=outpost', 400)
+        if options['outpost_http'] != 'http://127.0.0.1:8100':
+            raise SupervisorError('isaac_construct requires outpost_http=http://127.0.0.1:8100', 400)
+        serial = options.get('outpost_zed_serial') or 'stream://127.0.0.1:30000'
+        if serial != 'stream://127.0.0.1:30000':
+            raise SupervisorError('isaac_construct requires outpost_zed_serial=stream://127.0.0.1:30000', 400)
+        options['outpost_zed_serial'] = serial
+        if not options.get('outpost_zed_hw_id'):
+            try:
+                camera = json.loads((Path(workspace) / '.runtime/construct/zed-camera.json').read_text())
+                options['outpost_zed_hw_id'] = camera['hw_id']
+            except (OSError, ValueError, KeyError, TypeError):
+                options['outpost_zed_hw_id'] = ''
+        options['spray_eoat_profile'] = str(Path(workspace).resolve() / 'isaac_assets' / (model_id + '_eoat.json'))
     for key in ('outpost_zed_hw_id', 'outpost_zed_serial', 'outpost_d405_hw_id', 'outpost_d405_serial'):
         value = options.setdefault(key, '')
+        if profile == 'isaac_construct' and key == 'outpost_zed_serial' and value == 'stream://127.0.0.1:30000':
+            continue
         if not isinstance(value, str) or len(value) > 128 or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in value):
             raise SupervisorError(key + ' must be a camera identifier', 400)
     for key in ("launch_rviz", "launch_zed_driver", "launch_d405_driver"):
-        options.setdefault(key, profile != "fake" and (key == 'launch_rviz' or backend == 'native'))
+        options.setdefault(key, profile not in ("fake", "isaac_construct") and (key == 'launch_rviz' or backend == 'native'))
         if type(options[key]) is not bool:
             raise SupervisorError(f"{key} must be a JSON boolean", 400)
-    if process_mode == 'spray':
+    if profile == 'isaac_construct':
+        for key in ('launch_rviz', 'launch_zed_driver', 'launch_d405_driver'):
+            options[key] = False
+    if process_mode != 'paint':
         options['launch_d405_driver'] = False
     if backend == 'outpost' and (options['launch_zed_driver'] or options['launch_d405_driver']):
         raise SupervisorError('Outpost owns cameras; native camera drivers must be disabled', 400)
+    if profile == 'isaac_construct':
+        return options, [
+            ProcessSpec('simulation', 'Construct · Isaac Sim · MoveIt · controllers', (),
+                        ('/usr/bin/python3', '-u', 'scripts/run_construct_demo.py', '--managed-runtime') +
+                        (('--process-mode', 'weld', '--model-id', model_id) if process_mode == 'weld' else ()),
+                        ('controller_manager', 'move_group')),
+            ProcessSpec('perception', 'ZED · Outpost · sketch perception', ('simulation',),
+                        ('bash', 'scripts/run_construct_perception.sh', model_id) + (('weld',) if process_mode == 'weld' else ()),
+                        ('weld_input',) if process_mode == 'weld' else ('target_selector', 'wall_projector', 'sketch_to_waypoints')),
+            ProcessSpec('executor', 'Sketch path executor · Construct', ('simulation', 'perception'),
+                        ('bash', 'scripts/run_construct_executor.sh', model_id) + (('weld',) if process_mode == 'weld' else ()), ('moveit_executor',)),
+            ProcessSpec('rosbridge', 'Browser ROS WebSocket (9090)', (),
+                        ('ros2', 'run', 'rosbridge_server', 'rosbridge_websocket',
+                         '--ros-args', '-r', '__node:=painting_rosbridge_websocket',
+                         '-p', 'max_message_size:=10000000'),
+                        ('painting_rosbridge_websocket', 'rosbridge_websocket')),
+        ]
     if profile == 'zed_preview':
         if backend != 'outpost':
             raise SupervisorError('zed_preview requires camera_backend=outpost', 400)
@@ -146,14 +195,18 @@ def utcnow():
 
 
 class Supervisor:
-    def __init__(self, workspace, monitor, options=None, *, specs=None, grace=1.0, stop_timeout=8.0):
+    def __init__(self, workspace, monitor, options=None, *, specs=None, grace=1.0, stop_timeout=8.0,
+                 readiness_timeout=300.0):
         self.workspace, self.monitor = Path(workspace), monitor
         self.options, built = build_specs(workspace, options)
         self.grace, self.stop_timeout = grace, stop_timeout
+        self.readiness_timeout = min(300.0, max(0.0, readiness_timeout))
         self.log_dir = self.workspace / "logs/system_api"
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.created = time.monotonic()
         self.lock = asyncio.Lock()
+        self._startup_abort = asyncio.Event()
+        self._shutdown_requests = 0
         self.event_list = deque(maxlen=500)
         self.monitor_task = None
         self._set_specs(built if specs is None else specs)
@@ -199,6 +252,8 @@ class Supervisor:
                 "teleoperation_active": False,
                 "degraded": any(p["state"] in ("FAILED", "EXITED") for p in processes),
                 "processes": processes, "configuration": self.options,
+                "runtime": {"simulation": self.options['profile'] in ('isaac_construct', 'fake'),
+                            "spray_standoff_m": .3 if self.options['profile'] == 'isaac_construct' else .5},
                 "ros": self.monitor.snapshot(), "ros_domain_id": os.environ.get("ROS_DOMAIN_ID", "0")}
 
     async def configure(self, options):
@@ -214,7 +269,7 @@ class Supervisor:
 
     def _validate_model_calibration(self):
         if (self.options['model_id'] != DEFAULT_MODEL
-                and self.options['profile'] != 'fake'):
+                and self.options['profile'] not in ('fake', 'isaac_construct')):
             try:
                 mode = self.options['process_mode']
                 validate_calibration_files(
@@ -225,6 +280,9 @@ class Supervisor:
     def _validate_cameras(self):
         if self.options['camera_backend'] != 'outpost' or self.options['profile'] == 'fake':
             return
+        if self.options['profile'] == 'isaac_construct':
+            # The managed demo may register a new hardware ID during startup.
+            self.options, _ = build_specs(self.workspace, {**self.options, 'outpost_zed_hw_id': ''})
         for camera, kind in process_cameras(self.options['process_mode']):
             try:
                 camera_status(self.options['outpost_http'], self.options[f'outpost_{camera}_hw_id'],
@@ -266,7 +324,28 @@ class Supervisor:
                 if sock.connect_ex(("127.0.0.1", 9090)) == 0:
                     raise SupervisorError("Port 9090 is already occupied")
 
+    async def _wait_simulation_ready(self, process):
+        path = self.workspace / '.runtime/construct/managed-ready.json'
+        deadline = time.monotonic() + self.readiness_timeout
+        while True:
+            if self._startup_abort.is_set():
+                raise SupervisorError('Startup cancelled by shutdown')
+            if process.returncode is not None:
+                raise SupervisorError(f"simulation exited during startup ({process.returncode}); inspect logs")
+            try:
+                marker = json.loads(path.read_text())
+                if isinstance(marker, dict) and type(marker.get('pid')) is int and marker['pid'] == process.pid:
+                    return
+            except (OSError, ValueError):
+                pass
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SupervisorError('simulation readiness timed out; inspect logs')
+            await asyncio.sleep(min(.1, remaining))
+
     async def _start(self, name):
+        if self._startup_abort.is_set():
+            raise SupervisorError('Startup cancelled by shutdown')
         r = self._record(name)
         if self.snapshot(name)["state"] == "RUNNING":
             return self.snapshot(name)
@@ -288,12 +367,20 @@ class Supervisor:
                     stdout=log, stderr=asyncio.subprocess.STDOUT, start_new_session=True)
             r.update(process=p, last_pid=p.pid, started=time.monotonic(), last_started_at=utcnow(),
                      last_stopped_at=None, last_exit_code=None, start_count=r["start_count"] + 1)
-            await asyncio.sleep(self.grace)
+            if name == 'simulation' and self.options['profile'] == 'isaac_construct':
+                await self._wait_simulation_ready(p)
+            else:
+                await asyncio.sleep(self.grace)
+            if self._startup_abort.is_set():
+                raise SupervisorError('Startup cancelled by shutdown')
             if p.returncode is not None:
                 raise SupervisorError(f"{name} exited during startup ({p.returncode}); inspect logs")
             r["state"] = "RUNNING"
             self._event("started", name, "Process passed startup liveness check")
             return self.snapshot(name)
+        except asyncio.CancelledError:
+            await self._stop(name)
+            raise
         except (OSError, SupervisorError) as exc:
             await self._stop(name)
             r["state"], r["error"] = "FAILED", str(exc)
@@ -332,7 +419,9 @@ class Supervisor:
                     await asyncio.sleep(0.15)
             except Exception as exc:
                 self._event("abort_error", name, str(exc))
-        for sig, timeout in ((signal.SIGINT, self.stop_timeout), (signal.SIGTERM, 3), (signal.SIGKILL, 2)):
+        interrupt_timeout = max(40.0, self.stop_timeout) if (
+            name == 'simulation' and self.options['profile'] == 'isaac_construct') else self.stop_timeout
+        for sig, timeout in ((signal.SIGINT, interrupt_timeout), (signal.SIGTERM, 3), (signal.SIGKILL, 2)):
             try:
                 os.killpg(p.pid, sig)
             except ProcessLookupError:
@@ -374,7 +463,8 @@ class Supervisor:
     async def prepare(self):
         async with self.lock:
             self._validate_model_calibration()
-            self._validate_cameras()
+            if self.options['profile'] != 'isaac_construct':
+                self._validate_cameras()
             started = []
             try:
                 for name in self.records:
@@ -382,7 +472,7 @@ class Supervisor:
                     await self._start(name)
                     if not was_running:
                         started.append(name)
-            except Exception:
+            except (Exception, asyncio.CancelledError):
                 for name in reversed(started):
                     try:
                         await self._stop(name)
@@ -393,17 +483,26 @@ class Supervisor:
                     "note": "RUNNING is process liveness. Check ros.readiness before work."}
 
     async def shutdown(self):
-        async with self.lock:
-            stopped, errors = [], []
-            for name in reversed(self.records):
-                try:
-                    await self._stop(name)
-                    stopped.append(name)
-                except SupervisorError as exc:
-                    errors.append(str(exc))
-            if errors:
-                raise SupervisorError("; ".join(errors), 503)
-            return {"system": "stopped", "stopped": stopped}
+        # Wake startup before waiting for its lifecycle lock. Queued starts must
+        # observe this intent until every pending shutdown has acquired the lock.
+        self._shutdown_requests += 1
+        self._startup_abort.set()
+        try:
+            async with self.lock:
+                stopped, errors = [], []
+                for name in reversed(self.records):
+                    try:
+                        await self._stop(name)
+                        stopped.append(name)
+                    except SupervisorError as exc:
+                        errors.append(str(exc))
+                if errors:
+                    raise SupervisorError("; ".join(errors), 503)
+                return {"system": "stopped", "stopped": stopped}
+        finally:
+            self._shutdown_requests -= 1
+            if not self._shutdown_requests:
+                self._startup_abort.clear()
 
     def logs(self, name, lines=100):
         self._record(name)

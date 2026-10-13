@@ -10,6 +10,17 @@ const activatePlanePub = new ROSLIB.Topic({ ros, name: "/painting_system/activat
 const processModePub = new ROSLIB.Topic({ ros, name: "/painting_system/set_process_mode", messageType: "std_msgs/String" });
 let requestedProcessMode = "";
 let lastPlaneRender = "";
+let processModeError = "";
+
+function renderProcessModeState() {
+  const motion = executionRuntime.simulation ? "시뮬레이션 로봇 이동" : "실제 로봇 이동";
+  if (processMode === "weld") { $("process-mode-state").textContent = processModeError || "Isaac 용접 이동 시험"; return; }
+  $("process-mode-state").textContent = processModeError || (planningOnly ? "ZED만 · 대상/영역/경로 미리보기 · 로봇 연결 안 함" : sprayMotionTest
+    ? `EOAT 이동 검증 · ${motion} · ${sprayStandoffText()} 이격 · 분사 항상 OFF`
+    : processMode === "spray"
+      ? `ZED 평면 · ${executionRuntime.simulation ? '시뮬레이션 · ' : ''}${sprayStandoffText()} 이격 · ${executionRuntime.simulation ? '실제 분사 OFF' : '도포 경로에서 분사'}`
+      : "작업면에 접촉하여 도장합니다.");
+}
 
 function beginPlaneExtraction(stamp) {
   requestedPlaneGeneration = window.ZedSurfaceGate.stampPathId(stamp);
@@ -20,6 +31,7 @@ function hasPlaneExtraction() {
 }
 
 function invalidateTargetPlanes(reason) {
+  if (processMode === "weld" && window.WeldWorkflow) { WeldWorkflow.invalidate(); return; }
   clearPlaneSelection(true);
   invalidateSelection(reason);
 }
@@ -38,6 +50,7 @@ function clearPlaneSelection(clearCatalog = false) {
 }
 
 function renderPlaneList() {
+  if (processMode === "weld") { if (window.WeldWorkflow) WeldWorkflow.render(); return; }
   const spray = processMode === "spray";
   const running = paintingDerivedState().running;
   const blocked = !rosConnected || running || processModePending;
@@ -210,20 +223,19 @@ $("process-mode").addEventListener("change", event => {
 
 new ROSLIB.Topic({ ros, name: "/painting_system/process_mode", messageType: "std_msgs/String" }).subscribe(msg => {
   const payload = parseJsonStatus("/painting_system/process_mode", msg);
-  if (!payload || !["paint", "spray"].includes(payload.mode)) return;
+  if (!payload || !["paint", "spray", "weld"].includes(payload.mode)) return;
   if (requestedProcessMode && payload.mode !== requestedProcessMode && !payload.error) return;
   const changed = processMode !== payload.mode || sprayMotionTest !== (payload.spray_motion_test === true) || planningOnly !== (payload.planning_only === true);
   const wasPending = processModePending;
   processMode = payload.mode;
   sprayMotionTest = payload.spray_motion_test === true;
   planningOnly = payload.planning_only === true;
-  zedSelection.setMode(processMode);
+  if (processMode !== "weld") zedSelection.setMode(processMode);
   processModePending = false;
   requestedProcessMode = "";
   $("process-mode").value = processMode;
-  $("process-mode-state").textContent = payload.error || (planningOnly ? "ZED만 · 대상/영역/경로 미리보기 · 로봇 연결 안 함" : sprayMotionTest
-    ? "EOAT 이동 검증 · 실제 로봇 이동 · 50 cm 이격 · 분사 항상 OFF"
-    : processMode === "spray" ? "ZED 평면 · 50 cm 이격 · 도포 경로에서 분사" : "작업면에 접촉하여 도장합니다.");
+  processModeError = payload.error || "";
+  renderProcessModeState();
   if (changed || wasPending) {
     invalidateSelection("process mode acknowledged; select a new target");
     strokesMap.target = [];

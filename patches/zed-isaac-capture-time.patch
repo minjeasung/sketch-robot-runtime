@@ -1,0 +1,47 @@
+diff --git a/exts/sl.sensor.camera/plugins/nodes/OgnZEDSimCameraNode.cpp b/exts/sl.sensor.camera/plugins/nodes/OgnZEDSimCameraNode.cpp
+index b7771f7..c50d70b 100644
+--- a/exts/sl.sensor.camera/plugins/nodes/OgnZEDSimCameraNode.cpp
++++ b/exts/sl.sensor.camera/plugins/nodes/OgnZEDSimCameraNode.cpp
+@@ -12,6 +12,8 @@
+ #include <array>
+ #include <chrono>
+ #include <cstdlib>
++#include <fstream>
++#include <cstdio>
+ #include <condition_variable>
+ #include <map>
+ #include <mutex>
+@@ -530,6 +532,9 @@ public:
+                     // steady clock when the upstream time nodes deliver 0 (Isaac build
+                     // regression observed with Kit 110.1).
+                     double frame_time = db.inputs.simulationTime();
++                    // Construct profile requires exact ROS simulation-time correspondence.
++                    const char* timing_path = std::getenv("CONSTRUCT_ZED_TIMING_FILE");
++                    if (timing_path && frame_time <= 0.0) return true;
+                     if (frame_time <= 0.0) {
+                         if (!state.m_clock0_set) {
+                             state.m_clock0 = std::chrono::steady_clock::now();
+@@ -920,6 +925,23 @@ public:
+                         slot->has_depth = state.m_stream_depth;
+                         slot->ts_ns = state.m_epoch_base_ns +
+                             static_cast<unsigned long long>((timestamp - state.m_sim_time_base) * 1e9);
++                        // Opt-in capture-time metadata; SDK timestamps are wall-anchored
++                        // simulation time, not actual wall time at non-unit real-time factors.
++                        if (timing_path) {
++                            std::string temporary = std::string(timing_path) + ".tmp";
++                            std::ofstream timing(temporary, std::ios::trunc);
++                            timing << "{\"clock_source\":\"simulation\",\"epoch_base_ns\":"
++                                   << state.m_epoch_base_ns << ",\"sim_time_base_ns\":"
++                                   << static_cast<unsigned long long>(state.m_sim_time_base * 1e9)
++                                   << ",\"latest_capture_sim_ns\":"
++                                   << static_cast<unsigned long long>(timestamp * 1e9)
++                                   << ",\"capture_wall_ns\":"
++                                   << std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                       std::chrono::system_clock::now().time_since_epoch()).count()
++                                   << "}";
++                            timing.close();
++                            std::rename(temporary.c_str(), timing_path);
++                        }
+                         slot->qw = static_cast<float>(converted_orientation.GetReal());
+                         slot->qx = -static_cast<float>(converted_orientation.GetImaginary()[0]);
+                         slot->qy = -static_cast<float>(converted_orientation.GetImaginary()[1]);

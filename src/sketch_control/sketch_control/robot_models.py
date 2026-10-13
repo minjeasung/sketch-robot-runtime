@@ -6,18 +6,19 @@ import xml.etree.ElementTree as ET
 
 DEFAULT_MODEL = 'rb10_1300e_u'
 MODEL_LABELS = {DEFAULT_MODEL: 'RB10-1300E', 'rb20_1900es': 'RB20-1900ES'}
+CONSTRUCT_MODEL_LABELS = {'construct_left': 'Construct left arm', 'construct_right': 'Construct right arm'}
 JOINT_NAMES = ('base', 'shoulder', 'elbow', 'wrist1', 'wrist2', 'wrist3')
 
 
 def validate_model(model_id):
-    if not isinstance(model_id, str) or model_id not in MODEL_LABELS:
-        raise ValueError('model_id must be rb10_1300e_u or rb20_1900es')
+    if not isinstance(model_id, str) or model_id not in {**MODEL_LABELS, **CONSTRUCT_MODEL_LABELS}:
+        raise ValueError('unsupported model_id')
     return model_id
 
 
 def validate_process_mode(process_mode):
-    if not isinstance(process_mode, str) or process_mode not in ('paint', 'spray'):
-        raise ValueError('process_mode must be paint or spray')
+    if not isinstance(process_mode, str) or process_mode not in ('paint', 'spray', 'weld'):
+        raise ValueError('process_mode must be paint, spray or weld')
     return process_mode
 
 
@@ -42,7 +43,7 @@ def validate_calibration_files(paths, process_mode='paint'):
     validate_process_mode(process_mode)
     for name, key in (('zed_calibration_file', 'T_world_zed_optical'),
                       ('d405_calibration_file', 'T_d405_optical_to_tcp')):
-        if process_mode == 'spray' and name == 'd405_calibration_file':
+        if process_mode != 'paint' and name == 'd405_calibration_file':
             continue
         path = paths.get(name)
         try:
@@ -62,6 +63,11 @@ def validate_calibration_files(paths, process_mode='paint'):
 def model_srdf(model_id=DEFAULT_MODEL, path=None):
     """Do not transfer RB10 taught poses or sampled collision exclusions to RB20."""
     validate_model(model_id)
+    if model_id in CONSTRUCT_MODEL_LABELS:
+        if path is None:
+            from ament_index_python.packages import get_package_share_directory
+            path = Path(get_package_share_directory('construct_moveit_config')) / 'config/construct_robot_0528.srdf'
+        return Path(path).read_text()
     if path is None:
         from ament_index_python.packages import get_package_share_directory
         path = Path(get_package_share_directory('sketch_control')) / 'config/rbpodo_named.srdf'
@@ -82,6 +88,17 @@ def model_joint_limits(model_id, description_share=None, moveit_share=None):
     import yaml
     from ament_index_python.packages import get_package_share_directory
     validate_model(model_id)
+    if model_id in CONSTRUCT_MODEL_LABELS:
+        description_share = Path(description_share or get_package_share_directory('construct_description'))
+        root = ET.parse(description_share / 'urdf_0528/construct_robot_0528.urdf').getroot()
+        limits = {}
+        for name in model_execution_contract(model_id)['arm_joint_names']:
+            bounds = root.find(f"joint[@name='{name}']/limit")
+            low, high = float(bounds.get('lower')), float(bounds.get('upper'))
+            if not math.isfinite(low) or not math.isfinite(high) or low >= high:
+                raise ValueError(f'Invalid joint limits: {model_id}/{name}')
+            limits[name] = (low, high)
+        return limits
     description_share = Path(description_share or get_package_share_directory('rbpodo_description'))
     moveit_share = Path(moveit_share or get_package_share_directory('rbpodo_moveit_config'))
     joints = yaml.safe_load((description_share / 'robots' / model_id / 'joint.yaml').read_text())
@@ -96,3 +113,18 @@ def model_joint_limits(model_id, description_share=None, moveit_share=None):
             raise ValueError(f'Invalid joint limits: {model_id}/{name}')
         limits[name] = (low, high)
     return limits
+
+
+def model_execution_contract(model_id):
+    """Resolve hardware-facing names without changing sketch geometry or execution."""
+    validate_model(model_id)
+    if model_id in CONSTRUCT_MODEL_LABELS:
+        side = model_id.removeprefix('construct_')
+        group = f'{side}_manipulator'
+        return dict(planning_group=group, ee_link=f'{group}_ee_point',
+                    base_frame='World', arm_joint_names=tuple(f'{group}_joint{i}' for i in range(1, 7)),
+                    trajectory_controller=f'{group}_controller',
+                    follow_joint_trajectory_action=f'/{group}_controller/follow_joint_trajectory')
+    return dict(planning_group='manipulator', ee_link='tcp', base_frame='link0',
+                arm_joint_names=JOINT_NAMES, trajectory_controller='joint_trajectory_controller',
+                follow_joint_trajectory_action='/joint_trajectory_controller/follow_joint_trajectory')

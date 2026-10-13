@@ -188,6 +188,8 @@ def _load_d405_mount_pose(context):
 
 def _make_zed_static_tfs(context, *args, **kwargs):
     """Publish World->ZED left camera frame from the calibrated optical pose."""
+    if not _is_truthy(LaunchConfiguration('publish_zed_static_tf', default='true').perform(context)):
+        return []
     zed_x, zed_y, zed_z, q_world_optical = _load_zed_optical_pose(context)
 
     # ROS optical convention from zed_left_camera_frame to optical frame:
@@ -396,6 +398,7 @@ def generate_launch_description():
                 "dry_run": ParameterValue(dry_run, value_type=bool),
                 "process_mode": ParameterValue(LaunchConfiguration('process_mode'), value_type=str),
                 "model_id": ParameterValue(LaunchConfiguration('model_id'), value_type=str),
+                "eoat_segment_frame": ParameterValue(LaunchConfiguration('eoat_segment_frame'), value_type=str),
                 "spray_tool_axis": ParameterValue(LaunchConfiguration('spray_tool_axis'), value_type=str),
                 "spray_eoat_profile": ParameterValue(LaunchConfiguration('spray_eoat_profile'), value_type=str),
                 **{key: ParameterValue(LaunchConfiguration(key), value_type=float) for key in
@@ -457,6 +460,9 @@ def generate_launch_description():
                               description='Reliable image transport for the Outpost bridge'),
         DeclareLaunchArgument('process_mode', default_value='paint', choices=['paint', 'spray']),
         DeclareLaunchArgument('model_id', default_value='rb10_1300e_u'),
+        DeclareLaunchArgument('eoat_segment_frame', default_value='link0'),
+        DeclareLaunchArgument('publish_zed_static_tf', default_value='true',
+                              description='Disable when a robot model already owns the camera TF'),
         DeclareLaunchArgument('spray_tool_axis', default_value=''),
         DeclareLaunchArgument('spray_eoat_profile', default_value=''),
         DeclareLaunchArgument('spray_footprint_width_m', default_value='0.35'),

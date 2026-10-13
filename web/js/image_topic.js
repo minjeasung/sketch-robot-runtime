@@ -51,7 +51,7 @@
         try {
           const image = await decodePreview(msg);
           if (!active) break;
-          onPreview(image);
+          onPreview(image, msg);
           usable = true;
           root.clearTimeout(fallback);
           if (raw) { raw.unsubscribe(); raw = null; }
