@@ -4,8 +4,10 @@
 1. Read `AGENTS.md` and `docs/agent/SAFETY_RULES.md`.
 2. Identify the issue's target mode (Paint, Spray, or `zed_preview`),
    relevant source files, ROS/web contracts, and current tests.
-3. State the expected change, untouched behavior, assumptions and safety tier.
-4. Work on a separate branch. Keep unrelated file edits and auto-formatting out.
+3. Use `docs/agent/TEST_MATRIX.md` to select tests for the changed behavior and
+   affected callers, including higher-tier checks that cannot run in CI.
+4. State the expected change, untouched behavior, assumptions and safety tier.
+5. Work on a separate branch. Keep unrelated file edits and auto-formatting out.
 
 ## Role handoffs
 - **Developer:** implement minimal changes; identify call sites and tests.
@@ -36,16 +38,18 @@ a passing planning-only path does not validate a robot-execution path.
 bash scripts/ci/offline_tests.sh
 ```
 
-This runs a **limited** Node.js UI test group and the isolated Git-based
-plane-version-management Python tests. Requires Node.js, Python 3, Git and
-`pytest`. It does not source ROS or configuration secrets, install packages,
-start services, connect to cameras or execute controller/robot commands.
+This runs the isolated Git-based plane-version-management tests, pure-Python
+force-safety and wrench-guard logic tests, and Node.js UI tests. Requires
+Node.js, Python 3, Git and `pytest`. It does not source ROS or configuration
+secrets, install packages, start services, connect to cameras or execute
+controller/robot commands.
 
 The `scripts/check_runtime.sh` script performs installation checks but sources
 local ROS/runtime environment; it is **not** a CI command. Do not use
 `scripts/run_michelo_sketch.sh`, launch files, or install scripts as automatic
-validation. More complete tests in `src/*/test/` need ROS dependencies and
-appropriately isolated test environments.
+validation. Other tests under `src/*/test/` may need ROS dependencies and appropriately
+isolated test environments. The test matrix distinguishes CI-covered checks
+from ROS/mock, simulation and human-only validation.
 
 ## Pull request handoff
 - What changed and **what did not**.

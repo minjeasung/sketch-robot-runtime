@@ -13,6 +13,8 @@
 - [ ] No credentials, calibration secrets or private hardware data committed.
 
 ## Verification
+- [ ] Reviewed `docs/agent/TEST_MATRIX.md`; selected tests for modified code
+      and affected callers, and listed checks not executed.
 - [ ] Ran `bash scripts/ci/offline_tests.sh` (or explained why unavailable).
 - [ ] Recorded exact results, known baseline failures and new failures.
 - [ ] Listed ROS/mock/simulation/hardware checks not performed.

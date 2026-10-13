@@ -20,6 +20,13 @@ fi
 echo "== Offline plane-version tests =="
 python3 -m pytest -q scripts/tests/test_plane_versions.py
 
+echo "== Offline force safety and wrench guard logic tests =="
+# These two modules use only Python standard-library dependencies; do not
+# install, source, launch or connect to ROS/hardware for this check.
+PYTHONPATH="$repo_root/src/rbpodo_painting_control" python3 -m pytest -q \
+  src/rbpodo_painting_control/test/test_force_safety.py \
+  src/rbpodo_painting_control/test/test_wrench_guard.py
+
 echo "== Offline web UI tests =="
 node --test web/test/*.test.js
 

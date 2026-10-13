@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   offline:
-    name: Python + UI (no ROS or hardware)
+    name: Plane + force safety + UI (offline)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:

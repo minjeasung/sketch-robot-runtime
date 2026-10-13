@@ -2,7 +2,8 @@
 
 Read `docs/agent/WORKFLOW.md` and `docs/agent/SAFETY_RULES.md`.
 
-1. Map changed code to its relevant automated tests.
+1. Map changed code and affected callers to checks in
+   `docs/agent/TEST_MATRIX.md`; identify required higher-tier checks.
 2. Run `bash scripts/ci/offline_tests.sh` if its prerequisites exist.
 3. Record **command**, environment, exit code and failing test names.
 4. Where ROS/simulator dependencies are needed, report "not run" rather than

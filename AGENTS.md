@@ -10,6 +10,7 @@ source and tests before editing; documentation is orientation, not proof of beha
   feature documentation under `docs/`.
 - Follow `docs/agent/WORKFLOW.md` for change planning, validation and handoff.
 - Follow `docs/agent/SAFETY_RULES.md` for every task, especially motion/force changes.
+- Use `docs/agent/TEST_MATRIX.md` to choose change-specific tests and record verification gaps.
 
 ## Change workflow
 1. Identify the affected ROS packages, web modules, configuration, and consumers.
