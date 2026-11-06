@@ -1,0 +1,5 @@
+<library path="isaac_painting_hardware">
+ <class name="isaac_painting_hardware/IsaacPaintingSystem" type="isaac_painting_hardware::IsaacPaintingSystem" base_class_type="hardware_interface::SystemInterface">
+  <description>Simulation only: session-bound measured joints and F/T, no physical robot transport.</description>
+ </class>
+</library>

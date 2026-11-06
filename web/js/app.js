@@ -9,8 +9,10 @@ let backendPreview = null;
 let processModePending = true;
 let multiPlaneBusy = false;
 let stopRequested = false;
+let stopWait = null;
+let pathMethod = "auto";
 
-const WS_URL = `ws://${window.location.hostname || "localhost"}:9090`;
+let WS_URL = `ws://${window.location.hostname || "localhost"}:9090`;
 const WORK_AREA_CORNERS_TOPIC = "/perception/work_area_corners";
 const ZED_LEFT_IMAGE_TOPIC = "/zed/zed_node/rgb/color/rect/image";
 const D405_REFINEMENT_STATUS_TOPIC = "/perception/d405_surface_refinement_status";
@@ -43,12 +45,14 @@ function logEvent(line) {
 }
 
 // ---- ROS 연결 ----
-const ros = new ROSLIB.Ros({ url: WS_URL });
+const ros = new ROSLIB.Ros();
 // Large/slow video frames must not queue ahead of plan results or commands.
-const imageRos = new ROSLIB.Ros({ url: WS_URL });
+const imageRos = new ROSLIB.Ros();
 let rosConnected = false;
 let zedImageReliable = false;
 let controlReconnectTimer = null;
+let appliedRuntimeIdentity = null;
+let runtimeStatusTimer = null;
 
 function sprayStandoffText() {
   const metres = executionRuntime.spray_standoff_m;
@@ -61,9 +65,24 @@ async function refreshImageTransport() {
   try {
     const response = await fetch(new URL("/status", window.location.href));
     if (!response.ok) return;
-    const {configuration, runtime} = await response.json();
+    const {configuration, runtime, runtime_configuration} = await response.json();
+    if(runtime_configuration?.phase==='ready'&&runtime_configuration.asset_revision){
+      // The same asset content can start a new session; only a committed apply
+      // replaces bundle_directory. Desired revisions alone must not clear drawings.
+      const identity=JSON.stringify([runtime_configuration.asset_revision,runtime_configuration.applied,runtime_configuration.bundle_directory]);
+      if(appliedRuntimeIdentity!==null&&identity!==appliedRuntimeIdentity){
+        cancelPendingDrawing();
+        for(const stage of Object.keys(strokesMap))strokesMap[stage]=[];
+        invalidateSelection('실행 구성이 적용됨 · 대상을 다시 선택하세요.');
+        if(window.WeldWorkflow)WeldWorkflow.reset();
+        ProcessSettings.disconnected();redrawSketch();refreshPaintingUI();
+      }
+      appliedRuntimeIdentity=identity;
+    }
+    updateFreeSpaceConfirmationRoute(runtime_configuration?.applied);
     executionRuntime = {
-      simulation: runtime?.simulation === true || ['isaac_construct', 'fake'].includes(configuration?.profile),
+      simulation: runtime?.simulation === true || configuration?.profile === 'isaac_construct',
+      execution_mode: runtime_configuration?.applied?.execution_mode || null,
       spray_standoff_m: runtime?.spray_standoff_m ?? null,
     };
     if (typeof renderProcessModeState === 'function') renderProcessModeState();
@@ -73,6 +92,10 @@ async function refreshImageTransport() {
       if (currentView === "zed_raw") subscribeView(currentView);
     }
   } catch (_) { /* Standalone web hosting keeps native-driver defaults. */ }
+  finally {
+    clearTimeout(runtimeStatusTimer);
+    if(rosConnected)runtimeStatusTimer=setTimeout(refreshImageTransport,2000);
+  }
 }
 
 ros.on("connection", () => {
@@ -195,12 +218,25 @@ function requireFreshAuthoritativeState(reason) {
   paintingState.local.invalidationReason = reason;
 }
 
-const freeSpaceConfirmedPub = new ROSLIB.Topic({
+let freeSpaceConfirmedPub = new ROSLIB.Topic({
   ros: ros,
   name: FREE_SPACE_CONFIRMED_TOPIC,
   messageType: "std_msgs/Bool",
 });
 let freeSpaceConfirmed = false;
+
+function updateFreeSpaceConfirmationRoute(applied) {
+  // Match platform_simulation.launch.py; pending desired settings do not own ROS.
+  const namespaced = ['simulation', 'mixed'].includes(applied?.execution_mode) &&
+    applied?.process === 'paint' && ['left', 'right', 'single'].includes(applied?.active_arm);
+  const name = (namespaced ? `/platform/${applied.active_arm}` : '') + FREE_SPACE_CONFIRMED_TOPIC;
+  if (freeSpaceConfirmedPub.name === name) return;
+  resetFreeSpaceConfirmation('active approval route changed', true);
+  if (typeof freeSpaceConfirmedPub.unadvertise === 'function') freeSpaceConfirmedPub.unadvertise();
+  freeSpaceConfirmedPub = new ROSLIB.Topic({ros, name, messageType: 'std_msgs/Bool'});
+  // Never carry an operator assertion across an arm/session change.
+  resetFreeSpaceConfirmation('active approval route initialized', true);
+}
 
 function setFreeSpaceConfirmed(value, publish = true, reason = "") {
   const next = value === true;
@@ -209,7 +245,7 @@ function setFreeSpaceConfirmed(value, publish = true, reason = "") {
   if (checkbox) checkbox.checked = next;
   if (publish && rosConnected) {
     freeSpaceConfirmedPub.publish(new ROSLIB.Message({ data: next }));
-    logEvent(`published ${FREE_SPACE_CONFIRMED_TOPIC}=${next}${reason ? ` (${reason})` : ""}`);
+    logEvent(`published ${freeSpaceConfirmedPub.name}=${next}${reason ? ` (${reason})` : ""}`);
   }
   // The operator half of the Run interlock changes synchronously; do not leave
   // a previously enabled Run button open while waiting for the next status tick.
@@ -405,9 +441,7 @@ function syncZedSelection(action) {
     local.planeInvalidated = false;
     local.selectionIdentityPending = false;
     if (acceptingWorkArea) local.unsentInputEdit = false;
-    if (workflowMode === "work_area") switchToPathMode();
-  } else if (zedSelection.target && workflowMode === "target") {
-    switchToWorkAreaMode();
+
   }
   reconcileValidatedPlan();
   refreshPaintingUI();
@@ -577,7 +611,9 @@ d405StatusSub.subscribe((msg) => {
 });
 
 planStatusSub.subscribe((msg) => {
+  if (processMode === "weld" || processModePending) return;
   const payload = parseJsonStatus(PLAN_STATUS_TOPIC, msg);
+  if (payload?.process_mode && payload.process_mode !== processMode) return;
   if (!payload) {
     paintingState.plan = { state: "rejected", reason: "INVALID_PLAN_STATUS_JSON" };
     paintingState.planSeq += 1;
@@ -628,7 +664,27 @@ let previousAbortReason = "";
 let previousExecutionState = "";
 let freeSpaceResetForActiveRun = false;
 
+function reconcileStopReset() {
+  if (!stopRequested || !stopWait) return;
+  const execution = paintingState.execution, sequence = Number(execution.execution_sequence);
+  if (normalizedState(execution.state) === 'abort' && sequence > stopWait.baselineSeq)
+    stopWait.abortSeq = Math.max(stopWait.abortSeq || 0, sequence);
+  const reset = normalizedState(execution.state) === 'idle' &&
+    execution.reason === 'manual execution abort reset' &&
+    stopWait.abortSeq !== null && sequence > stopWait.abortSeq;
+  const readiness = paintingState.readiness;
+  if (reset && paintingState.readinessSeq > stopWait.readinessSeq &&
+      readiness.running === false && readiness.abort_reason === 'NONE') {
+    stopRequested = false; stopWait = null;
+    paintingState.local.unsentInputEdit = true;
+    paintingState.local.planInvalidated = true;
+    paintingState.local.awaitingPlan = false;
+    paintingState.local.invalidationReason = 'safe abort reset; new plan required';
+  }
+}
+
 function handleRunAndAbortTransition() {
+  reconcileStopReset();
   const derived = paintingDerivedState();
   const executionState = normalizedState(paintingState.execution.state);
   // The executor latches the confirmed Run prerequisite before publishing
@@ -658,7 +714,9 @@ function handleRunAndAbortTransition() {
 }
 
 readinessSub.subscribe((msg) => {
+  if (processMode === "weld" || processModePending) return;
   const payload = parseJsonStatus(READINESS_TOPIC, msg);
+  if (payload?.process_mode && payload.process_mode !== processMode) return;
   if (!payload) {
     paintingState.readiness = {
       ready: false,
@@ -681,7 +739,9 @@ readinessSub.subscribe((msg) => {
 });
 
 executionStatusSub.subscribe((msg) => {
+  if (processMode === "weld" || processModePending) return;
   const payload = parseJsonStatus(EXECUTION_STATUS_TOPIC, msg);
+  if (payload?.process_mode && payload.process_mode !== processMode) return;
   if (!payload) {
     paintingState.execution = {
       state: "ERROR",
@@ -690,6 +750,13 @@ executionStatusSub.subscribe((msg) => {
     handleRunAndAbortTransition();
     refreshPaintingUI();
     return;
+  }
+  // Production execution messages have no process_mode. Bind nonempty identity
+  // fields to current authoritative work before allowing them to affect the UI.
+  for (const key of ['work_area_id', 'plane_generation_id', 'plan_hash']) {
+    const incoming = textId(payload[key]);
+    const current = textId(paintingState.readiness[key]);
+    if (incoming && incoming !== current) return;
   }
   paintingState.execution = payload;
   handleRunAndAbortTransition();
@@ -927,7 +994,8 @@ function refreshPaintingUI() {
     workflowMode !== "work_area" || currentView !== "wall_front" || derived.targetSelected !== true ||
     (spray && (currentStroke || pendingLine || pendingRect || !sprayWorkAreaBoundary(cs)));
   $("btn-execute").disabled = !pathGate || zedFrameCount === 0 || cs.length === 0 || Boolean(currentStroke || pendingLine || pendingRect);
-  $("btn-execute").hidden = false;
+  $("btn-execute").hidden = true;
+  $("btn-fill-work-area").hidden = true;
   $("btn-fill-work-area").textContent = spray ? "자동 도포 경로 생성" : "영역 자동 채우기";
   $("btn-fill-work-area").disabled = !pathGate;
   $("btn-run-robot").disabled = planningOnly || !rosConnected || !derived.ready || stopRequested;
@@ -984,8 +1052,60 @@ function refreshPaintingUI() {
   $("btn-fill-work-area").title = pathReasons.length ? pathReasons.join("; ") : "선택한 작업영역을 채우는 경로를 생성합니다";
   const runReasons = buttonBlockReason(derived, "run");
   $("btn-run-robot").title = runReasons.length ? runReasons.join("; ") : "확인 후 로봇이 움직입니다";
+  Workflow.render(Workflow.derive(getPaintingWorkflowInput()));
   return derived;
 }
+
+function getPaintingWorkflowInput() {
+  const d=paintingDerivedState(),l=paintingState.local;
+  // awaitingD405 alone can mean "area not chosen yet", not an in-flight move.
+  const pending=Boolean(multiPlaneBusy||waitingTargetRefine||waitingWorkAreaRefine||l.awaitingPlan);
+  const targetReady=processMode==='spray'?Boolean(zedSelection.target):
+    paintingState.targetSelectionState==='selected'||(d.targetSelected&&!l.awaitingD405);
+  return {mode:processMode,stage:workflowMode,connected:rosConnected,modePending:processModePending,
+    planningOnly,running:d.running,stopping:stopRequested,pending,targetReady,
+    jobReady:d.workAreaSelected&&d.surfaceAccepted,settingsApplied:true,
+    canPlan:zedFrameCount>0&&currentView==='wall_front'&&buttonBlockReason(d,'path').length===0&&
+      (pathMethod==='auto'||currentStrokes().length>0&&!currentStroke&&!pendingLine&&!pendingRect),
+    canRun:d.ready,generated:d.planValidated||d.planGenerated||(!l.planInvalidated&&
+      ["generated","validated"].includes(d.planState)&&Boolean(d.pathId)&&Boolean(d.planHash)&&
+      d.surfaceAccepted&&textId(paintingState.plan.work_area_id)===d.workAreaId&&
+      textId(paintingState.plan.plane_generation_id)===d.planeGenerationId),validated:d.planValidated,
+    dirty:l.unsentInputEdit,pathMethod,error:d.abortReason||'',blockers:[]};
+}
+function workflowView() {
+  return Workflow.derive(processMode==='weld'&&window.WeldWorkflow?.workflowInput?
+    WeldWorkflow.workflowInput():getPaintingWorkflowInput());
+}
+function workflowCanDraw() {
+  // Legacy weld rendering remains valid until its stage adapter is loaded.
+  if(processMode==='weld'&&!window.WeldWorkflow?.workflowInput) return rosConnected&&!processModePending&&!paintingDerivedState().running;
+  const v=workflowView();return v.canEdit&&v.show.drawing;
+}
+function navigateWorkflow(stage) {
+  const v=workflowView();
+  if(!v.steps.find(s=>s.key===stage)?.accessible) {Workflow.render(v);return false;}
+  switchWorkflow(stage);refreshPaintingUI();return true;
+}
+function setPathMethod(method) {
+  if(!['auto','manual'].includes(method)||processMode==='weld'||!workflowView().canEdit) return;
+  if(method!==pathMethod) {
+    pathMethod=method;paintingState.local.unsentInputEdit=true;
+    cancelPendingDrawing();
+    invalidatePlanLocally('경로 방식 변경');
+  }
+  $('path-method').value=pathMethod;refreshPaintingUI();
+}
+function requestWorkflowPlan() {
+  if(!workflowView().canPlan)return false;
+  if(processMode==='weld')WeldWorkflow.requestPlan();
+  else if(pathMethod==='manual')requestManualPlan();
+  else requestFillPlan();
+  refreshPaintingUI();return true;
+}
+$('path-method').addEventListener('change',event=>setPathMethod(event.target.value));
+$('btn-plan-workflow').addEventListener('click',requestWorkflowPlan);
+$('btn-workflow-next').addEventListener('click',()=>{const next=workflowView().next;if(next)navigateWorkflow(next.key);});
 
 // ---- View mode (ZED Raw / Wall Front) + image subscriber ----
 // 두 view 의 sketch strokes 는 의미가 다름 (원본 카메라 픽셀 vs 벽 평면 픽셀) → 분리 보관.
@@ -1064,7 +1184,7 @@ function resizeImageCanvas(width, height) {
 }
 
 function handleImageMsg(msg) {
-  if (currentView === "zed_raw" && window.WeldWorkflow) WeldWorkflow.setImageHeader(msg.header);
+  if (currentView === "zed_raw" && window.WeldWorkflow?.isFrameFrozen()) return;
   try {
     const imgData = decodeImageData(msg);
     resizeImageCanvas(msg.width, msg.height);
@@ -1074,10 +1194,12 @@ function handleImageMsg(msg) {
     return;
   }
 
+  if (currentView === "zed_raw" && window.WeldWorkflow) WeldWorkflow.setImageHeader(msg.header);
   imageDisplayed(msg.width, msg.height, msg.encoding);
 }
 
 function handlePreviewImage(image, msg) {
+  if (currentView === "zed_raw" && window.WeldWorkflow?.isFrameFrozen()) return;
   if (currentView === "zed_raw" && window.WeldWorkflow) WeldWorkflow.setImageHeader(msg?.header);
   resizeImageCanvas(image.width, image.height);
   zedCtx.drawImage(image, 0, 0);
@@ -1330,6 +1452,7 @@ function redrawSketch() {
   sketchCtx.clearRect(0, 0, sketchCanvas.width, sketchCanvas.height);
   if (typeof drawPlaneCandidates === "function") drawPlaneCandidates();
   drawRollerFootprints();
+  if(window.WeldWorkflow)WeldWorkflow.drawOverlay(sketchCtx,sketchCanvas.width,sketchCanvas.height);
   const derived = paintingDerivedState();
   if (currentView === "wall_front" && workflowMode === "path" &&
       (derived.planGenerated || derived.planValidated)) {
@@ -1419,13 +1542,14 @@ sketchCanvas.addEventListener("pointerdown", (ev) => {
     logEvent("영상 수신 후 영역을 선택하세요");
     return;
   }
-  if (paintingDerivedState().running || processModePending ||
+  if (!workflowCanDraw() || paintingDerivedState().running || processModePending ||
       (processMode === "spray" && workflowMode !== "target" &&
         (!zedSelection.target || currentView !== "wall_front" ||
          (workflowMode === "path" && !paintingDerivedState().surfaceAccepted)))) {
     logEvent("stroke ignored: execution is running");
     return;
   }
+  if (workflowMode === "target" && window.WeldWorkflow && !WeldWorkflow.beginDrawing()) return;
   sketchCanvas.setPointerCapture(ev.pointerId);
   const c = getNativeCoords(ev);
   currentMouse = c;
@@ -1530,13 +1654,22 @@ document.querySelectorAll('input[name="sketch-mode"]').forEach((r) => {
   });
 });
 
-function switchWorkflow(mode) {
-  if (!strokesMap[mode]) return;
+function cancelPendingDrawing() {
+  if (currentStroke) {
+    const strokes = currentStrokes(), index = strokes.indexOf(currentStroke);
+    if (index >= 0) strokes.splice(index, 1);
+  }
   currentStroke = null;
   pendingLine = null;
   pendingRect = null;
+}
+
+function switchWorkflow(mode) {
+  if (!strokesMap[mode]) return;
+  cancelPendingDrawing();
   currentMouse = null;
   workflowMode = mode;
+  if (mode !== "target" && processMode !== "weld" && window.WeldWorkflow) WeldWorkflow.releaseFrame();
   if (processMode === "spray" && mode === "work_area") {
     sketchMode = "rect";
     document.querySelector('input[name="sketch-mode"][value="rect"]').checked = true;
@@ -1554,15 +1687,16 @@ function switchWorkflow(mode) {
 document.querySelectorAll('input[name="workflow-mode"]').forEach((r) => {
   r.addEventListener("change", () => {
     const mode = document.querySelector('input[name="workflow-mode"]:checked').value;
-    switchWorkflow(mode);
+    navigateWorkflow(mode);
   });
 });
 
 // ---- Clear / Undo (현재 view 의 strokes 만) ----
 $("btn-clear").addEventListener("click", () => {
-  if (paintingDerivedState().running) return;
+  if (!workflowCanDraw()) return;
   paintingState.local.unsentInputEdit = true;
   currentStrokes().length = 0;
+  if(workflowMode === "target" && window.WeldWorkflow) WeldWorkflow.releaseFrame();
   pendingLine = null;
   pendingRect = null;
   currentStroke = null;
@@ -1573,10 +1707,11 @@ $("btn-clear").addEventListener("click", () => {
 });
 
 $("btn-undo").addEventListener("click", () => {
-  if (paintingDerivedState().running) return;
+  if (!workflowCanDraw()) return;
   const cs = currentStrokes();
   if (cs.length > 0 || (workflowMode === "target" && hasPlaneExtraction())) {
     cs.pop();
+    if(workflowMode === "target" && !cs.length && window.WeldWorkflow) WeldWorkflow.releaseFrame();
     paintingState.local.unsentInputEdit = true;
     if (workflowMode === "target") invalidateTargetPlanes("target undone");
     else if (processMode === "spray" && workflowMode === "work_area")
@@ -1723,7 +1858,6 @@ targetRefineStatusSub.subscribe((msg) => {
   if (decision.action === "success") {
     clearTargetRefineWait();
     paintingState.targetSelectionState = "selected";
-    switchToWorkAreaMode();
   } else if (decision.action === "failure") {
     clearTargetRefineWait();
     paintingState.targetSelectionState = "rejected";
@@ -1746,7 +1880,6 @@ workAreaRefineStatusSub.subscribe((msg) => {
 
   if (state === "done" || state === "accepted") {
     waitingWorkAreaRefine = false;
-    switchToPathMode();
     logEvent("work-area workflow completed; waiting for authoritative D405 acceptance");
   } else if (["failed", "rejected", "timeout", "busy", "aborted", "abort_latched"].includes(state)) {
     waitingWorkAreaRefine = false;
@@ -1798,9 +1931,11 @@ function publishPixels(pub, topicName, frameId, strokes, stamp = null) {
 
 $("btn-set-target").addEventListener("click", () => {
   if (processMode === "weld") { WeldWorkflow.requestTarget(); return; }
-  if (workflowMode !== "target" || currentView !== "zed_raw") return;
+  if (!workflowView().canEdit || workflowMode !== "target" || currentView !== "zed_raw") return;
   if (zedFrameCount === 0) return;
   if (!rosConnected || processModePending || paintingDerivedState().running || !currentStrokes().length) return;
+  const selectionStamp = nowRosTime();
+  if (window.WeldWorkflow && !WeldWorkflow.submitTaskScene(currentStrokes(), selectionStamp)) return;
   if (typeof clearPlaneSelection === "function") clearPlaneSelection(true);
   if (processMode === "spray") invalidateSelection("new ZED target selected");
   paintingState.targetSelectionState = "pending";
@@ -1810,7 +1945,6 @@ $("btn-set-target").addEventListener("click", () => {
   // stored this new target surface.  Publishing a separate Bool here used to
   // race the target surface across two DDS topics and could refine the old
   // target instead.
-  const selectionStamp = nowRosTime();
   beginPlaneExtraction(selectionStamp);
   clearTargetRefineWait();
   if (publishPixels(
@@ -1831,7 +1965,7 @@ $("btn-set-target").addEventListener("click", () => {
 });
 
 $("btn-set-work-area").addEventListener("click", () => {
-  if (workflowMode !== "work_area" || currentView !== "wall_front") return;
+  if (!workflowView().canEdit || workflowMode !== "work_area" || currentView !== "wall_front") return;
   if (zedFrameCount === 0) return;
   if (!rosConnected || processModePending || paintingDerivedState().running) return;
   let strokes = currentStrokes();
@@ -1880,7 +2014,7 @@ $("btn-set-work-area").addEventListener("click", () => {
   }
 });
 
-$("btn-fill-work-area").addEventListener("click", () => {
+function requestFillPlan() {
   if (processMode === "weld") { WeldWorkflow.requestPlan(); return; }
   const derived = paintingDerivedState();
   const blockers = buttonBlockReason(derived, "path");
@@ -1893,9 +2027,9 @@ $("btn-fill-work-area").addEventListener("click", () => {
   fillWorkAreaPub.publish(new ROSLIB.Message({}));
   // The overlay uses only the backend-generated pixels for this path ID.
   logEvent("published /fill_work_area; waiting for backend plan_status before Run is enabled");
-});
+}
 
-$("btn-execute").addEventListener("click", () => {
+function requestManualPlan() {
   if (zedFrameCount === 0 || currentStroke || pendingLine || pendingRect) return;
   const cs = currentStrokes();
   if (cs.length === 0) return;
@@ -1924,14 +2058,17 @@ $("btn-execute").addEventListener("click", () => {
   }
   if (!publishPixels(sketchPub, SKETCH_PIXELS_TOPIC, "wall_front", cs)) return;
   logEvent("path pixels sent; waiting for backend plan validation before Run is enabled");
-});
+}
+
+$("btn-fill-work-area").addEventListener("click", () => { if (!workflowView().canEdit) return; requestFillPlan(); });
+$("btn-execute").addEventListener("click", () => { if (!workflowView().canEdit) return; requestManualPlan(); });
 
 // ---- Run Robot: confirm 후 /sketch_execute Bool(true) publish ----
 $("btn-run-robot").addEventListener("click", () => {
   if (processMode === "weld") { WeldWorkflow.execute(); return; }
   const derived = refreshPaintingUI();
   const blockers = buttonBlockReason(derived, "run");
-  if (!derived.ready || blockers.length) {
+  if (!workflowView().canRun || !derived.ready || blockers.length) {
     logEvent(`Run rejected by authoritative gate: ${blockers.join("; ") || "readiness=false"}`);
     return;
   }
@@ -1963,6 +2100,10 @@ $("btn-run-robot").addEventListener("click", () => {
 const motionAbortPub = new ROSLIB.Topic({ros, name: "/motion_abort", messageType: "std_msgs/Bool"});
 $("btn-stop-robot").addEventListener("click", () => {
   if (!rosConnected) return;
+  if (!stopRequested) stopWait = {
+    baselineSeq: Number(paintingState.execution.execution_sequence) || 0,
+    abortSeq: null, readinessSeq: paintingState.readinessSeq,
+  };
   stopRequested = true;
   motionAbortPub.publish(new ROSLIB.Message({data: true}));
   resetFreeSpaceConfirmation("operator requested stop", true);
@@ -1979,3 +2120,33 @@ new ROSLIB.Topic({ros, name: "/painting_system/fill_preview_pixels",
   backendPreview = msg;
   redrawSketch();
 });
+
+// Resolve the supervisor's transport before connecting to an existing ROS graph.
+async function connectOwnedRosTransport() {
+  let port = 9090;
+  try {
+    if (typeof fetch === 'function') {
+      const response = await fetch(new URL('/runtime-connection', window.location.href));
+      if (response.ok) {
+        const config = await response.json();
+        if (config.rosbridge_port !== undefined) {
+          if (!Number.isInteger(config.rosbridge_port) || config.rosbridge_port < 1 || config.rosbridge_port > 65535) {
+            throw new Error('Invalid ROS WebSocket port');
+          }
+          port = config.rosbridge_port;
+        }
+      } else if (response.status !== 404) {
+        throw new Error('ROS connection configuration is unavailable');
+      }
+    }
+    WS_URL = `ws://${window.location.hostname || "localhost"}:${port}`;
+    $("ws-url").textContent = WS_URL;
+    ros.connect(WS_URL);
+    imageRos.connect(WS_URL);
+  } catch (error) {
+    setStatus('error', 'error');
+    logEvent(error.message);
+    setTimeout(connectOwnedRosTransport, 1000);
+  }
+}
+connectOwnedRosTransport();

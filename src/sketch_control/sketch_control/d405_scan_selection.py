@@ -18,7 +18,8 @@ from sketch_control.d405_view_geometry import measurement_samples, camera_view, 
 class D405ScanSelectionMixin:
     def _d405_mount_transform(self):
         transform = self.tf_buffer.lookup_transform(
-            'tcp', 'd405_color_optical_frame', rclpy.time.Time(), timeout=Duration(seconds=.2))
+            getattr(self, 'ee_link', 'tcp'), 'd405_color_optical_frame',
+            rclpy.time.Time(), timeout=Duration(seconds=.2))
         t,q = transform.transform.translation, transform.transform.rotation
         translation = np.array([t.x,t.y,t.z],float)
         rotation = np.array([q.x,q.y,q.z,q.w],float)
@@ -126,11 +127,11 @@ class D405ScanSelectionMixin:
         context['phase'] = 'ik'
         for index,candidate in enumerate(context['candidates']):
             request = GetPositionIK.Request()
-            request.ik_request.group_name = 'manipulator'
-            request.ik_request.ik_link_name = 'tcp'
+            request.ik_request.group_name = getattr(self, 'planning_group', 'manipulator')
+            request.ik_request.ik_link_name = getattr(self, 'ee_link', 'tcp')
             request.ik_request.robot_state.joint_state = copy.deepcopy(context['seed'])
             request.ik_request.avoid_collisions = True
-            request.ik_request.pose_stamped.header.frame_id = 'link0'
+            request.ik_request.pose_stamped.header.frame_id = getattr(self, 'base_frame', 'link0')
             request.ik_request.pose_stamped.header.stamp = self.get_clock().now().to_msg()
             request.ik_request.pose_stamped.pose = copy.deepcopy(candidate['pose'])
             request.ik_request.timeout = Duration(seconds=.5).to_msg()

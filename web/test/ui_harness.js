@@ -78,7 +78,7 @@ function loadUI(page = "index.html", fetch) {
   const topics = [];
   let ros;
   class Ros {
-    constructor() { if (!ros) ros = this; connections.push(this); this.listeners = {}; }
+    constructor(options) { if (!ros) ros = this; connections.push(this); this.listeners = {}; this.initialUrl = options?.url; }
     connect(url) { this.connectCalls = [...(this.connectCalls || []), url]; }
     callOnConnection(packet) { this.packets = [...(this.packets || []), packet]; }
     on(event, fn) { (this.listeners[event] ||= []).push(fn); }
@@ -93,8 +93,7 @@ function loadUI(page = "index.html", fetch) {
   const context = vm.createContext({
     document: {
       getElementById: id => {
-        if (!elements.has(id)) throw new Error(`Missing UI element ${id}`);
-        return elements.get(id);
+        return elements.get(id) || null;
       },
       querySelectorAll: queryAll, querySelector: selector => queryAll(selector)[0],
       createElement: tag => new Element(tag), createTextNode: text => ({ textContent: text }), addEventListener() {},

@@ -12,6 +12,7 @@ import time
 
 from geometry_msgs.msg import WrenchStamped
 import rclpy
+from rclpy.clock import Clock, ClockType
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
@@ -60,6 +61,7 @@ def _quat_rotate(q, v):
 class PaintingWrenchReferenceNode(Node):
     def __init__(self) -> None:
         super().__init__("painting_wrench_reference")
+        self.declare_parameter('public_motion_abort_requires_restart', False)
 
         self.declare_parameter("controller_name", "admittance_controller")
         self.declare_parameter(
@@ -185,13 +187,14 @@ class PaintingWrenchReferenceNode(Node):
 
         self._mode = "IDLE"
         self._aborted = False
+        self._motion_abort_latched = False
         self._measured_force_y = 0.0
         self._measured_force_y_at = 0.0
         self._current_force_y = 0.0
         self._ramp_start_force_y = 0.0
-        self._ramp_started_at = time.monotonic()
+        self._ramp_started_at = self._dynamics_time()
         self._ramp_complete = True
-        self._last_time = time.monotonic()
+        self._last_time = self._dynamics_time()
         self._last_tf_warn = 0.0
         self._last_log = 0.0
         self._ramp_status_sequence = 0
@@ -240,6 +243,8 @@ class PaintingWrenchReferenceNode(Node):
             Bool, "/painting_admittance/enable_force", self._on_enable_force, 10
         )
         self.create_subscription(Bool, "/painting_admittance/abort", self._on_abort, 10)
+        if self.get_parameter('public_motion_abort_requires_restart').value:
+            self.create_subscription(Bool, '/motion_abort', self._on_motion_abort, 10)
         if self._measured_wrench_topic:
             self.create_subscription(
                 WrenchStamped,
@@ -247,7 +252,10 @@ class PaintingWrenchReferenceNode(Node):
                 self._on_measured_wrench,
                 10,
             )
-        self.create_timer(1.0 / self._rate_hz, self._on_timer)
+        # Dispatch watchdogs and heartbeat publications even when /clock stops.
+        # Sensor stamps and force-ramp dynamics retain the node's ROS clock.
+        self._steady_clock = Clock(clock_type=ClockType.STEADY_TIME)
+        self.create_timer(1.0 / self._rate_hz, self._on_timer, clock=self._steady_clock)
 
         self.get_logger().warn(
             "Painting wrench reference ready: dry_run=%s, enable_force=%s, "
@@ -260,6 +268,14 @@ class PaintingWrenchReferenceNode(Node):
                 self._requested_wrench_topic,
             )
         )
+
+    def _dynamics_time(self):
+        """Use the physics time domain for dynamics, never for input leases."""
+        clock = self.get_clock()
+        if getattr(clock, "ros_time_is_active", False):
+            now_ns = clock.now().nanoseconds
+            return now_ns * 1e-9 if now_ns > 0 else None
+        return time.monotonic()
 
     def _on_measured_wrench(self, msg: WrenchStamped) -> None:
         value = float(msg.wrench.force.y)
@@ -308,7 +324,7 @@ class PaintingWrenchReferenceNode(Node):
             mode = "IDLE"
         if mode != self._mode:
             self._ramp_start_force_y = self._ramp_entry_force_y(mode)
-            self._ramp_started_at = time.monotonic()
+            self._ramp_started_at = self._dynamics_time()
             self._ramp_complete = mode not in RAMP_MODES
         self._mode = mode
         if mode == "ABORT":
@@ -333,8 +349,16 @@ class PaintingWrenchReferenceNode(Node):
             )
             desired = self._max_force
         if self._mode == "RAMP_UP" and abs(desired - self._desired_force) > 1e-9:
-            self._ramp_start_force_y = self._current_force_y
-            self._ramp_started_at = time.monotonic()
+            # The mode and setpoint use independent topics. If the mode edge
+            # arrived while CONTACT_SEARCH's zero target was still current,
+            # seed this first positive target from the same fresh contact
+            # measurement used by _on_mode. Ordinary retargets stay continuous.
+            initial_target = (self._desired_force <= 1e-9 and desired > 0.0
+                              and abs(self._current_force_y) <= 1e-9)
+            self._desired_force = desired
+            self._ramp_start_force_y = (self._ramp_entry_force_y("RAMP_UP")
+                                       if initial_target else self._current_force_y)
+            self._ramp_started_at = self._dynamics_time()
             self._ramp_complete = False
         self._desired_force = desired
 
@@ -345,10 +369,18 @@ class PaintingWrenchReferenceNode(Node):
             self._ramp_complete = True
 
     def _on_abort(self, msg: Bool) -> None:
-        self._aborted = bool(msg.data)
+        self._aborted = bool(msg.data) or self._motion_abort_latched
         if self._aborted and self._zero_on_abort:
             self._current_force_y = 0.0
             self._ramp_complete = True
+
+    def _on_motion_abort(self, msg: Bool) -> None:
+        if msg.data:
+            self._motion_abort_latched = True
+            self._on_abort(msg)
+            # Withdraw the request on receipt, independent of executor/monitor
+            # relays and the next periodic timer. A hard stop requires restart.
+            self._on_timer()
 
     def _target_force_y_for_mode(self) -> float:
         if self._aborted:
@@ -419,6 +451,9 @@ class PaintingWrenchReferenceNode(Node):
         return msg
 
     def _transform_force_tcp_to_ft(self, tcp_force: list[float]) -> list[float] | None:
+        # Zero is frame invariant: an emergency zero never waits on TF.
+        if all(value == 0.0 for value in tcp_force):
+            return list(tcp_force)
         if self._tcp_frame == self._ft_frame:
             return list(tcp_force)
         try:
@@ -446,12 +481,30 @@ class PaintingWrenchReferenceNode(Node):
         self._mode_pub.publish(msg)
 
     def _on_timer(self) -> None:
+        # Provenance, measured-input freshness and abort handling keep wall
+        # time. Only ramp progress and force slew advance with physics time.
         now = time.monotonic()
-        dt = now - self._last_time
-        self._last_time = now
+        dynamics_now = self._dynamics_time()
+        simulated = getattr(self.get_clock(), "ros_time_is_active", False)
+        dt = (dynamics_now - self._last_time
+              if dynamics_now is not None and self._last_time is not None else 0.0)
+        if not simulated or (dynamics_now is not None and
+                             (self._last_time is None or dynamics_now > self._last_time)):
+            # Preserve the last positive physics time across zero/rewind;
+            # never manufacture elapsed dynamics time on clock reset.
+            self._last_time = dynamics_now
+        if self._ramp_started_at is None and dynamics_now is not None:
+            self._ramp_started_at = dynamics_now
 
         target_force_y = self._target_force_y_for_mode()
-        self._current_force_y = self._slew_force(target_force_y, dt, now)
+        if not simulated or (dynamics_now is not None and dt > 0.0):
+            self._current_force_y = self._slew_force(target_force_y, dt, dynamics_now)
+        elif self._aborted or not self._enable_force or self._mode in ZERO_FORCE_MODES:
+            # A stopped/uninitialized clock must never defer a zero command.
+            self._current_force_y = 0.0
+            self._ramp_complete = True
+        # Otherwise a duplicate/frozen simulation clock holds the previous
+        # force even if the slew cap or the configured ramp duration is zero.
         if not math.isfinite(self._current_force_y):
             self.get_logger().error("non-finite force command generated; latching ABORT")
             self._aborted = True

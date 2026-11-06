@@ -32,6 +32,8 @@
   <exec_depend>rviz2</exec_depend>
   <exec_depend>rosbridge_server</exec_depend>
   <exec_depend>rbpodo_msgs</exec_depend>
+  <exec_depend>isaac_painting_msgs</exec_depend>
+  <exec_depend>rosgraph_msgs</exec_depend>
   <exec_depend>eoat_description</exec_depend>
   <exec_depend>realsense2_camera</exec_depend>
   <exec_depend>realsense2_description</exec_depend>

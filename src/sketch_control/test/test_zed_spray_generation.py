@@ -54,8 +54,8 @@ def generator(tmp_path):
     module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
                              node_class], type_ignores=[])
     namespace = {}
-    from rbpodo_painting_control import spray_eoat
-    for dependency in (segment_path, spray_path, work_area_geometry, spray_eoat):
+    from rbpodo_painting_control import spray_eoat, spray_envelope
+    for dependency in (segment_path, spray_path, work_area_geometry, spray_eoat, spray_envelope):
         namespace.update({key: value for key, value in vars(dependency).items() if not key.startswith("__")})
     namespace.update(Node=object, np=np, math=math, time=time, json=json, replace=replace,
                      groupby=groupby, Marker=Marker, Point=SimpleNamespace, ColorRGBA=SimpleNamespace,
@@ -69,6 +69,7 @@ def generator(tmp_path):
     node.process_mode = "spray"
     node.model_id, node.spray_tool_axis = "rb10_1300e_u", "-y"
     node.spray_eoat_profile = str(write_profile(tmp_path))
+    node.spray_envelope_profile = ""
     node.spray_footprint_width_m, node.spray_overlap = .35, .30
     node.spray_speed_mps, node.spray_standoff_m = .02, .5
     node.real_painting_enabled, node.dry_run = True, False
@@ -561,3 +562,69 @@ def test_preview_tcp_reconstructs_nozzle_half_meter_from_surface(generator, tmp_
         nozzle = tcp + rotation @ endpoint
         np.testing.assert_allclose(nozzle, np.asarray(row.position) + .5 * normal, atol=1e-8)
         assert np.dot(tcp - row.position, normal) == pytest.approx(.68)
+
+
+ENVELOPE = Path(__file__).resolve().parents[3] / "assets/construct/spray_v2/envelope.json"
+
+
+def configure_cone(node):
+    node.spray_envelope_profile = str(ENVELOPE)
+    node.spray_footprint_width_m, node.spray_overlap = .602376, .1
+
+
+def test_cone_profile_produces_one_long_axis_pass_and_binds_source(generator):
+    configure_cone(generator)
+    path = generate(generator)
+    assert path is not None
+    spray_rows = [row for row in path.rows if row.mode == "SPRAY"]
+    assert len(spray_rows) == 2
+    np.testing.assert_allclose([row.position for row in spray_rows], [[0., .25, 0.], [1., .25, 0.]])
+    assert path.raw_payload["spray_envelope_source_sha256"] == "b8c4d8ce18572932fde019faf4b55f5a9289acf5d324d5dcc1a68006abba73b9"
+    assert path.source["spray_envelope_profile_sha256"] == path.raw_payload["spray_envelope_profile_sha256"]
+    segment_path.validate_segment_path_for_real_execution(path)
+
+
+def test_cone_preview_matches_narrow_beam_one_pass_with_overspray(generator):
+    configure_cone(generator)
+    generator.zed_surface_status.update(
+        corners=[[.2, .1, 0.], [.8, .1, 0.], [.8, .3, 0.], [.2, .3, 0.]],
+        position=[.5, .2, 0.])
+    for pose, (u, v) in zip(generator.latest_work_area_pixels.poses,
+                            ((160., 80.), (640., 80.), (640., 240.), (160., 240.))):
+        pose.position.x, pose.position.y = u, v
+    generator.latest_work_area_rect_px = (160., 80., 640., 240.)
+    previews = []
+    generator._publish_fill_preview = lambda strokes, **kwargs: previews.append(strokes)
+    generator._on_fill_work_area(None)
+    assert len(generator.segment_pub.messages) == 1
+    payload = json.loads(generator.segment_pub.messages[0].data)
+    rows = [row for row in payload["rows"] if row["mode"] == "SPRAY"]
+    np.testing.assert_allclose([[row['x'], row['y'], row['z']] for row in rows],
+                               [[.2, .2, 0.], [.8, .2, 0.]])
+    np.testing.assert_allclose(previews[-1], [[[160., 160.], [640., 160.]]])
+    assert payload['spray_standoff_m'] == .5
+    assert payload['spray_footprint_width_m'] == .602376
+
+
+def test_cone_width_mismatch_rejects_generated_plan(generator):
+    configure_cone(generator)
+    generator.spray_footprint_width_m = .35
+    assert generate(generator) is None
+
+
+def test_profile_multi_pass_travel_is_off_and_standoff_is_constant(generator):
+    configure_cone(generator)
+    generator.zed_surface_status.update(
+        corners=[[0., 0., 0.], [3., 0., 0.], [3., 1.2, 0.], [0., 1.2, 0.]],
+        front_extent=[[0., 0., 0.], [3., 0., 0.], [3., 1.2, 0.], [0., 1.2, 0.]],
+        position=[1.5, .6, 0.])
+    generator.zed_target_lock.update(center=[1.5, .6, 0.],
+        corners=copy.deepcopy(generator.zed_surface_status['corners']))
+    path = generate(generator)
+    assert path is not None
+    rows = path.raw_payload['rows']
+    assert [row['mode'] for row in rows] == [
+        'SPRAY_APPROACH', 'SPRAY', 'SPRAY', 'SPRAY_TRAVEL', 'SPRAY', 'SPRAY',
+        'SPRAY_TRAVEL', 'SPRAY', 'SPRAY', 'SPRAY_FINISH']
+    assert all(row['offset_m'] == .5 for row in rows)
+    assert [row['y'] for row in rows if row['mode'] == 'SPRAY'][::2] == pytest.approx([.0578616, .6, 1.1421384])

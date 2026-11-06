@@ -13,6 +13,8 @@ def nodes(context):
         Node(package='sketch_control', executable='moveit_executor',
              name='moveit_executor', output='screen', parameters=[{
                  'model_id': model, 'use_sim_time': True,
+                 # Match the generated EOAT semantics loaded by MoveIt.
+                 'collision_srdf_path': str(root / 'isaac_assets/construct.srdf'),
                  'execution_backend': 'follow_joint_trajectory',
                  # FJT trajectories use simulation time; the original result
                  # watchdog uses wall time. Allow slower RTX/VNC playback while

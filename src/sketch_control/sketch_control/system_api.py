@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, StrictBool, StrictStr
+from pydantic import BaseModel, ConfigDict, StrictBool, StrictStr, StrictInt
 
 from .process_supervisor import Supervisor, SupervisorError
 from .outpost_camera import get_json
@@ -18,6 +18,7 @@ from .outpost_camera import get_json
 
 class ConfigurationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    expected_revision: StrictInt | None = None
     profile: str = "dry_run"
     process_mode: str | None = None
     spray_eoat_profile: StrictStr | None = None
@@ -32,6 +33,18 @@ class ConfigurationRequest(BaseModel):
     outpost_zed_serial: str = ''
     outpost_d405_hw_id: str = ''
     outpost_d405_serial: str = ''
+
+
+class RuntimeConfigurationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    selection: dict = {}
+    connections: dict | None = None
+    expected_revision: StrictInt
+
+
+class RuntimeApplyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: StrictInt
 
 
 def is_loopback(host):
@@ -80,9 +93,21 @@ def create_app(supervisor, *, api_token=None, manage_monitor=False, local_only=T
     async def handle_error(_request, exc):
         return JSONResponse(status_code=exc.status, content={"detail": str(exc)})
 
+    from .runtime_apply import RuntimeApplyError
+
+    @app.exception_handler(RuntimeApplyError)
+    async def handle_runtime_error(_request, exc):
+        return JSONResponse(status_code=exc.status, content={"detail": str(exc)})
+
     @app.get("/healthz")
     async def health():
         return {"status": "live"}
+
+    @app.get('/runtime-connection')
+    async def runtime_connection():
+        # The original browser pages need their owned ROS transport before
+        # connecting. This endpoint contains only connection routing metadata.
+        return supervisor.connection_config()
 
     router = APIRouter(dependencies=[Depends(authenticate)])
 
@@ -94,22 +119,44 @@ def create_app(supervisor, *, api_token=None, manage_monitor=False, local_only=T
     async def events():
         return {"events": list(supervisor.event_list)}
 
+    @router.get('/runtime/configuration')
+    async def runtime_configuration():
+        return supervisor.runtime_state()
+
+    @router.post('/runtime/configuration')
+    async def configure_runtime(body: RuntimeConfigurationRequest):
+        try:
+            return supervisor.runtime_manager.configure(body.model_dump(exclude_none=True))
+        except ValueError as exc:
+            if isinstance(exc, RuntimeApplyError): raise
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.post('/runtime/apply')
+    async def apply_runtime(body: RuntimeApplyRequest):
+        return await supervisor.runtime_manager.apply(body.expected_revision)
+
     @router.get("/configuration")
     async def configuration():
         return supervisor.options
 
     @router.get('/outpost/cameras')
-    async def outpost_cameras():
+    async def outpost_cameras(outpost_http: str | None = None):
         import asyncio
         try:
-            cameras = await asyncio.to_thread(get_json, supervisor.options['outpost_http'], '/cameras')
+            from .runtime_apply import validate_connections
+            address = outpost_http or supervisor.runtime_manager.state()['connections'].get('outpost_http', supervisor.options['outpost_http'])
+            validate_connections({'outpost_http': address})
+            cameras = await asyncio.to_thread(get_json, address, '/cameras')
             return {'cameras': cameras}
         except (OSError, ValueError) as exc:
             raise HTTPException(503, 'Outpost unavailable: ' + str(exc)) from None
 
     @router.post("/configuration")
     async def configure(body: ConfigurationRequest):
-        return await supervisor.configure(body.model_dump(exclude_none=True))
+        # The simulator profile owns its model and camera defaults. Preserve an
+        # explicitly supplied incompatible value so validation can reject it.
+        return await supervisor.configure(body.model_dump(
+            exclude_none=True, exclude_unset=body.profile == 'isaac_rb20_paint'))
 
     @router.get("/processes/{name}")
     async def process_status(name: str):

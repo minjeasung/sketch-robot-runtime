@@ -13,7 +13,9 @@ def test_generated_equipment_uses_construct_tcp_and_urdf_meshes(tmp_path):
     from prepare_construct_runtime import prepare
     from rbpodo_painting_control.spray_eoat import load_spray_eoat_profile
     import json
-    prepare(ROOT, tmp_path)
+    from prepare_construct_assets import prepare as prepare_assets
+    prepare_assets(ROOT, tmp_path, source_model='original')
+    prepare(ROOT, tmp_path, urdf_path=tmp_path/'construct_control.urdf')
     for side in ('left', 'right'):
         name = 'construct_' + side
         path = tmp_path / (name + '_eoat.json')

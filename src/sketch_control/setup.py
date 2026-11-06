@@ -22,7 +22,10 @@ setup(
     zip_safe=True,
     entry_points={
         'console_scripts': [
+            'isaac_painting_lifecycle = sketch_control.isaac_painting_lifecycle:main',
             'weld_input = sketch_control.weld_input_node:main',
+            'rgbd_weld_provider = sketch_control.rgbd_weld_provider_node:main',
+            'task_scene = sketch_control.task_scene_node:main',
             'outpost_bridge = sketch_control.outpost_bridge_node:main',
             'zed_preview = sketch_control.zed_preview_node:main',
             'sketch_ui = sketch_control.sketch_ui:main',

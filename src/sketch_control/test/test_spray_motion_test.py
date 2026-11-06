@@ -107,9 +107,11 @@ def test_motion_test_startup_is_explicit_read_only_and_initializes_spray():
         declared.append((name, default, descriptor.read_only))
         return SimpleNamespace(value=True if name == "spray_motion_test" else default)
     node.declare_parameter = declare
+    # This adapter models a fresh Node; process_mode is not declared yet.
+    node.has_parameter = lambda name: False
     node.create_publisher = lambda *args: node.spray_command_pub
     node.create_subscription = lambda *args: None
-    node.create_timer = lambda *args: None
+    node.create_timer = lambda *args, **kwargs: None
     node._init_spray()
     assert declared == [('spray_motion_test', False, True), ('process_mode', 'paint', True)]
     assert node.process_mode == 'spray'
@@ -117,3 +119,22 @@ def test_motion_test_startup_is_explicit_read_only_and_initializes_spray():
     node.painting_force_enabled = True
     with pytest.raises(ValueError, match='painting_force_enabled=false'):
         node._init_spray()
+
+
+def test_startup_reuses_executor_declared_process_parameter_without_redeclaration():
+    node = motion_test()
+    declared = []
+    node.has_parameter = lambda name: name == "process_mode"
+    node.get_parameter = lambda name: SimpleNamespace(value="spray")
+    def declare(name, default, descriptor):
+        declared.append(name)
+        return SimpleNamespace(value=default)
+    node.declare_parameter = declare
+    node.create_publisher = lambda *args: node.spray_command_pub
+    node.create_subscription = lambda *args: None
+    node.create_timer = lambda *args, **kwargs: None
+    node._init_spray()
+    assert declared == ["spray_motion_test"]
+    assert node.process_mode == "spray"
+    assert node.initial_process_mode == "spray"
+    assert node.spray_motion_test is False

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>스케치 작업</title>
   <link rel="stylesheet" href="style.css" />
-  <link rel="stylesheet" href="sketch.css?v=fit-view-1" />
+  <link rel="stylesheet" href="sketch.css?v=unified-1" />
   <script src="js/roslib.min.js"></script>
 </head>
 <body class="sketch-page">
@@ -21,9 +21,9 @@
   <main class="workspace">
     <section class="drawing-panel" aria-label="작업 스케치">
       <div class="workflow-tabs" role="group" aria-label="작업 단계">
-        <label><input type="radio" name="workflow-mode" value="target" checked /><span><b>1</b> 대상 선택</span></label>
-        <label><input type="radio" name="workflow-mode" value="work_area" /><span><b>2</b> 작업영역</span></label>
-        <label><input type="radio" name="workflow-mode" value="path" /><span><b>3</b> 경로·실행</span></label>
+        <label><input type="radio" name="workflow-mode" value="target" checked /><span><b>1</b> 대상 인식</span></label>
+        <label><input type="radio" name="workflow-mode" value="work_area" /><span><b>2</b> 작업 지정</span></label>
+        <label><input type="radio" name="workflow-mode" value="path" /><span><b>3</b> 계획·실행</span></label>
       </div>
       <div class="canvas-heading"><h2 id="view-card-title">ZED 카메라</h2><span id="sketch-strokes-count">0개 스케치</span></div>
       <div id="zed-wrap" class="zed-wrap">
@@ -31,7 +31,7 @@
         <canvas id="sketch-canvas" width="1280" height="720" aria-label="카메라 영상 위에 작업 대상을 그리세요"></canvas>
         <div id="camera-empty" class="camera-empty"><span class="camera-icon" aria-hidden="true">▣</span><strong>카메라 연결 대기</strong><span>영상이 연결되면 이곳에서 스케치할 수 있습니다.</span></div>
       </div>
-      <div class="drawing-toolbar">
+      <div id="drawing-toolbar" class="drawing-toolbar">
         <div class="drawing-tools" role="group" aria-label="그리기 도구">
           <label><input type="radio" name="sketch-mode" value="freehand" checked /><span>자유선</span></label>
           <label><input type="radio" name="sketch-mode" value="line" /><span>직선</span></label>
@@ -40,6 +40,8 @@
         <div class="edit-tools"><button id="btn-undo">되돌리기</button><button id="btn-clear">모두 지우기</button></div>
       </div>
       <p id="workflow-hint" class="workflow-hint">작업할 대상을 둘러 그린 뒤 평면을 추출하세요.</p>
+      <p id="workflow-stage-reason" class="field-help" role="status"></p>
+      <button id="btn-workflow-next" class="primary">다음: 작업 지정</button>
     </section>
 
     <aside class="task-panel" aria-label="작업 설정과 실행">
@@ -52,6 +54,14 @@
 
       <section id="target-actions" class="task-section">
         <h2>대상 평면</h2>
+        <details id="weld-reference-settings" hidden>
+          <summary>용접 기준면 법선 · 고급</summary>
+          <p class="field-help">주변 평면을 자동 측정할 수 없을 때만 지정하세요. 선택 영상의 카메라 optical 좌표계에서 길이 1인 법선입니다. 측정값이나 자세 자동 보정으로 취급하지 않습니다.</p>
+          <label><input id="weld-reference-override" type="checkbox">법선 직접 지정</label>
+          <label class="field-label">X <input id="weld-reference-x" type="number" step="any" placeholder="0" disabled></label>
+          <label class="field-label">Y <input id="weld-reference-y" type="number" step="any" placeholder="-1" disabled></label>
+          <label class="field-label">Z <input id="weld-reference-z" type="number" step="any" placeholder="0" disabled></label>
+        </details>
         <button id="btn-set-target" class="primary wide" disabled>평면 추출</button>
         <div id="plane-candidates" aria-label="측정할 평면 선택"></div>
         <p id="planes-status" class="field-help" aria-live="polite">대상을 그리면 평면을 추출할 수 있습니다.</p>
@@ -64,8 +74,16 @@
         <button id="btn-set-work-area" class="primary wide" disabled>작업영역 확정</button>
       </section>
 
+      <section id="weld-seam-actions" class="task-section" hidden>
+        <h2>작업할 용접심</h2><p>영상에 표시된 용접선을 확인하고 실행할 심과 순서·방향을 지정하세요.</p>
+        <div id="weld-seam-list" aria-label="용접심 선택"></div>
+      </section>
+
       <section id="path-actions" class="task-section" hidden>
         <h2 id="path-actions-title">작업 경로</h2>
+        <label id="path-method-field" class="field-label">경로 방식<select id="path-method"><option value="auto">자동 채우기</option><option value="manual">직접 그리기</option></select></label>
+        <p id="weld-selection-summary" class="field-help" hidden></p>
+        <button id="btn-plan-workflow" class="primary wide" disabled>계획 생성·검증</button>
         <button id="btn-fill-work-area" class="primary wide" disabled>영역 자동 채우기</button>
         <button id="btn-execute" class="wide secondary-action" disabled>그린 경로 사용</button>
       </section>
@@ -77,12 +95,16 @@
         <button id="settings-apply" class="wide" disabled>설정 적용</button>
       </details>
 
-      <section class="task-section execution-section">
+      <section id="execution-section" class="task-section execution-section">
         <h2>실행</h2>
         <div class="execution-checks">
+          <div><span>경로 생성</span><span id="workflow-generation-state" class="state-pill unknown">대기</span></div>
+          <div><span>실행 준비</span><span id="workflow-ready-state" class="state-pill unknown">대기</span></div>
           <div><span id="painting-surface-label">D405 평면 측정</span><span id="painting-d405-state" class="state-pill unknown">대기</span></div>
           <div><span id="painting-plan-label">경로 검증</span><span id="painting-plan-validation" class="state-pill unknown">대기</span></div>
         </div>
+        <p id="workflow-validation-scope" class="field-help"></p>
+        <p id="workflow-ready-detail" class="field-help"></p>
         <div class="free-space-panel" id="tare-confirmation" hidden>
           <label for="free-space-confirmed"><input id="free-space-confirmed" type="checkbox" /><span>접촉 전 F/T 영점 조정 승인<small>계획 간격 10 mm · 실측 최소 7 mm</small></span></label>
           <span id="free-space-state" class="state-pill bad">미승인</span>
@@ -105,9 +127,10 @@
   <script src="js/target_refine_gate.js"></script>
   <script src="js/zed_surface_gate.js?v=manual-spray-1"></script>
   <script src="js/image_topic.js?v=jpeg-preview-1"></script>
-  <script src="js/app.js?v=manual-spray-1"></script>
-  <script src="js/plane_workflow.js"></script>
-  <script src="js/process_settings.js"></script>
-  <script src="js/weld_workflow.js?v=draw-transport-2"></script>
+  <script src="js/workflow.js?v=unified-1"></script>
+  <script src="js/app.js?v=seam-overlay-2"></script>
+  <script src="js/plane_workflow.js?v=unified-1"></script>
+  <script src="js/process_settings.js?v=unified-1"></script>
+  <script src="js/weld_workflow.js?v=seam-overlay-2"></script>
 </body>
 </html>

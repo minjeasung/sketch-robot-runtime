@@ -5,9 +5,11 @@ and D405 isolated prevents a slow global cloud conversion from delaying the
 wrist camera, while this module still supports camera_name=all for offline
 smoke tests and backwards-compatible manual use.
 """
+from dataclasses import asdict
 import math
 import json
 import time
+import uuid
 
 import numpy as np
 import rclpy
@@ -19,6 +21,8 @@ import zmq
 
 from .outpost_camera import camera_status, decode_frame, FrameGuard
 from .image_preview import ImagePreview
+from .camera_registration import load_registration
+from .mixed_frame_sync import MixedFrameSync
 
 
 CAMERA_SPECS = {
@@ -101,6 +105,19 @@ class OutpostBridge(Node):
             str(self.declare_parameter('stamp_mode', 'capture').value),
             use_sim_time=bool(self.get_parameter('use_sim_time').value),
         )
+        self.execution_mode = self.declare_parameter('execution_mode', 'legacy').value
+        self.registration_file = self.declare_parameter('camera_registration_file', '').value
+        self._source_session = uuid.uuid4().hex
+        self._clock_epoch = 0
+        self._last_clock = 0
+        self._static_tf = None
+        if self.execution_mode == 'mixed':
+            if self.stamp_policy.mode != 'ros_clock':
+                raise ValueError('mixed requires stamp_mode=ros_clock and use_sim_time=true')
+            if not self.registration_file:
+                raise ValueError('mixed requires measured camera_registration_file')
+            from tf2_ros import StaticTransformBroadcaster
+            self._static_tf = StaticTransformBroadcaster(self)
         self.origin = self.declare_parameter(
             "outpost_http", "http://127.0.0.1:8100"
         ).value
@@ -144,12 +161,26 @@ class OutpostBridge(Node):
                 hw = self.declare_parameter(f"outpost_{name}_hw_id", "").value
                 serial = self.declare_parameter(f"outpost_{name}_serial", "").value
                 status = camera_status(self.origin, hw, serial, kind)
+                registration = load_registration(self.registration_file, name) if self.execution_mode == 'mixed' else None
+                if registration and registration.serial != serial:
+                    raise ValueError(name + ': calibrated camera serial mismatch')
+                if registration:
+                    from geometry_msgs.msg import TransformStamped
+                    transform = TransformStamped()
+                    transform.header.frame_id = registration.target_frame
+                    transform.child_frame_id = registration.optical_frame
+                    transform.transform.translation.x, transform.transform.translation.y, transform.transform.translation.z = registration.translation_m
+                    transform.transform.rotation.x, transform.transform.rotation.y, transform.transform.rotation.z, transform.transform.rotation.w = registration.quaternion_xyzw
+                    self._static_tf.sendTransform(transform)
                 self.cameras.append(
                     dict(
                         name=name,
+                        registration=registration,
+                        sync=MixedFrameSync(registration, max_frame_age) if registration else None,
+                        identity_pub=self._zed_identity_pub if name == 'zed' else self.create_publisher(String, '/perception/d405_frame_identity', 10),
                         kind=kind,
-                        image_frame=spec["image_frame"],
-                        cloud_frame=spec["cloud_frame"],
+                        image_frame=registration.optical_frame if registration else spec["image_frame"],
+                        cloud_frame=registration.optical_frame if registration else spec["cloud_frame"],
                         status=status,
                         hw=hw,
                         serial=serial,
@@ -207,6 +238,8 @@ class OutpostBridge(Node):
             status["generation"] != previous["generation"]
             or status["local_raw_endpoint"] != previous["local_raw_endpoint"]
         )
+        if reconnect and camera.get('sync'):
+            raise ValueError(camera['name'] + ': physical source session changed; restart perception and invalidate plans')
         camera["status"] = status
         if reconnect:
             camera["sock"].close(linger=0)
@@ -244,10 +277,27 @@ class OutpostBridge(Node):
         return info
 
     def publish_frame(self, camera, data):
-        stamp, _, rgb, depth, cloud = data
-        stamp = self.stamp_policy.stamp(stamp, self.get_clock().now().nanoseconds)
-        if stamp is None:
-            return
+        capture_stamp, sequence, rgb, depth, cloud = data
+        ros_now = self.get_clock().now().nanoseconds
+        binding = None
+        if camera.get('sync'):
+            if ros_now < self._last_clock:
+                self._clock_epoch += 1
+            self._last_clock = ros_now
+            registration = camera['registration']
+            try:
+                binding = camera['sync'].bind(dict(camera_id=camera['name'], serial=camera['serial'],
+                    source_session=self._source_session + ':' + str(camera['status']['generation']), source_frame_id=sequence,
+                    capture_stamp=capture_stamp, receipt_monotonic=camera['last'],
+                    registration_revision=registration.revision), ros_now, time.monotonic(), self._clock_epoch)
+            except ValueError as exc:
+                camera['identity_pub'].publish(String(data=json.dumps(dict(valid=False,error=str(exc),clock_epoch=self._clock_epoch))))
+                return
+            stamp = binding.sim_stamp
+        else:
+            stamp = self.stamp_policy.stamp(capture_stamp, ros_now)
+            if stamp is None:
+                return
         header = Header(frame_id=camera["image_frame"])
         header.stamp.sec, header.stamp.nanosec = divmod(stamp, 1_000_000_000)
         h, w = depth.shape
@@ -289,12 +339,15 @@ class OutpostBridge(Node):
                 pubs[3].publish(info)
 
         camera["preview"].publish(rgb, header)
-        if camera["name"] == "zed":
-            self._zed_identity_pub.publish(String(data=json.dumps(dict(
-                generation=str(camera["status"]["generation"]), frame_id=header.frame_id,
+        if camera["name"] == "zed" or binding:
+            identity = dict(generation=str(camera["status"]["generation"]), frame_id=header.frame_id,
                 stamp=dict(sec=header.stamp.sec, nanosec=header.stamp.nanosec),
                 clock_domain="ros" if self.stamp_policy.mode == "ros_clock" else "wall",
-                width=w, height=h))))
+                width=w, height=h)
+            if binding:
+                identity.update(generation=binding.source_session, valid=True, source='physical', camera_id=camera['name'], serial=camera['serial'], frame_binding=asdict(binding))
+            publisher=self._zed_identity_pub if camera['name']=='zed' else camera['identity_pub']
+            publisher.publish(String(data=json.dumps(identity)))
 
         # The global ZED cloud can be sparse without losing sketch pixel
         # precision because sketch ROI reconstruction uses full depth+CameraInfo.
@@ -302,7 +355,7 @@ class OutpostBridge(Node):
         if not pubs[4].get_subscription_count():
             return
         sampled_cloud, sampled_rgb = sample_pointcloud_grid(
-            cloud, rgb, camera["point_stride"], camera["name"]
+            cloud, rgb, camera["point_stride"], None if binding else camera["name"]
         )
         ph, pw = sampled_cloud.shape[:2]
         packed = np.empty(

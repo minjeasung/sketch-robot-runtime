@@ -9,6 +9,7 @@ import time
 
 from geometry_msgs.msg import WrenchStamped
 import rclpy
+from rclpy.clock import Clock, ClockType
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
@@ -49,6 +50,7 @@ class PaintingWrenchGuardNode(Node):
 
     def __init__(self) -> None:
         super().__init__("painting_wrench_guard")
+        self.declare_parameter('public_motion_abort_requires_restart', False)
 
         self.declare_parameter(
             "requested_wrench_topic",
@@ -198,6 +200,7 @@ class PaintingWrenchGuardNode(Node):
         self._safety_received_at = None
         self._safety_abort_latched = True
         self._abort_signal_latched = False
+        self._motion_abort_latched = False
         self._compliance_active = False
         self._compliance_active_received_at = None
         self._normal_limit_reached = False
@@ -242,6 +245,10 @@ class PaintingWrenchGuardNode(Node):
         self.create_subscription(WrenchStamped, self._ft_topic, self._on_ft_wrench, 10)
         self.create_subscription(String, self._safety_topic, self._on_safety_status, 10)
         self.create_subscription(Bool, self._abort_topic, self._on_abort, 10)
+        # Simulator hard stops are irreversible. Legacy hardware retains its
+        # existing monitor/executor abort and explicit safe-reset choreography.
+        if self.get_parameter('public_motion_abort_requires_restart').value:
+            self.create_subscription(Bool, '/motion_abort', self._on_motion_abort, 10)
         self.create_subscription(
             Bool, self._controller_fault_topic, self._on_controller_fault, 10
         )
@@ -262,7 +269,10 @@ class PaintingWrenchGuardNode(Node):
             "/painting_admittance/reset_wrench_guard",
             self._on_reset_guard,
         )
-        self.create_timer(1.0 / self._rate_hz, self._on_timer)
+        # Dispatch watchdogs and heartbeat publications even when /clock stops.
+        # Sensor stamps and force-ramp dynamics retain the node's ROS clock.
+        self._steady_clock = Clock(clock_type=ClockType.STEADY_TIME)
+        self.create_timer(1.0 / self._rate_hz, self._on_timer, clock=self._steady_clock)
 
         self.get_logger().warn(
             "Wrench guard ready: real_painting_enabled=%s request=%s output=%s; "
@@ -379,6 +389,14 @@ class PaintingWrenchGuardNode(Node):
         # without preventing the geometry-only approach to the runtime tare.
         self._abort_signal_latched = bool(msg.data)
 
+    def _on_motion_abort(self, msg: Bool) -> None:
+        if msg.data:
+            # Public hard stop reaches the output owner directly, without
+            # waiting for executor mode changes or monitor/timer relays.
+            # Keep this separate from the resettable monitor abort signal.
+            self._motion_abort_latched = True
+            self._on_timer()
+
     def _on_controller_fault(self, msg: Bool) -> None:
         self._external_fault_signal = bool(msg.data)
         if msg.data:
@@ -410,6 +428,8 @@ class PaintingWrenchGuardNode(Node):
         del request
         now = time.monotonic()
         blockers = []
+        if self._motion_abort_latched:
+            blockers.append('MOTION_ABORT_RESTART_REQUIRED')
         if self._mode != "IDLE":
             blockers.append("MODE_NOT_IDLE")
         if self._force_enable:
@@ -480,7 +500,8 @@ class PaintingWrenchGuardNode(Node):
 
     def _on_timer(self) -> None:
         now = time.monotonic()
-        self._check_tf(now)
+        if not self._motion_abort_latched:
+            self._check_tf(now)
         normal_limit_force_context = self._normal_limit_force_context()
         normal_limit_qualified = self._normal_limit_qualifier.update(
             self._normal_limit_reached, normal_limit_force_context, now
@@ -523,6 +544,7 @@ class PaintingWrenchGuardNode(Node):
             safety_status_received_at=self._safety_received_at,
             abort_latched=(
                 self._safety_abort_latched or self._abort_signal_latched
+                or self._motion_abort_latched
             ),
             controller_fault=controller_fault,
             controller_status_received_at=controller_received_at,

@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>isaac_painting_hardware</name><version>0.1.0</version>
+  <description>Measured Isaac joint and six-axis F/T ros2_control interface.</description>
+  <maintainer email="34088547+minjeasung@users.noreply.github.com">Minjea Sung</maintainer><license>MIT</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>hardware_interface</depend><depend>pluginlib</depend><depend>rclcpp</depend>
+  <depend>std_msgs</depend><depend>std_srvs</depend><depend>isaac_painting_msgs</depend>
+  <test_depend>ament_cmake_gtest</test_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

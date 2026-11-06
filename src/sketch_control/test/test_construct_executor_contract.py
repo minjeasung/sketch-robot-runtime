@@ -1,5 +1,6 @@
 """Construct uses original executor with its own joints, frames and collision model."""
 from pathlib import Path
+import importlib.util
 from types import SimpleNamespace as NS
 import xml.etree.ElementTree as ET
 
@@ -14,6 +15,50 @@ from sketch_control import robot_models
 from sketch_control.moveit_executor import MoveItExecutor
 
 SRC = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.parametrize('side', ['left', 'right'])
+def test_construct_launch_collision_baseline_matches_generated_moveit_model(monkeypatch, tmp_path, side):
+    from launch import LaunchContext
+
+    workspace = SRC.parent
+    spec = importlib.util.spec_from_file_location(
+        'construct_executor_launch', workspace / 'scripts/construct_executor.launch.py')
+    launch = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(launch)
+    monkeypatch.setattr(launch, 'Node', lambda **kwargs: NS(**kwargs))
+    # The legacy launcher remains compatible with explicitly generated original assets.
+    # Never depend on a user's ignored, previously generated isaac_assets directory.
+    import sys
+    monkeypatch.syspath_prepend(str(workspace / 'scripts'))
+    from prepare_construct_assets import prepare
+    prepare(workspace, tmp_path / 'isaac_assets', source_model='original')
+    monkeypatch.setattr(launch, '__file__', str(tmp_path / 'scripts/construct_executor.launch.py'))
+    workspace = tmp_path
+    context = LaunchContext()
+    context.launch_configurations.update(
+        model_id=f'construct_{side}', process_mode='spray', weld_input_provider='fixture')
+    params = launch.nodes(context)[0].parameters[0]
+    path = params.get('collision_srdf_path')
+    assert path == str(workspace / 'isaac_assets/construct.srdf')
+    pairs = MoveItExecutor._load_srdf_allowed_collision_pairs(params['model_id'], path)
+    semantic = ET.parse(path).getroot()
+    assert set(pairs) == {(e.attrib['link1'], e.attrib['link2'])
+                          for e in semantic.iter('disable_collisions')}
+    links = {e.attrib['name'] for e in ET.parse(
+        workspace / 'isaac_assets/construct_control.urdf').getroot().findall('link')}
+    assert pairs
+    assert all(a in links and b in links for a, b in pairs)
+    assert not any('left_D435_link' in pair for pair in pairs)
+    assert any('right_D435_link' in pair for pair in pairs)
+
+
+@pytest.mark.parametrize('content', [None, '<robot>', '<robot/>'])
+def test_explicit_collision_baseline_never_falls_back_to_old_tool(tmp_path, content):
+    path = tmp_path / 'configured.srdf'
+    if content is not None:
+        path.write_text(content)
+    assert MoveItExecutor._load_srdf_allowed_collision_pairs('construct_left', path) == ()
 
 
 @pytest.mark.parametrize('side', ['left', 'right'])

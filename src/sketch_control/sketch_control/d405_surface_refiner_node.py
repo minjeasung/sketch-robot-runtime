@@ -11,10 +11,14 @@ import json
 import copy
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
+from .camera_registration import load_registration
+from .mixed_frame_sync import FrameBinding, PhysicalCameraReadiness
+from .task_scene import TaskSurface, make_surface, make_refined_surface
 
 import numpy as np
 import rclpy
+from .refined_plane_record import make_refined_plane_record
 from geometry_msgs.msg import PoseArray, PoseStamped
 from rclpy.duration import Duration
 from rclpy.node import Node
@@ -326,6 +330,9 @@ class D405SurfaceRefinerNode(Node):
         self.create_subscription(
             String, PAINTING_MODE_TOPIC, self._on_painting_mode, 10
         )
+        self.create_subscription(
+            Bool, '/perception/invalidate_all', self._on_invalidate_all, LATCHED_QOS
+        )
 
         self.target_record_pub = self.create_publisher(String, "/perception/refined_target_record", 10)
         self.target_refined_pub = self.create_publisher(
@@ -338,6 +345,23 @@ class D405SurfaceRefinerNode(Node):
         self.target_status_pub = self.create_publisher(
             String, TARGET_REFINE_STATUS_TOPIC, LATCHED_QOS
         )
+        self.scene_registration = None
+        self._pending_scene_refinement = None
+        scene_registration_file = self.declare_parameter('scene_registration_file', '').value
+        if scene_registration_file:
+            self.scene_registration = load_registration(scene_registration_file, 'd405')
+            self._scene_camera = PhysicalCameraReadiness({'d405': self.scene_registration})
+            self._scene_bindings = {}
+            self._scene_status = {}
+            self._scene_surface = None
+            self._scene_task_active = False
+            self.scene_request_pub = self.create_publisher(String, '/task_scene/request', 10)
+            self.create_subscription(String, '/perception/d405_frame_identity', self._on_scene_identity, 10)
+            self.create_subscription(String, '/task_scene/status', self._on_scene_status, LATCHED_QOS)
+            self.create_subscription(String, '/task_scene/apply', self._on_scene_surface, LATCHED_QOS)
+            self.create_subscription(String, '/task_scene/activity', self._on_scene_activity, LATCHED_QOS)
+            from rclpy.clock import Clock, ClockType
+            self.create_timer(.05, self._poll_scene_refinement, clock=Clock(clock_type=ClockType.STEADY_TIME))
         self.create_timer(0.05, self._check_capture_timeout)
         self.create_timer(calibration_period, self._check_calibration_hash)
 
@@ -604,6 +628,30 @@ class D405SurfaceRefinerNode(Node):
                     rejection_reason=lifecycle.rejection_reason,
                 )
 
+    def _on_invalidate_all(self, msg):
+        """Retire all accepted planes and in-flight captures without recapture.
+
+        This event is used after a global runtime interruption. Repeated stop
+        leases are idempotent; the interrupted stack must be restarted before
+        capturing another plane, so an old pending cloud can never reaccept it.
+        """
+        if not msg.data or getattr(self, '_global_invalidation_latched', False):
+            return
+        self._global_invalidation_latched = True
+        self._paint_active = False
+        self._active_capture_mode = None
+        self._active_capture_reference = None
+        self._cancel_pending_cloud()
+        self.latest_target_surface = None
+        self.latest_work_area_plane = None
+        self.latest_corners = None
+        self._external_work_area_id = ''
+        for mode, lifecycle in self._lifecycles.items():
+            lifecycle.set_paint_active(False)
+            self._invalidate_lifecycle(mode, 'runtime_interrupted',
+                work_area_id='', token=f'interruption:{lifecycle.invalidation_seq + 1}')
+        self._publish_target_status('invalidated')
+
     def _invalidate_lifecycle(
         self,
         mode,
@@ -686,6 +734,11 @@ class D405SurfaceRefinerNode(Node):
         self._start_capture("target")
 
     def _start_capture(self, mode, *, reference_plane=None, roi_polygon=None):
+        if getattr(self, '_pending_scene_refinement', None) is not None:
+            self._publish_status(False, 'waiting_for_task_scene', mode=mode, rejection_reason='')
+            return False
+        if getattr(self, '_global_invalidation_latched', False):
+            return False
         if getattr(self, "process_mode", "paint") == "spray":
             return False
         if self._active_capture_mode is not None:
@@ -1003,12 +1056,22 @@ class D405SurfaceRefinerNode(Node):
             )
             return
 
+        if getattr(self, 'scene_registration', None) is not None:
+            try:
+                self._stage_scene_refinement(mode, msg, target_frame, result, metadata)
+            except (ValueError, KeyError, TypeError) as exc:
+                self._reject_capture(mode, 'task_scene_refinement_rejected: '+str(exc), metadata=metadata)
+            return
+        self._accept_refinement(mode, msg, target_frame, result, metadata)
+
+    def _accept_refinement(self, mode, msg, target_frame, result, metadata):
+        lifecycle = self._lifecycles[mode]
         center = np.asarray(result.center, dtype=float)
         normal = np.asarray(result.normal, dtype=float)
         lifecycle.accept()
-        # Publish the accepted generation contract first.  Consumers can then
-        # arm themselves for the *next* bare PoseStamped and reject any stale
-        # transient-local refined pose retained from an earlier generation.
+        # DDS does not order delivery across status and Pose topics. Include
+        # work-area geometry in the accepted identity transaction; the bare
+        # Pose topic remains available to the original wall projector.
         self._publish_status(
             True,
             "accepted",
@@ -1016,6 +1079,9 @@ class D405SurfaceRefinerNode(Node):
             rejection_reason="",
             metrics=result.metrics(),
             target_frame=target_frame,
+            **({'refined_plane': make_refined_plane_record(
+                target_frame, center, _normal_to_quaternion(normal), msg.header.stamp
+            )} if mode == "work_area" else {}),
             **metadata,
         )
         if mode == "work_area":
@@ -1027,6 +1093,93 @@ class D405SurfaceRefinerNode(Node):
             msg.header.stamp,
             mode,
         )
+
+    def _on_scene_identity(self, msg):
+        try:
+            payload=json.loads(msg.data)
+            changed=self._scene_camera.observe('d405',payload,time.monotonic())
+            if changed: self._scene_bindings.clear()
+            binding=FrameBinding.from_dict(payload['frame_binding'])
+            self._scene_bindings[binding.sim_stamp]=binding
+            while len(self._scene_bindings)>30: self._scene_bindings.pop(next(iter(self._scene_bindings)))
+        except (ValueError, KeyError, TypeError):
+            self._scene_bindings.clear(); self._scene_camera.frames.clear()
+
+    def _on_scene_status(self, msg):
+        try: self._scene_status=json.loads(msg.data)
+        except (ValueError, TypeError): self._scene_status={}
+        self._poll_scene_refinement()
+
+    def _on_scene_surface(self, msg):
+        try: self._scene_surface=TaskSurface.from_dict(json.loads(msg.data))
+        except (ValueError, KeyError, TypeError): self._scene_surface=None
+
+    def _on_scene_activity(self, msg):
+        try: self._scene_task_active=json.loads(msg.data).get('active') is True
+        except (ValueError, TypeError): self._scene_task_active=True
+        self._poll_scene_refinement()
+
+    def _stage_scene_refinement(self, mode, msg, target_frame, result, metadata):
+        registration=self.scene_registration; now=time.monotonic()
+        if self._scene_task_active: raise ValueError('cannot refine scene during active task')
+        if not self._scene_camera.ready(now): raise ValueError('physical D405 input unavailable')
+        if self._scene_status.get('ready') is not True or not self._scene_status.get('revision'):
+            raise ValueError('parent measured scene is not ready')
+        stamp=msg.header.stamp.sec*1_000_000_000+msg.header.stamp.nanosec
+        binding=self._scene_bindings.get(stamp)
+        if binding is None or msg.header.frame_id != registration.optical_frame:
+            raise ValueError('exact physical D405 exposure identity unavailable')
+        binding.require_current(now,registration.revision)
+        current=self._scene_camera.frames['d405']
+        if (binding.source_session,binding.clock_epoch)!=(current.source_session,current.clock_epoch):
+            raise ValueError('D405 capture context changed')
+        transform=None
+        center=np.asarray(result.center); normal=np.asarray(result.normal)
+        if target_frame!=registration.target_frame:
+            transform,age=self._lookup_transform(registration.target_frame,target_frame,msg.header.stamp)
+            if transform is None or age is None or age>self.fit_config.max_tf_age_s:
+                raise ValueError('measured refinement-to-scene transform unavailable')
+            center=self._transform_points(np.asarray([center]),transform)[0]
+            q=transform.transform.rotation
+            normal=quat_apply([q.x,q.y,q.z,q.w],normal)
+        surface_id=self._scene_status['surface_id']
+        if mode=='work_area':
+            corners=self.latest_corners
+            if corners is None or corners.header.frame_id!=target_frame or len(corners.poses)!=4:
+                raise ValueError('measured work-area support unavailable')
+            surface=make_refined_surface(surface_id,self._transform_points(self._corner_points(corners),transform),center,normal,registration.target_frame,binding,registration)
+        else:
+            original=self._scene_surface
+            if original is None or original.revision!=self._scene_status['revision'] or original.frame_id!=registration.target_frame:
+                raise ValueError('parent measured target support unavailable')
+            vertices=np.asarray(original.vertices_m)
+            projected=vertices-((vertices-center)@normal)[:,None]*normal
+            faces=np.asarray(original.faces)
+            if np.dot(original.normal,normal)<0: faces=faces[:,::-1]
+            surface=make_surface(dict(surface_id=surface_id,vertices_m=((projected-registration.translation_m)@registration.rotation).tolist(),faces=faces.tolist(),normal=(registration.rotation.T@normal).tolist(),frame_binding=binding),registration)
+        measurement=dict(surface_id=surface.surface_id,vertices_m=((np.asarray(surface.vertices_m)-registration.translation_m)@registration.rotation).tolist(),faces=surface.faces,normal=(registration.rotation.T@surface.normal).tolist(),frame_binding=asdict(binding))
+        # Hash the exact serialized optical coordinates that the scene node applies.
+        surface=make_surface(measurement,registration)
+        self._pending_scene_refinement=dict(revision=surface.revision,binding=binding,generation=self._lifecycles[mode].plane_generation_id,mode=mode,deadline=now+5.,args=(mode,msg,target_frame,result,dict(metadata)))
+        self._publish_status(False,'waiting_for_task_scene',mode=mode,rejection_reason='',**metadata)
+        self.scene_request_pub.publish(String(data=json.dumps(dict(camera_name='d405',parent_revision=self._scene_status['revision'],measurement=measurement))))
+
+    def _poll_scene_refinement(self):
+        pending=getattr(self,'_pending_scene_refinement',None)
+        if pending is None: return
+        mode=pending['mode']; current=self._scene_camera.frames.get('d405'); binding=pending['binding']; now=time.monotonic()
+        if (self._scene_task_active or now>pending['deadline'] or not self._scene_camera.ready(now)
+                or self._lifecycles[mode].plane_generation_id!=pending['generation']
+                or current is None or (binding.source_session,binding.clock_epoch)!=(current.source_session,current.clock_epoch)):
+            self._pending_scene_refinement=None
+            self._reject_capture(mode,'task_scene_refinement_invalidated')
+            return
+        status=self._scene_status; acks=status.get('acks',{})
+        if status.get('revision')==pending['revision'] and status.get('ready') is True and acks.get('moveit') is True and acks.get('isaac') is True:
+            self._pending_scene_refinement=None
+            args=list(pending['args'])
+            args[-1]={**args[-1], 'task_scene_revision':pending['revision']}
+            self._accept_refinement(*args)
 
     def _cancel_pending_cloud(self, mode=None):
         pending = getattr(self, "_pending_cloud_capture", None)
@@ -1256,6 +1409,27 @@ class D405SurfaceRefinerNode(Node):
             }
         )
         payload.update(fields)
+        if mode == "work_area":
+            if not lifecycle.accepted:
+                self._accepted_work_area_record = None
+            else:
+                identity = (lifecycle.work_area_id, lifecycle.plane_generation_id)
+                cached = getattr(self, "_accepted_work_area_record", None)
+                if "refined_plane" in fields and (cached is None or cached["identity"] != identity):
+                    measurement_keys = set(self._empty_metrics()) | {"refined_plane", "target_frame", "task_scene_revision"}
+                    self._accepted_work_area_record = {
+                        "identity": identity,
+                        "measurement": copy.deepcopy({key: value for key, value in payload.items()
+                                                      if key in measurement_keys}),
+                    }
+                cached = getattr(self, "_accepted_work_area_record", None)
+                if cached is not None and cached["identity"] == identity:
+                    # Paint locking and ignored captures replay the same
+                    # measurement, never a new stamp or metadata-only plane.
+                    payload.update(copy.deepcopy(cached["measurement"]))
+                else:
+                    payload.update(accepted=False, ok=False,
+                                   rejection_reason="accepted_geometry_missing")
         payload = self._json_safe(payload)
         message = String()
         message.data = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -1277,7 +1451,7 @@ class D405SurfaceRefinerNode(Node):
         else:
             self.status_pub.publish(message)
 
-        if state == "accepted":
+        if state == "accepted" and payload["accepted"]:
             self.get_logger().info(
                 "[D405 REFINE] accepted "
                 f"generation={lifecycle.plane_generation_id}, "

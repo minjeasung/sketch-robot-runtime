@@ -15,14 +15,16 @@ class RosMonitor:
         rclpy.init(context=self.context)
         self.node = rclpy.create_node("sketch_system_api", context=self.context)
         self.lock = threading.Lock()
-        self.nodes, self.readiness, self.execution = [], None, None
-        self.updated, self.readiness_at, self.execution_at = 0.0, 0.0, 0.0
+        self.nodes, self.readiness, self.execution, self.welding = [], None, None, None
+        self._motion_sources = {}
+        self.updated, self.readiness_at, self.execution_at, self.welding_at = 0.0, 0.0, 0.0, 0.0
         self.abort = self.node.create_publisher(Bool, "/motion_abort", 10)
         self.force = self.node.create_publisher(Bool, "/painting_admittance/enable_force", 10)
         self.subscriptions = [self.node.create_subscription(
             String, topic, lambda msg, key=key: self._receive(key, msg), 10)
             for key, topic in (("readiness", "/painting_system/readiness"),
-                               ("execution", "/painting_system/execution_status"))]
+                               ("execution", "/painting_system/execution_status"),
+                               ("welding", "/welding/status"))]
         self.node.create_timer(0.5, self._graph)
         self.executor = SingleThreadedExecutor(context=self.context)
         self.executor.add_node(self.node)
@@ -39,6 +41,12 @@ class RosMonitor:
         with self.lock:
             setattr(self, key, payload)
             setattr(self, key + "_at", time.monotonic())
+            # Missing/stale feedback cannot establish that motion has stopped.
+            # Each authoritative publisher must explicitly confirm its own idle.
+            activity = self._motion_sources.setdefault(key, {})
+            for field in ("running", "stopping"):
+                if type(payload.get(field)) is bool:
+                    activity[field] = payload[field]
 
     def _graph(self):
         names = self.node.get_node_names_and_namespaces()
@@ -52,7 +60,16 @@ class RosMonitor:
             return {"graph_fresh": now - self.updated < 2,
                     "nodes": list(self.nodes),
                     "readiness": self.readiness if now - self.readiness_at < 2 else None,
-                    "execution": self.execution if now - self.execution_at < 2 else None}
+                    "execution": self.execution if now - self.execution_at < 2 else None,
+                    "welding": self.welding if now - self.welding_at < 2 else None,
+                    "motion_busy": any(any(activity.values()) for activity in self._motion_sources.values())}
+
+    def clear_motion_observations(self):
+        """Only for a successfully stopped, supervisor-owned simulator stack."""
+        with self.lock:
+            self._motion_sources.clear()
+            self.readiness = self.execution = self.welding = None
+            self.readiness_at = self.execution_at = self.welding_at = 0.
 
     def request_abort(self):
         self.abort.publish(self.Bool(data=True))

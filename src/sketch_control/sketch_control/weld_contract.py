@@ -92,6 +92,8 @@ class ToolProfile:
     max_corner_deg: float = 45.
     sample_dt_s: float = .02
     sample_spacing_m: float = .001
+    collision_mode: str = "attached_demo"
+    native_collision_links: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -193,4 +195,16 @@ def load_tool_profile(path,model_id):
     if p.get('simulation_only') is not True or model_id not in p.get('models',[]): raise ValueError('profile not valid for model')
     xyz=vectors([p['tip_translation_m']],3)[0]; q=vectors([p['tip_quaternion_xyzw']],4)[0]; up=vectors([p['reference_up']],3)[0]
     if abs(math.sqrt(sum(x*x for x in q))-1)>.001 or abs(math.sqrt(sum(x*x for x in up))-1)>.001: raise ValueError('profile orientation not normalized')
-    return ToolProfile(ident(p['profile_id']),ident(p['revision']),model_id,xyz,q,up,number(p['radius_m'],.001,.05))
+    mode=p.get('collision_mode','attached_demo')
+    if mode not in ('attached_demo','native_urdf'):raise ValueError('Unknown tool collision mode')
+    native=()
+    if mode=='native_urdf':
+        import hashlib
+        import xml.etree.ElementTree as ET
+        data=Path(p['robot_description_file']).read_bytes()
+        if hashlib.sha256(data).hexdigest()!=p['robot_description_sha256']:raise ValueError('Native robot description changed')
+        robot=ET.fromstring(data);native=tuple(p.get('native_collision_links',[]))
+        if not native or any(robot.find(f"link[@name='{name}']/collision") is None for name in native):
+            raise ValueError('Native tool collision links missing')
+    return ToolProfile(ident(p['profile_id']),ident(p['revision']),model_id,xyz,q,up,number(p['radius_m'],.001,.05),
+                       collision_mode=mode,native_collision_links=native)

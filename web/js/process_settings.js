@@ -6,8 +6,9 @@
     setMode(value){if(mode!==value){mode=value;signature='';}render();},
     setRunning(value){running=Boolean(value);render();},
     values(){return {...state().draft};},
+    stateView(){const s=state();return {applied:api.isApplied(),dirty:s.dirty,pending:Boolean(s.pending),server_session_id:s.snapshot?.server_session_id,revision:s.snapshot?.revision};},
     isApplied(){const s=state();return Boolean(s.snapshot?.applied&&!s.dirty&&!s.pending);},
-    edit(key,value){const s=state();s.draft[key]=value;s.dirty=true;render();if(root.WeldWorkflow)root.WeldWorkflow.render();},
+    edit(key,value){if(running||state().pending)return;const s=state();s.draft[key]=value;s.dirty=true;render();if(root.WeldWorkflow)root.WeldWorkflow.render();},
     setSnapshot(snapshot){
       if(!snapshot||!snapshot.fields||!snapshot.server_session_id)return;
       const s=states[snapshot.mode] ||= {snapshot:null,draft:{},dirty:false,pending:null};
@@ -19,7 +20,7 @@
       }
       s.snapshot=snapshot;
       if(!s.dirty&&!s.pending)s.draft=Object.fromEntries(Object.entries(snapshot.fields).map(([k,v])=>[k,v.value]));
-      render();
+      render();if(root.WeldWorkflow)root.WeldWorkflow.render();
     },
     reject(){const s=state();s.pending=null;s.dirty=true;render();},
     disconnected(){for(const s of Object.values(states)){s.pending=null;s.dirty=true;}render();},

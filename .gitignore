@@ -59,3 +59,6 @@ dist/
 /aft200_force_threshold.json
 /CALIBRATION_MANIFEST.json
 /calibration/
+
+# Isolated implementation workspaces
+.worktrees/

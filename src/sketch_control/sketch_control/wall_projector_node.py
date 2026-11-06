@@ -932,12 +932,10 @@ class WallProjectorNode(Node):
     def _d405_phase_a(self, rgb, R, t, centroid, normal, stamp):
         """Rectify the live D405 view of the target plane → wall_front canvas.
 
-        1) ray-cast the 4 D405 image corners onto the target plane (the visible
-           region, a general quad), 2) take its axis-aligned bounding box in the
-           plane's right/up axes to define a TRUE rectangle on the plane
-           (front_view_extent), 3) project that rectangle back into the D405 image
-           and warp → frontal view. The rectangle makes the bilinear back-
-           projection in _lock_work_area_from_wall_front exact.
+        Ray-cast the image footprint and inscribe a rectangle on the existing
+        plane axes, preserving canvas and stroke orientation. The rectangle
+        stays inside every footprint edge, including under perspective, and
+        keeps the work-area bilinear mapping exact.
         """
         # work area lock 후에는 그릴 때의 extent 를 고정해서 사용한다 (refine 이 평면
         # 깊이를 바꿔도 표시 크기가 변하지 않음 -> 그린 작업영역과 일치).
@@ -963,29 +961,34 @@ class WallProjectorNode(Node):
             raw_quad.append(p)
         raw_quad = np.asarray(raw_quad, dtype=float)
 
-        right, up = _plane_axes(np.asarray(normal, dtype=float))
-        origin = np.asarray(centroid, dtype=float)
-        rel = raw_quad - origin
-        us, vs = rel @ right, rel @ up
-        # 가시영역(raw_quad)이 비스듬한 사각형이면 bounding box 는 코너에 검은 여백을
-        # 남긴다. 대신 내접 사각형(2nd/3rd order statistic)을 써서 실제로 꽉 보이는
-        # 영역만 wall_front 로 쓴다 -> 가장자리(특히 아래) 짤림 방지.
-        us_s, vs_s = np.sort(us), np.sort(vs)
-        umin, umax = float(us_s[1]), float(us_s[2])
-        vmin, vmax = float(vs_s[1]), float(vs_s[2])
-        # Orient the rectangle to match the D405 camera image so the rectified
-        # wall_front is right-side up (not mirrored/flipped). raw_quad is in image
-        # corner order TL,TR,BR,BL: its right edge is [1]-[0], its down edge [3]-[0].
-        cam_right = raw_quad[1] - raw_quad[0]
-        cam_down = raw_quad[3] - raw_quad[0]
-        u_lo, u_hi = (umin, umax) if float(np.dot(cam_right, right)) >= 0 else (umax, umin)
-        v_lo, v_hi = (vmin, vmax) if float(np.dot(cam_down, up)) >= 0 else (vmax, vmin)
-        extent = np.array([
-            origin + u_lo * right + v_lo * up,   # TL
-            origin + u_hi * right + v_lo * up,   # TR
-            origin + u_hi * right + v_hi * up,   # BR
-            origin + u_lo * right + v_hi * up,   # BL
-        ], dtype=float)
+        n = np.asarray(normal, dtype=float)
+        n = n / np.linalg.norm(n)
+        right, down = _plane_axes(n)
+        # Keep the original plane axes and their camera-facing signs. Changing
+        # camera roll must not redefine the direction of a drawn vertical line.
+        if np.dot(raw_quad[1] - raw_quad[0], right) < 0:
+            right = -right
+        if np.dot(raw_quad[3] - raw_quad[0], down) < 0:
+            down = -down
+        origin = raw_quad.mean(axis=0)
+        basis = np.column_stack((right, down))
+        uv = (raw_quad - origin) @ basis
+        half_size = np.max(np.abs(uv), axis=0)
+        edges = np.roll(uv, -1, axis=0) - uv
+        winding = np.sign(np.sum(uv[:, 0] * np.roll(uv[:, 1], -1)
+                                 - uv[:, 1] * np.roll(uv[:, 0], -1)))
+        inward = winding * np.column_stack((-edges[:, 1], edges[:, 0]))
+        clearance = -np.einsum('ij,ij->i', uv, inward)
+        reach = np.abs(inward) @ half_size
+        if not np.isfinite(reach).all() or np.min(reach) <= 0 or np.min(clearance) <= 0:
+            self._d405_warn("D405 image footprint has no finite interior")
+            return
+        # Every rectangle corner must satisfy every footprint half-plane.
+        # Uniformly shrink the bounding rectangle to its first footprint edge;
+        # coordinate order statistics can discard much more usable coverage.
+        half_size *= min(1., float(np.min(clearance / reach)))
+        extent = origin + (np.array([[-1, -1], [1, -1], [1, 1], [-1, 1]])
+                           * half_size) @ basis.T
 
         out_w, out_h, _pw, _ph = self._front_view_size(extent)
         self._warp_overlay_publish(rgb, extent, out_w, out_h, R, t, stamp)
@@ -1088,10 +1091,10 @@ class WallProjectorNode(Node):
                 cv2.line(front, first, second, (245, 158, 11), 2)
             previous_end = points[-1]
 
-    def _publish_front_view_extent(self, extent, stamp):
+    def _publish_front_view_extent(self, extent, stamp, *, frame_id=None):
         pa = PoseArray()
         pa.header.stamp = stamp
-        pa.header.frame_id = (
+        pa.header.frame_id = frame_id if frame_id is not None else (
             self.latest_surface[2] if self.latest_surface else "")
         for p in extent:
             pose = Pose()
@@ -1193,7 +1196,8 @@ class WallProjectorNode(Node):
             "base_mode": "wall_front_sketch",
             "mode": "locked:wall_front_sketch",
             "d405_refined_locked": False,
-            "src_pts": None,
+            "src_pts": (_project_points(corners_3d,self.K).astype(np.float32)
+                        if self.front_view_source=='zed' else None),
         }
         self._begin_work_area_selection("wall_front", msg.header.stamp)
         lock["work_area_id"] = self._work_area_id
@@ -1300,7 +1304,10 @@ class WallProjectorNode(Node):
             self.get_logger().warn(f"warpPerspective 실패: {e}")
             return
 
+        self.front_view_extent=np.asarray(corners_3d,dtype=float).copy()
+        self.front_view_size=(out_w,out_h)
         self._publish_front(front, msg.header.stamp)
+        self._publish_front_view_extent(corners_3d,msg.header.stamp,frame_id=_frame)
 
         pose = PoseStamped()
         pose.header.stamp = msg.header.stamp

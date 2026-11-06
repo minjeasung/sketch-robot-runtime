@@ -29,14 +29,17 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
+from rclpy.clock import Clock, ClockType
 from rclpy.action import ActionClient
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from tf2_ros import Buffer, TransformListener
 
 from action_msgs.msg import GoalStatus
 from controller_manager_msgs.srv import ListControllers
+from control_msgs.msg import JointTrajectoryControllerState
 from geometry_msgs.msg import Point, PoseArray, Pose, PoseStamped
 from rcl_interfaces.msg import ParameterDescriptor
+from sketch_control.refined_plane_record import refined_pose_from_status
 from sketch_control.robot_models import DEFAULT_MODEL, CONSTRUCT_MODEL_LABELS, validate_model, model_joint_limits, model_srdf, model_execution_contract
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Float64, String
@@ -135,9 +138,15 @@ D405_PREFLIGHT_CARTESIAN_FRACTION = CARTESIAN_COMPLETE_FRACTION
 D405_PREFLIGHT_ADAPTIVE_PROBE_SCALES = (0.75, 0.50)
 D405_PREFLIGHT_ADAPTIVE_MIN_MOVE_M = 0.015
 D405_PREFLIGHT_FINAL_JOINT_TOL_RAD = 0.02
+# The 80 mm planned camera inset leaves only 5 mm beyond the 75 mm
+# measured-capture inset. General Stage1's 0.02 rad planning tolerance can
+# move an RB20 optical ray by centimetres; retain the calibrated D405 goal.
+D405_PREFLIGHT_JOINT_GOAL_TOL_RAD = 1e-4
+D405_PREFLIGHT_ENDPOINT_NUMERICAL_SLACK_RAD = 1e-6
 D405_PREFLIGHT_START_STATE_TOL_RAD = 0.01
 D405_PREFLIGHT_ARRIVAL_VERIFY_TIMEOUT_S = 2.0
 D405_PREFLIGHT_JOINT_STATE_MAX_AGE_S = 0.20
+D405_PREFLIGHT_STATE_REFRESH_TIMEOUT_S = 1.0
 ACTIVE_SURFACE_DEDUPE_POINT_TOL_M = 1e-6
 ACTIVE_SURFACE_DEDUPE_NORMAL_TOL = 1e-6
 MOTION_ABORT_TOPIC = "/motion_abort"
@@ -156,6 +165,7 @@ D405_REFINEMENT_PROGRESS_STATES = frozenset(
         "capture_armed",
         "evaluating",
         "waiting_for_tf",
+        "waiting_for_task_scene",
         # These reject a duplicate/control request, not the currently accepted
         # plane or the capture already owned by the prescan state machine.
         "capture_rejected",
@@ -169,6 +179,7 @@ WORK_AREA_STATE_TOPIC = "/painting_system/work_area_state"
 PLAN_STATUS_TOPIC = "/painting_system/plan_status"
 READINESS_TOPIC = "/painting_system/readiness"
 EXECUTION_STATUS_TOPIC = "/painting_system/execution_status"
+EXECUTION_EVENT_TOPIC = "/painting_system/execution_events"
 EXECUTOR_HEARTBEAT_TOPIC = "/painting_admittance/executor_heartbeat"
 TRAJECTORY_ACTIVE_TOPIC = "/painting_admittance/trajectory_active"
 HARDWARE_MOTION_INHIBITED_TOPIC = "/painting_system/hardware_motion_inhibited"
@@ -240,6 +251,12 @@ LATCHED_QOS = QoSProfile(
     history=HistoryPolicy.KEEP_LAST,
     depth=1,
     durability=DurabilityPolicy.TRANSIENT_LOCAL,
+)
+EXECUTION_EVENT_QOS = QoSProfile(
+    history=HistoryPolicy.KEEP_LAST,
+    depth=100,
+    durability=DurabilityPolicy.VOLATILE,
+    reliability=ReliabilityPolicy.RELIABLE,
 )
 
 # Runtime speed policy.
@@ -536,6 +553,7 @@ def _load_static_collision_mesh(resource):
 
 
 from sketch_control.spray_execution import SprayExecutionMixin
+from sketch_control.spray_approach import SprayApproachMixin
 from sketch_control.zed_spray_execution import ZedSprayExecutionMixin
 from rbpodo_painting_control.spray_path import resolve_spray_tool_axis, rotation_from_spray_path
 from rbpodo_painting_control.spray_eoat import (
@@ -548,7 +566,238 @@ from sketch_control.d405_view_geometry import measurement_samples, camera_view
 from sketch_control.weld_execution import WeldExecutionMixin
 
 
-class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMixin, Node):
+def _generated_joint_limits(filename, expected_names):
+    """Read the optional generated model's command bounds without legacy overrides."""
+    if not filename:
+        return None
+    root = ET.parse(Path(filename).expanduser()).getroot()
+    joints = root.findall('joint')
+    names = [joint.get('name') for joint in joints]
+    expected = tuple(expected_names)
+    movable = {joint.get('name') for joint in joints if joint.get('type') != 'fixed'}
+    if (len(names) != len(set(names)) or len(expected) != len(set(expected))
+            or not set(expected).issubset(movable)):
+        raise ValueError('generated description joint names do not match the arm')
+    bounds = {}
+    for joint in joints:
+        if joint.get('name') not in expected:
+            continue
+        try:
+            limit = joint.find('limit')
+            low, high = float(limit.get('lower')), float(limit.get('upper'))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError('invalid generated description joint limits') from exc
+        if not math.isfinite(low) or not math.isfinite(high) or low >= high:
+            raise ValueError('invalid generated description joint limits')
+        bounds[joint.get('name')] = (low, high)
+    return bounds
+
+
+def _generated_native_spray_tool(filename, model_id):
+    """Validate generated simulator geometry before suppressing attached spray mesh."""
+    if not filename:
+        return False
+    contract = model_execution_contract(model_id)
+    _generated_joint_limits(filename, contract['arm_joint_names'])
+    root = ET.parse(Path(filename).expanduser()).getroot()
+    controls = root.findall('ros2_control')
+    allowed = {'topic_based_ros2_control/TopicBasedSystem',
+               'isaac_painting_hardware/IsaacPaintingSystem'}
+    if not controls or any(control.findtext('hardware/plugin', '').strip() not in allowed
+                           for control in controls):
+        raise ValueError('generated native spray requires simulation hardware')
+    commanded = [joint.get('name') for control in controls for joint in control.findall('joint')
+                 if joint.find("command_interface[@name='position']") is not None]
+    if any(commanded.count(name) != 1 for name in contract['arm_joint_names']):
+        raise ValueError('generated native spray requires selected simulation hardware joints')
+    side = ('single' if model_id == 'rb10_1300e_u' else
+            model_id.removeprefix('construct_') if model_id in CONSTRUCT_MODEL_LABELS else '')
+    flange = 'link6' if side == 'single' else f'{side}_manipulator_link6'
+    tool = f'{side}_spray_v2_left_manipulator_link_ee'
+    links = [link.get('name') for link in root.findall('link')]
+    if not side or len(links) != len(set(links)):
+        raise ValueError('invalid generated native spray link names')
+    def fixed_links(anchor):
+        descendants = {anchor}
+        while True:
+            children = {joint.find('child').get('link') for joint in root.findall('joint')
+                        if joint.get('type') == 'fixed' and joint.find('parent').get('link') in descendants}
+            if children <= descendants:
+                return descendants
+            descendants |= children
+    mesh = root.find(f"link[@name='{tool}']/collision/geometry/mesh")
+    if (tool not in fixed_links(flange) or contract['ee_link'] not in fixed_links(tool) or mesh is None
+            or not Path(mesh.get('filename', '').removeprefix('file://')).is_file()):
+        raise ValueError('invalid generated native spray fixed collision assembly')
+    return True
+
+
+def _object_collision_padding(obj):
+    """Exact simulator fixtures can declare zero; legacy uncertainty stays 20 mm."""
+    value = obj.get('collision_padding_m', WORLD_COLLISION_PADDING)
+    try:
+        if isinstance(value, bool):
+            raise ValueError('boolean padding')
+        padding = float(value)
+    except (ValueError, TypeError) as exc:
+        raise ValueError('collision_padding_m must be finite and nonnegative') from exc
+    if not math.isfinite(padding) or padding < 0.0:
+        raise ValueError('collision_padding_m must be finite and nonnegative')
+    return padding
+
+
+def _load_executor_objects_config(filename=''):
+    """An explicit registry replaces the legacy environment, never merges it."""
+    if not filename:
+        return load_objects_config()
+    import yaml
+    config = yaml.safe_load(Path(filename).expanduser().read_text())
+    if not isinstance(config, dict) or not isinstance(config.get('objects'), list):
+        raise ValueError('objects_config_file must contain an objects registry')
+    active = config.get('active_target')
+    source = config.get('active_target_source', 'static')
+    dynamic_names = {'task_scene': 'measured_task_surface', 'perception': 'perceived_task_surface'}
+    if source not in ('static', *dynamic_names):
+        raise ValueError('unknown active target source')
+    if source in dynamic_names and active != dynamic_names[source]:
+        raise ValueError('dynamic active target identity mismatch')
+    names = []
+    for obj in config['objects']:
+        if not isinstance(obj, dict) or not isinstance(obj.get('name'), str):
+            raise ValueError('objects registry requires named objects')
+        names.append(obj['name'])
+        _object_collision_padding(obj)
+        for key in ('position', 'size'):
+            values = obj.get(key, ())
+            if len(values) != 3 or not all(math.isfinite(float(v)) for v in values):
+                raise ValueError(f'invalid objects registry {key}')
+        if not all(float(v) > 0 for v in obj['size']):
+            raise ValueError('objects registry size must be positive')
+    if len(names) != len(set(names)):
+        raise ValueError('objects registry names must be unique')
+    if source != 'static':
+        if active in names:
+            raise ValueError('dynamic active target must not contain nominal geometry')
+        return config
+    if not any(obj['name'] == active and obj.get('enabled', True)
+               and obj.get('sketch_face') in ('+x', '-x', '+y', '-y', '+z', '-z')
+               for obj in config['objects']):
+        raise ValueError('objects registry requires an enabled active target with a sketch face')
+    return config
+
+
+class MoveItExecutor(SprayApproachMixin, WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionMixin, MultiSurfaceMixin, Node):
+    @property
+    def executing(self):
+        return getattr(self, "_executing", False)
+
+    @executing.setter
+    def executing(self, value):
+        self._executing = bool(value)
+        # Publish the execution edge immediately; the steady heartbeat also
+        # retains ownership while a controller cancellation is still pending.
+        MoveItExecutor._publish_task_scene_activity(self)
+
+    def _task_scene_active(self):
+        return bool(getattr(self, "executing", False)
+                    or getattr(self, "_active_trajectory_goal_handle", None) is not None
+                    or getattr(self, "_active_trajectory_goal_token", None) is not None
+                    or getattr(self, "_fjt_motion_state_unknown", False)
+                    or getattr(self, "_contact_collision_allowed", False)
+                    or getattr(getattr(self, "_weld", None), "busy", False))
+
+    def _publish_task_scene_activity(self):
+        publisher = getattr(self, "_task_scene_activity_pub", None)
+        if publisher is not None:
+            publisher.publish(String(data=json.dumps({
+                "active": MoveItExecutor._task_scene_active(self),
+                "revision": getattr(self, "_task_scene_revision", ""),
+            })))
+
+    def _active_target(self):
+        source = self.cfg.get('active_target_source', 'static')
+        if source != 'static':
+            return {'name': self.active_target_name, 'source': source}
+        return get_target(self.cfg, self.active_target_name)
+
+    def _task_scene_blocker(self):
+        source = getattr(self, 'cfg', {}).get('active_target_source', 'static')
+        if source == 'task_scene' and not getattr(self, 'require_task_scene_ack', False):
+            return 'TASK_SCENE_ACK_REQUIRED'
+        if source != 'static' and getattr(self, 'process_mode', '') != 'weld':
+            point, normal, _ = MoveItExecutor._execution_surface_geometry(self)
+            if point is None or normal is None:
+                return 'TARGET_SURFACE_NOT_OBSERVED'
+            if (np.shape(point) != (3,) or np.shape(normal) != (3,)
+                    or not np.isfinite(point).all() or not np.isfinite(normal).all()
+                    or abs(np.linalg.norm(normal) - 1.) > .001):
+                return 'TARGET_SURFACE_INVALID'
+        if not getattr(self, "require_task_scene_ack", False):
+            return ""
+        status = getattr(self, "_task_scene_status", {})
+        acks = status.get("acks", {})
+        if (status.get("ready") is not True or not status.get("revision")
+                or not status.get("surface_id")
+                or not isinstance(acks, dict)
+                or acks.get("isaac") is not True or acks.get("moveit") is not True):
+            return "TASK_SCENE_NOT_READY"
+        if (getattr(self, 'process_mode', '') == 'paint'
+                and getattr(self, '_d405_plane_accepted', False)
+                and getattr(self, '_d405_task_scene_revision', '') != status.get('revision')):
+            return 'TASK_SCENE_REFINEMENT_MISMATCH'
+        age = time.monotonic() - getattr(self, "_task_scene_received_at", 0.)
+        if not 0 <= age <= 1.:
+            return "TASK_SCENE_STATUS_STALE"
+        if (getattr(self, "process_mode", "paint") != "weld"
+                and getattr(self, "active_target_name", "") != "measured_task_surface"):
+            return "TASK_SCENE_TARGET_MISMATCH"
+        return ""
+
+    def _invalidate_task_scene_execution(self, reason):
+        self._accepted_plan_hash = ""
+        self._accepted_plan_path_id = ""
+        self._segment_path = None
+        self._acm_baseline_verified = False
+        # A changed physical scene invalidates even an immutable execution
+        # snapshot. It must not use the normal deferred candidate-update path.
+        if getattr(self, "process_mode", "paint") == "weld":
+            if hasattr(self, "_weld"):
+                self._weld_invalidate(reason)
+        else:
+            if MoveItExecutor._task_scene_active(self) and not getattr(self, "_task_scene_fault_latched", False):
+                self._task_scene_fault_latched = True
+                self._request_motion_abort(reason)
+            if (getattr(self, "_contact_collision_allowed", False)
+                    or getattr(self, "_acm_update_pending", None) is not None):
+                self._set_contact_collision_allowed(False)
+
+    def on_task_scene_status(self, msg):
+        if not getattr(self, "require_task_scene_ack", False):
+            return
+        try:
+            status = json.loads(msg.data)
+            if not isinstance(status, dict):
+                raise ValueError("status must be an object")
+        except (ValueError, TypeError):
+            status = {}
+        previous = getattr(self, "_task_scene_revision", "")
+        revision = str(status.get("revision", ""))
+        self._task_scene_status = status
+        self._task_scene_received_at = time.monotonic()
+        self._task_scene_revision = revision
+        if previous != revision:
+            MoveItExecutor._invalidate_task_scene_execution(self, "TASK_SCENE_REVISION_CHANGED")
+        elif status.get("ready") is not True:
+            MoveItExecutor._invalidate_task_scene_execution(self, "TASK_SCENE_NOT_READY")
+
+    def _task_scene_tick(self):
+        reason = MoveItExecutor._task_scene_blocker(self)
+        if reason:
+            MoveItExecutor._invalidate_task_scene_execution(self, reason)
+        else:
+            self._task_scene_fault_latched = False
+        MoveItExecutor._publish_task_scene_activity(self)
+
     def __init__(self):
         super().__init__("moveit_executor")
         self.model_id = validate_model(self.declare_parameter(
@@ -558,10 +807,37 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         for name, value in contract.items():
             setattr(self, name, value)
         self._robot_joint_limits = model_joint_limits(self.model_id)
+        generated_description_file = str(self.declare_parameter(
+            'generated_description_file', '', ParameterDescriptor(read_only=True)).value)
+        generated_limits = _generated_joint_limits(generated_description_file, self.arm_joint_names)
+        if generated_limits is not None:
+            self._robot_joint_limits = generated_limits
         initial_process = self.declare_parameter("process_mode", "paint", ParameterDescriptor(read_only=True)).value
+        self._generated_native_spray_tool = (
+            _generated_native_spray_tool(generated_description_file, self.model_id)
+            if initial_process == 'spray' else False)
+        self.require_task_scene_ack = bool(self.declare_parameter(
+            "require_task_scene_ack", False, ParameterDescriptor(read_only=True)).value)
+        self._task_scene_status = {}
+        self._task_scene_revision = ""
+        self._task_scene_received_at = 0.
+        self._task_scene_fault_latched = False
+        self._task_scene_activity_pub = None
+        if self.require_task_scene_ack:
+            self._task_scene_activity_pub = self.create_publisher(String, "/task_scene/activity", LATCHED_QOS)
+            self.create_subscription(String, "/task_scene/status", self.on_task_scene_status, LATCHED_QOS)
+            self.create_timer(.1, self._task_scene_tick, clock=Clock(clock_type=ClockType.STEADY_TIME))
         if initial_process == "weld":
             self._init_weld_execution()
             return
+        self.roller_contact_link = str(self.declare_parameter(
+            "roller_contact_link", ROLLER_CONTACT_LINK, ParameterDescriptor(read_only=True)
+        ).value).strip()
+        if not self.roller_contact_link:
+            raise ValueError("roller_contact_link must identify the selected tool contact link")
+        self.roller_tool_links = list(self.declare_parameter(
+            "roller_tool_links", EOAT_TOUCH_LINKS, ParameterDescriptor(read_only=True)
+        ).value)
         self.robot_link_frames = list(ROBOT_LINK_FRAMES)
         self.robot_link_capsule_radius = dict(ROBOT_LINK_CAPSULE_RADIUS)
         self.spray_eoat_touch_links = list(SPRAY_EOAT_TOUCH_LINKS)
@@ -594,6 +870,12 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
                 contract["follow_joint_trajectory_action"],
             ).value
         ).strip()
+        # Opt in only for a platform JTC feeding the admittance controller.
+        self.paint_nominal_reference_topic = str(
+            self.declare_parameter("paint_nominal_reference_topic", "").value
+        ).strip()
+        self._paint_nominal_controller_state = None
+        self._paint_nominal_controller_state_time = 0.0
         self.use_eoat_segments = bool(
             self.declare_parameter("use_eoat_segments", True).value
         )
@@ -903,6 +1185,13 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             Bool, PAINTING_CONTACT_TOPIC, self.on_painting_contact, 10
         )
         self.create_subscription(JointState, "/joint_states", self.on_joint_state, 10)
+        if self.paint_nominal_reference_topic:
+            self.create_subscription(
+                JointTrajectoryControllerState,
+                self.paint_nominal_reference_topic,
+                self._on_paint_nominal_controller_state,
+                10,
+            )
         self.create_subscription(
             MarkerArray, OBSTACLES_TOPIC, self.on_dynamic_obstacles, 10)
         self.create_subscription(
@@ -1004,6 +1293,9 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         self.execution_status_pub = self.create_publisher(
             String, EXECUTION_STATUS_TOPIC, LATCHED_QOS
         )
+        self.execution_event_pub = self.create_publisher(
+            String, EXECUTION_EVENT_TOPIC, EXECUTION_EVENT_QOS
+        )
         self.create_service(
             Trigger,
             "/painting_system/reset_execution_abort",
@@ -1090,6 +1382,8 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         self._d405_orientation_context = None
         self._d405_orientation_timer = None
         self._d405_arrival_timer = None
+        self._d405_dispatch_state_timer = None
+        self._d405_dispatch_state_wait = None
         self._d405_selected_orientation_branch = ""
         self._d405_refined_generation = 0
         self._d405_refined_lock_active = False
@@ -1112,6 +1406,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         self._active_trajectory_cancel_requested = False
         self._active_trajectory_cancel_reason = ""
         self._active_trajectory_result_deadline = 0.0
+        self._active_trajectory_sim_result_deadline = None
         self._active_trajectory_cancel_deadline = 0.0
         self._fjt_guard_timer = None
         self._fjt_motion_state_unknown = False
@@ -1208,13 +1503,17 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         self._acm_health_query_pending = None
         self._acm_health_query_timer = None
         self._latest_allowed_collision_matrix = None
+        collision_srdf_path = str(self.declare_parameter(
+            'collision_srdf_path', '').value).strip()
         self._required_acm_allowed_pairs = (
-            MoveItExecutor._load_srdf_allowed_collision_pairs(self.model_id)
+            MoveItExecutor._load_srdf_allowed_collision_pairs(
+                self.model_id, collision_srdf_path or None)
         )
         if not self._required_acm_allowed_pairs:
             self.get_logger().error(
                 "[ACM] SRDF disabled-collision baseline unavailable; "
-                "roller contact will remain fail-closed"
+                "execution will remain fail-closed"
+                + (f" (configured file: {collision_srdf_path})" if collision_srdf_path else "")
             )
         self._execution_state = "IDLE"
 
@@ -1284,7 +1583,8 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         self._controller_query_pending = False
 
         # ---- Target registry ----
-        self.cfg = load_objects_config()
+        self.cfg = _load_executor_objects_config(str(self.declare_parameter(
+            'objects_config_file', '', ParameterDescriptor(read_only=True)).value))
         if self.model_id in CONSTRUCT_MODEL_LABELS:
             # Construct's fixtures and camera geometry already live in its URDF.
             # Retain the target registry; its measured surface is authoritative.
@@ -1308,7 +1608,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.create_timer(0.5, self._retry_pending_surface_tf)
         self.create_timer(3.0, self._log_current_tcp)
-        self.create_timer(0.05, self._publish_executor_heartbeat)
+        self._start_executor_heartbeat()
         self._init_spray()
         self.spray_tool_axis = resolve_spray_tool_axis(
             self.model_id, str(self.declare_parameter(
@@ -1318,7 +1618,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             "spray_eoat_profile", "", ParameterDescriptor(read_only=True)).value)
         self._init_multi_surface()
         self._init_legacy_process_settings()
-        self.create_timer(0.5, self._update_and_publish_readiness)
+        self._start_readiness_timer()
 
         self.get_logger().info(
             f"MoveIt Executor 노드 시작 "
@@ -1498,8 +1798,9 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         return tcp
 
     def _spray_eoat_collision_object(self, profile):
-        if getattr(self, "model_id", DEFAULT_MODEL) in CONSTRUCT_MODEL_LABELS:
-            # Both Construct EOAT assemblies are fixed collision links in the
+        if (getattr(self, "_generated_native_spray_tool", False)
+                or getattr(self, "model_id", DEFAULT_MODEL) in CONSTRUCT_MODEL_LABELS):
+            # Validated generated tools and both Construct EOAT assemblies are fixed collision links in the
             # active full URDF. Do not overlay a second attached copy, which
             # would change native self/inter-arm collision behavior. Profile
             # endpoint/hash validation and scene confirmation remain required.
@@ -2082,7 +2383,29 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             and generation_id
             and work_area_id == self._current_work_area_id
         ):
+            try:
+                refined_pose = refined_pose_from_status(payload)
+            except ValueError as exc:
+                self._d405_plane_accepted = False
+                self._d405_refined_pose_armed = False
+                self._d405_refined_pose_generation_id = ""
+                self.get_logger().warn(f"[SURFACE] invalid accepted geometry record: {exc}")
+                if not prescan_active:
+                    self._abort_active_plan_invalidation("D405_REFINED_RECORD_INVALID")
+                return
+            if getattr(self, 'require_task_scene_ack', False):
+                self._d405_task_scene_revision = str(payload.get('task_scene_revision', ''))
             changed = generation_id != self._current_plane_generation_id
+            if refined_pose is None and (changed or not self._d405_refined_lock_active):
+                self._d405_plane_accepted = False
+                self._accepted_plan_hash = ""
+                self._accepted_plan_path_id = ""
+                self._reset_d405_refined_lock("accepted geometry missing", clear_surface=True)
+                self._d405_refined_pose_armed = False
+                self._d405_refined_pose_generation_id = ""
+                if not prescan_active:
+                    self._abort_active_plan_invalidation("D405_REFINED_RECORD_MISSING")
+                return
             if changed:
                 self._reset_d405_refined_lock(
                     "new accepted plane generation", clear_surface=True
@@ -2090,8 +2413,8 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             self._d405_plane_accepted = True
             self._current_plane_generation_id = generation_id
             if changed or not self._d405_refined_lock_active:
-                self._d405_refined_pose_armed = True
-                self._d405_refined_pose_generation_id = generation_id
+                self._d405_refined_pose_armed = refined_pose is not None
+                self._d405_refined_pose_generation_id = generation_id if refined_pose is not None else ""
             if changed and self._accepted_plan_hash:
                 self._accepted_plan_hash = ""
                 self._accepted_plan_path_id = ""
@@ -2102,6 +2425,8 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
                 self._abort_active_plan_invalidation(
                     "PLANE_GENERATION_CHANGED"
                 )
+            if refined_pose is not None and self._d405_refined_pose_armed:
+                MoveItExecutor._apply_identity_bound_refined_surface(self, refined_pose)
             return
         self._d405_plane_accepted = False
         self._d405_refined_pose_armed = False
@@ -2396,6 +2721,9 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
     def _motion_dispatch_inhibited_reason(
         self, *, requires_contact_acm=False, contact_acm_context=None
     ):
+        task_scene_reason = MoveItExecutor._task_scene_blocker(self)
+        if task_scene_reason:
+            return task_scene_reason
         if getattr(self, "_hardware_motion_inhibited", False):
             return "HARDWARE_MOTION_INHIBITED_RELAUNCH_REQUIRED"
         if getattr(self, "_fjt_motion_state_unknown", False):
@@ -2482,6 +2810,21 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
                 "HARDWARE_MOTION_INHIBITED",
                 "hardware stop latched; full stack relaunch required",
             )
+
+    def _start_readiness_timer(self):
+        # Controller queries and readiness receipt leases use wall time. Slow
+        # simulation progress must not defer queries or status publication.
+        self._readiness_timer = self.create_timer(
+            0.5, self._update_and_publish_readiness,
+            clock=Clock(clock_type=ClockType.STEADY_TIME))
+
+    def _start_executor_heartbeat(self):
+        # These renew independent wall-time guard leases, not process progress.
+        # A slow/frozen simulation clock must not suspend their publication;
+        # measured FT and controller feedback still expire independently.
+        self._executor_heartbeat_timer = self.create_timer(
+            0.05, self._publish_executor_heartbeat,
+            clock=Clock(clock_type=ClockType.STEADY_TIME))
 
     def _publish_executor_heartbeat(self):
         heartbeat = Bool()
@@ -2570,6 +2913,9 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         future.add_done_callback(done)
 
     def _current_real_plan_blockers(self):
+        task_scene_reason = MoveItExecutor._task_scene_blocker(self)
+        if task_scene_reason:
+            return (task_scene_reason,)
         snapshot = getattr(self, "_execution_snapshot", None)
         if isinstance(snapshot, dict):
             path = snapshot.get("segment_path")
@@ -2822,6 +3168,18 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             blockers.append("PLANNING_SCENE_REVISION_UNCONFIRMED")
         return tuple(dict.fromkeys(blockers))
 
+    def _motion_activity_status(self):
+        # High-level abort ends executing before the action's terminal result.
+        # Retained goal ownership and unknown motion must still inhibit apply.
+        running = bool(self.executing)
+        stopping = bool(
+            getattr(self, "_active_trajectory_cancel_requested", False)
+            or getattr(self, "_fjt_motion_state_unknown", False)
+            or (not running and (
+                getattr(self, "_active_trajectory_goal_token", None) is not None
+                or getattr(self, "_joint_command_timer", None) is not None)))
+        return {"running": running, "stopping": stopping}
+
     def _update_and_publish_readiness(self):
         self._query_controller_states()
         self._request_acm_baseline_health_check()
@@ -2971,7 +3329,9 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
                 self._current_work_area_id and self._current_plane_generation_id
                 and getattr(self, "_zed_plane_accepted", False))
             checks["spray_output_ready"] = not self._spray_motion_blockers()
+        checks["task_scene_acknowledged"] = not MoveItExecutor._task_scene_blocker(self)
         ready = all(checks.values()) if self.real_painting_enabled else plan_valid
+        ready = bool(ready and checks["task_scene_acknowledged"])
         if getattr(self, "process_mode", "paint") == "spray":
             ready = ready and checks["spray_output_ready"]
         if not self.dry_run:
@@ -3005,7 +3365,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             "model_id": getattr(self, "model_id", DEFAULT_MODEL),
             "real_painting_enabled": bool(self.real_painting_enabled),
             "dry_run": bool(self.dry_run),
-            "running": bool(self.executing),
+            **MoveItExecutor._motion_activity_status(self),
             "state": self._execution_state,
             "checks": checks,
             "precontact_tare_pending": bool(precontact_tare_pending),
@@ -3089,11 +3449,20 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             "contact_confirmed": bool(self._painting_contact_confirmed),
         }
         payload.update(fields)
+        self._execution_status_sequence = getattr(self, "_execution_status_sequence", 0) + 1
+        payload["execution_sequence"] = self._execution_status_sequence
         message = String()
         message.data = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
         self.execution_status_pub.publish(message)
+        # Preserve the latest-only UI contract. The separate reliable volatile
+        # stream retains rapid edges for current observers without replaying
+        # a previous execution when a checker reconnects. Both carry the exact
+        # same actually published record; no synthetic/reconstructed events.
+        event_pub = getattr(self, "execution_event_pub", None)
+        if event_pub is not None:
+            event_pub.publish(message)
 
     def on_active_surface(self, msg: PoseStamped):
         if getattr(self, "process_mode", "paint") == "spray":
@@ -3119,6 +3488,16 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         self._set_active_surface(msg, "zed")
 
     def on_refined_active_surface(self, msg: PoseStamped):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
+        # Geometry without its generation is not an executable plane. The
+        # accepted status record owns consumption, regardless of topic order.
+        self.get_logger().info(
+            "[SURFACE] compatibility refined Pose ignored; accepted geometry record owns plane",
+            throttle_duration_sec=2.0,
+        )
+
+    def _apply_identity_bound_refined_surface(self, msg: PoseStamped):
         if getattr(self, "process_mode", "paint") == "spray":
             return
         if MoveItExecutor._execution_snapshot_updates_locked(
@@ -3421,8 +3800,13 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             self.get_logger().info(
                 "[D405 PRESCAN] work area 선택 후 사전 보정 시작 "
                 "(fresh refined plane 이 있어도 새로 측정)")
-            self._publish_work_area_refine_status("moving")
-            self._begin_d405_prescan(mode="work_area")
+            if not getattr(self, "require_task_scene_ack", False):
+                self._publish_work_area_refine_status("moving")
+            if not self._begin_d405_prescan(mode="work_area"):
+                # Fixed-camera rejection already publishes its specific reason.
+                if not getattr(self, "require_task_scene_ack", False):
+                    self._publish_work_area_refine_status(
+                        "failed", reason="D405_APPROACH_UNAVAILABLE")
             return
 
         elapsed = time.monotonic() - float(self._work_area_refine_request_time)
@@ -3469,13 +3853,12 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             return
         if self._pending_surface_msg is not None:
             source = self._pending_surface_source
-            before_time = self.dynamic_surface_source_time
-            self._set_active_surface(
-                self._pending_surface_msg,
-                source,
-            )
-            if source == "d405_refined" and self._d405_refined_pose_armed:
-                self._finish_refined_surface_update(before_time)
+            if source == "d405_refined":
+                MoveItExecutor._apply_identity_bound_refined_surface(
+                    self, self._pending_surface_msg
+                )
+            else:
+                self._set_active_surface(self._pending_surface_msg, source)
         if self._pending_corners_msg is not None:
             self.on_work_area_corners(self._pending_corners_msg)
 
@@ -4180,6 +4563,9 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         )
 
     def _reset_d405_refined_lock(self, reason: str, clear_surface: bool = False):
+        if getattr(self, "_pending_surface_source", None) == "d405_refined":
+            self._pending_surface_msg = None
+            self._pending_surface_source = ""
         was_locked = self._d405_refined_lock_active
         self._d405_refined_lock_active = False
         self._d405_refined_lock_time = 0.0
@@ -4235,6 +4621,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
     def _invalidate_d405_prescan_callbacks(self, *, clear_token):
         """Invalidate delayed IK/MoveGroup/Cartesian callbacks from an old scan."""
 
+        MoveItExecutor._cancel_d405_dispatch_state_wait(self)
         self._cancel_d405_scene_wait_timer()
         self._cancel_d405_orientation_timer()
         self._cancel_d405_arrival_timer()
@@ -4342,6 +4729,8 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         if getattr(self, "process_mode", "paint") == "spray":
             return False
         self._invalidate_d405_prescan_callbacks(clear_token=True)
+        if getattr(self, "require_task_scene_ack", False):
+            return MoveItExecutor._begin_fixed_d405_capture(self, mode)
         scan_poses = self._build_d405_prescan_poses()
         if not scan_poses:
             self.get_logger().warn(
@@ -4369,6 +4758,42 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         )
         return True
 
+    def _begin_fixed_d405_capture(self, mode):
+        # In mixed mode the physical camera pose comes from its registration,
+        # never from the simulated wrist. Refine its current visible ROI only.
+        if mode == "multi_target" or getattr(self, "executing", False):
+            self._publish_work_area_refine_status(
+                "failed", reason="FIXED_CAMERA_CURRENT_ROI_CAPTURE_REQUIRED")
+            return False
+        self._cancel_d405_prescan_timer()
+        self._d405_prescan_active = True
+        self._d405_prescan_mode = mode
+        self._d405_prescan_queue = []
+        self._d405_prescan_index = 0
+        token = self._d405_prescan_token = object()
+        capture_time = time.monotonic()
+        self._d405_prescan_wait_start = capture_time
+        self._d405_prescan_capture_time = capture_time
+        self._d405_prescan_capture_sent = True
+        self._publish_work_area_refine_status("capturing_fixed")
+        self.d405_capture_pub.publish(Bool(data=True))
+
+        def wait_fixed_capture():
+            if not MoveItExecutor._d405_prescan_callback_valid(self, token):
+                return
+            if (getattr(self, "_d405_plane_accepted", False)
+                    and self.dynamic_surface_source == "d405_refined"
+                    and self.dynamic_surface_source_time >= capture_time):
+                self._finish_d405_prescan(success=True)
+            elif time.monotonic()-capture_time > D405_PREFLIGHT_SCAN_TIMEOUT_SEC:
+                self.get_logger().error(
+                    "Fixed D405 did not deliver an accepted current ROI capture; refinement refused")
+                self._finish_d405_prescan(success=False)
+
+        self._d405_prescan_timer = self.create_timer(
+            .1, wait_fixed_capture, clock=Clock(clock_type=ClockType.STEADY_TIME))
+        return True
+
     def _build_d405_prescan_poses(self):
         self._d405_scan_candidates = []
         try:
@@ -4383,7 +4808,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
                 if basis is None:
                     raise ValueError("finite work-area support unavailable")
                 center,u,v,hu,hv = basis
-                _point,normal = self._active_surface_plane(get_target(self.cfg,self.active_target_name))
+                _point,normal = self._active_surface_plane(MoveItExecutor._active_target(self))
                 polygon = np.array([center+su*hu*u+sv*hv*v for su,sv in [(-1,1),(1,1),(1,-1),(-1,-1)]])
                 polygon = np.array([self._project_point_to_active_surface(point,normal) for point in polygon])
             normal = np.asarray(normal,float)
@@ -4425,6 +4850,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
     def _runtime_tare_tcp_pose_sample(self):
         """Read a timestamped TCP sample for the execution-scoped tare gate."""
 
+        self._runtime_tare_tcp_tf_stamp_ns = None
         try:
             transform = self.tf_buffer.lookup_transform(
                 getattr(self, 'base_frame', BASE_FRAME),
@@ -4436,6 +4862,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             return None, f"actual TCP TF unavailable: {exc}"
         stamp = transform.header.stamp
         stamp_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+        self._runtime_tare_tcp_tf_stamp_ns = stamp_ns
         now_ns = int(self.get_clock().now().nanoseconds)
         if stamp_ns <= 0 or now_ns <= 0:
             return None, "actual TCP TF has invalid ROS timestamp"
@@ -4871,6 +5298,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
                 metrics, reason = self._stage1_candidate_joint_metrics(
                     response.solution.joint_state,
                     seed_state=context["seed_state"],
+                    joint_goal_tolerance=D405_PREFLIGHT_JOINT_GOAL_TOL_RAD,
                 )
                 if metrics is None:
                     record["reason"] = reason
@@ -5097,7 +5525,10 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             self._d405_orientation_plan_result(done, c, i)
         )
 
-    def _d405_plan_endpoint_matches_ik(self, trajectory, record):
+    def _d405_plan_endpoint_matches_ik(
+        self, trajectory, record, *, tolerance_rad=STAGE1_JOINT_GOAL_TOL + 1e-3,
+        diagnostic_label="STAGE1",
+    ):
         joint_trajectory = trajectory.joint_trajectory
         if not joint_trajectory.points:
             return False, "EMPTY_TRAJECTORY"
@@ -5109,15 +5540,140 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         goal_state = record["joint_state"]
         if len(goal_state.name) != len(goal_state.position):
             return False, "IK_GOAL_JOINT_ARRAY_INVALID"
-        tolerance = STAGE1_JOINT_GOAL_TOL + 1e-3
+        tolerance = float(tolerance_rad)
+        if getattr(self,"process_mode","paint")=="spray" and diagnostic_label=="STAGE1":
+            tolerance=min(tolerance,D405_PREFLIGHT_JOINT_GOAL_TOL_RAD+D405_PREFLIGHT_ENDPOINT_NUMERICAL_SLACK_RAD)
+        errors = []
+        planned_positions = []
         for name, goal in zip(goal_state.name, goal_state.position):
             if name not in endpoint:
                 return False, f"ENDPOINT_MISSING:{name}"
             actual = float(endpoint[name])
             goal = float(goal)
-            if not math.isfinite(actual) or abs(actual - goal) > tolerance:
+            if not math.isfinite(actual) or not math.isfinite(goal):
+                return False, f"ENDPOINT_MISMATCH:{name}"
+            planned_positions.append(actual)
+            errors.append(actual - goal)
+        candidate = record.get("candidate", {})
+        poses = candidate.get("poses", ())
+        requested_tcp = None
+        if poses:
+            pose = poses[0]
+            requested_tcp = {
+                "position": [pose.position.x, pose.position.y, pose.position.z],
+                "quaternion": [pose.orientation.x, pose.orientation.y,
+                               pose.orientation.z, pose.orientation.w],
+            }
+        self.get_logger().info(f"[{diagnostic_label} PLANNED ENDPOINT] " + json.dumps({
+            "candidate": candidate.get("name", ""),
+            "requested_tcp": requested_tcp,
+            "joint_names": list(goal_state.name),
+            "ik_positions": list(goal_state.position),
+            "planned_positions": planned_positions,
+            "error_rad": errors,
+            "max_abs_error_rad": max(map(abs, errors), default=0.0),
+            "allowed_error_rad": tolerance,
+        }))
+        for name, error in zip(goal_state.name, errors):
+            if abs(error) > tolerance:
                 return False, f"ENDPOINT_MISMATCH:{name}"
         return True, ""
+
+    def _on_paint_nominal_controller_state(self, msg):
+        self._paint_nominal_controller_state = msg
+        self._paint_nominal_controller_state_time = time.monotonic()
+
+    def _paint_nominal_start_snapshot(self):
+        """Keep the nominal JTC command separate from the loaded physical pose.
+
+        Admittance adds its accumulated joint offset to the JTC reference. A
+        measured Cartesian seed would therefore apply that offset twice at
+        handoff. Do not infer the reference by subtracting trim: feedback also
+        contains physical tracking error.
+        """
+        state = getattr(self, "_paint_nominal_controller_state", None)
+        measured = getattr(self, "current_joint_state", None)
+        if state is None or measured is None:
+            return None, "PAINT_NOMINAL_STATE_MISSING"
+        now = time.monotonic()
+        ros_now_ns = self.get_clock().now().nanoseconds
+        ages = {}
+        for label, msg, receipt in (
+            ("CONTROLLER", state, getattr(self, "_paint_nominal_controller_state_time", 0.0)),
+            ("MEASURED", measured, getattr(self, "current_joint_state_time", 0.0)),
+        ):
+            stamp = msg.header.stamp
+            stamp_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+            receipt_age = now - float(receipt)
+            source_age = (ros_now_ns - stamp_ns) / 1e9
+            if (
+                float(receipt) <= 0.0 or stamp_ns <= 0
+                or not 0 <= int(stamp.nanosec) < 1_000_000_000
+                or not math.isfinite(receipt_age)
+                or not 0.0 <= receipt_age <= D405_PREFLIGHT_JOINT_STATE_MAX_AGE_S
+                or not 0.0 <= source_age <= D405_PREFLIGHT_JOINT_STATE_MAX_AGE_S
+            ):
+                return None, f"PAINT_NOMINAL_{label}_STATE_STALE"
+            ages[label] = {"source_age_s": source_age, "receipt_age_s": receipt_age}
+
+        def positions(names, values):
+            if len(names) != len(values) or len(set(names)) != len(names):
+                return None
+            if not all(math.isfinite(float(value)) for value in values):
+                return None
+            return dict(zip(names, map(float, values)))
+
+        active = list(self.arm_joint_names)
+        reference = positions(state.joint_names, state.reference.positions)
+        feedback = positions(state.joint_names, state.feedback.positions)
+        physical = positions(measured.name, measured.position)
+        if (
+            len(set(active)) != len(active)
+            or not active
+            or reference is None or feedback is None or physical is None
+            or set(state.joint_names) != set(active)
+            or not set(active).issubset(physical)
+        ):
+            return None, "PAINT_NOMINAL_JOINT_ARRAY_INVALID"
+        for name in active:
+            if abs(feedback[name] - physical[name]) > D405_PREFLIGHT_START_STATE_TOL_RAD:
+                return None, f"PAINT_NOMINAL_FEEDBACK_MISMATCH:{name}"
+        seed = copy.deepcopy(measured)
+        seed.position = [reference.get(name, value) for name, value in zip(seed.name, seed.position)]
+        # This is a position seed; measured velocity/effort are not nominal.
+        seed.velocity = []
+        seed.effort = []
+        return {
+            "seed_state": seed,
+            "reference": reference,
+            "measured": physical,
+            "ages": ages,
+        }, ""
+
+    def _paint_nominal_plan_start_error(self, trajectory, captured):
+        current, error = MoveItExecutor._paint_nominal_start_snapshot(self)
+        if error:
+            return error
+        joint_trajectory = trajectory.joint_trajectory
+        names = list(joint_trajectory.joint_names)
+        if not joint_trajectory.points:
+            return "PAINT_NOMINAL_PLAN_EMPTY"
+        values = list(joint_trajectory.points[0].positions)
+        if (
+            len(names) != len(values) or len(set(names)) != len(names)
+            or not set(self.arm_joint_names).issubset(names)
+            or not all(math.isfinite(float(value)) for value in values)
+        ):
+            return "PAINT_NOMINAL_PLAN_JOINT_ARRAY_INVALID"
+        first = dict(zip(names, values))
+        # The nominal controller is holding during planning. Require command
+        # continuity, independently of the existing .01 rad physical bound.
+        for name in self.arm_joint_names:
+            if abs(current["reference"][name] - captured["reference"][name]) > 1e-6:
+                return f"PAINT_NOMINAL_REFERENCE_CHANGED:{name}"
+            if abs(first[name] - captured["reference"][name]) > 1e-6:
+                return f"PAINT_NOMINAL_PLAN_START_MISMATCH:{name}"
+        return ""
 
     def _d405_plan_start_matches_measured(
         self,
@@ -5331,7 +5887,10 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         record = context["ranked"][int(rank_index)]
         trajectory = result.planned_trajectory
         endpoint_ok, endpoint_reason = self._d405_plan_endpoint_matches_ik(
-            trajectory, record
+            trajectory, record,
+            tolerance_rad=(D405_PREFLIGHT_JOINT_GOAL_TOL_RAD
+                           + D405_PREFLIGHT_ENDPOINT_NUMERICAL_SLACK_RAD),
+            diagnostic_label="D405",
         )
         if not endpoint_ok:
             self._try_next_d405_orientation_rank(context, endpoint_reason)
@@ -5378,7 +5937,90 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         self.get_logger().info(f"[D405 VIEW] selected sample path: summed joint travel={cost[0]:.3f}rad, compared={len(context['planned_views'])}")
         return self._activate_d405_orientation_rank(context,index,trajectory=trajectory)
 
+    def _cancel_d405_dispatch_state_wait(self):
+        timer = getattr(self, "_d405_dispatch_state_timer", None)
+        self._d405_dispatch_state_wait = None
+        self._d405_dispatch_state_timer = None
+        if timer is not None:
+            timer.cancel()
+            self.destroy_timer(timer)
+
+    def _d405_dispatch_state_sample(self):
+        """Receipt and source ages for the selected arm's dispatch refresh."""
+        receipt = float(getattr(self, "current_joint_state_time", 0.0))
+        state = getattr(self, "current_joint_state", None)
+        stamp_ns = 0
+        if state is not None:
+            stamp = state.header.stamp
+            stamp_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+        return dict(receipt=receipt, stamp_ns=stamp_ns,
+                    receipt_age_s=time.monotonic() - receipt,
+                    source_age_s=(int(self.get_clock().now().nanoseconds) - stamp_ns) / 1e9)
+
+    def _start_d405_dispatch_state_wait(self, context, record, trajectory):
+        # Dense action-result processing runs on this node's single executor
+        # thread. Yield once for subscriptions instead of relaxing state age or
+        # repeating an already successful collision-checked planning request.
+        MoveItExecutor._cancel_d405_dispatch_state_wait(self)
+        sample = MoveItExecutor._d405_dispatch_state_sample(self)
+        wait = dict(context=context, token=context["token"],
+                    scene_revision=context["scene_revision"],
+                    rank_index=context.get("rank_index"),
+                    started=time.monotonic(), stamp_ns=sample["stamp_ns"])
+        self._d405_dispatch_state_wait = wait
+        context["state_refresh_attempted"] = True
+
+        def diagnostic(phase, current):
+            return (f"[D405 VIEW] state refresh {phase}: "
+                    f"receipt_age_s={current['receipt_age_s']:.6f}, "
+                    f"source_age_s={current['source_age_s']:.6f}, "
+                    f"source_stamp_ns={current['stamp_ns']}, "
+                    f"points={len(trajectory.joint_trajectory.points)}, "
+                    f"wait_s={time.monotonic() - wait['started']:.6f}")
+
+        self.get_logger().info(diagnostic("waiting", sample))
+
+        def refresh():
+            if getattr(self, "_d405_dispatch_state_wait", None) is not wait:
+                return
+            if (context is not getattr(self, "_d405_orientation_context", None)
+                    or context.get("token") is not wait["token"]
+                    or context.get("rank_index") != wait["rank_index"]
+                    or context.get("scene_revision") != wait["scene_revision"]
+                    or not self._d405_prescan_callback_valid(wait["token"])):
+                MoveItExecutor._cancel_d405_dispatch_state_wait(self)
+                return
+            inhibit = MoveItExecutor._motion_dispatch_inhibited_reason(self)
+            if inhibit or not self._d405_scene_revision_confirmed(wait["scene_revision"]):
+                MoveItExecutor._cancel_d405_dispatch_state_wait(self)
+                self.get_logger().error(
+                    "[D405 VIEW] state refresh rejected: " + (inhibit or "SCENE_CHANGED"))
+                context["finalize_cb"](False)
+                return
+            current = MoveItExecutor._d405_dispatch_state_sample(self)
+            if time.monotonic() - wait["started"] >= D405_PREFLIGHT_STATE_REFRESH_TIMEOUT_S:
+                MoveItExecutor._cancel_d405_dispatch_state_wait(self)
+                self.get_logger().error(diagnostic("STATE_REFRESH_TIMEOUT", current))
+                context["finalize_cb"](False)
+                return
+            if not (current["receipt"] > wait["started"]
+                    and current["stamp_ns"] > max(0, wait["stamp_ns"])
+                    and 0.0 <= current["receipt_age_s"] <= D405_PREFLIGHT_JOINT_STATE_MAX_AGE_S
+                    and 0.0 <= current["source_age_s"] <= D405_PREFLIGHT_JOINT_STATE_MAX_AGE_S):
+                return
+            MoveItExecutor._cancel_d405_dispatch_state_wait(self)
+            self.get_logger().info(diagnostic("received", current))
+            # The exact saved plan returns through all ordinary dispatch gates.
+            # state_refresh_attempted prevents a second wait if it is stale again.
+            self._dispatch_d405_orientation_trajectory(context, record, trajectory)
+
+        self._d405_dispatch_state_timer = self.create_timer(
+            0.02, refresh, clock=Clock(clock_type=ClockType.STEADY_TIME))
+
     def _dispatch_d405_orientation_trajectory(self, context, record, trajectory):
+        pending = getattr(self, "_d405_dispatch_state_wait", None)
+        if context.get("fjt_dispatched") or (pending is not None and pending["context"] is context):
+            return
         # Recheck at dispatch: comparing plans must never reuse a moved seed or scene.
         inhibit = MoveItExecutor._motion_dispatch_inhibited_reason(self)
         if inhibit:
@@ -5390,6 +6032,9 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             return
         start_ok,reason = self._d405_plan_start_matches_measured(trajectory,context["seed_state"])
         if not start_ok:
+            if reason == "START_MEASURED_STATE_STALE" and not context.get("state_refresh_attempted"):
+                MoveItExecutor._start_d405_dispatch_state_wait(self, context, record, trajectory)
+                return
             self.get_logger().error(f"[D405 VIEW] dispatch rejected: {reason}")
             context["finalize_cb"](False)
             return
@@ -5612,7 +6257,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         normal = np.asarray(self.dynamic_surface_normal, dtype=float)
         normal /= np.linalg.norm(normal) + 1e-12
         try:
-            target = get_target(self.cfg, self.active_target_name)
+            target = MoveItExecutor._active_target(self)
         except Exception:
             target = get_target(self.cfg, "wall")
         old_normal = self._infer_surface_normal_from_waypoints(
@@ -5707,7 +6352,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             )
             return False
         try:
-            target = get_target(self.cfg, self.active_target_name)
+            target = MoveItExecutor._active_target(self)
         except Exception:
             target = get_target(self.cfg, "wall")
         plane_point, active_normal = self._active_surface_plane(target)
@@ -5969,6 +6614,15 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             if path.process_mode == "spray":
                 preferred_candidate["name"] = "spray_tool_axis"
                 candidates = (preferred_candidate,)
+                # A source-CAD circular cone is invariant under roll about +Z.
+                # Keep legacy fan profiles at their fixed accepted orientation.
+                if (path.raw_payload.get("spray_envelope_profile_id") == "spray_v2_original_cad_cone"
+                        and path.raw_payload.get("spray_tool_axis") == "+z"):
+                    alternate = self._build_segment_orientation_candidate(
+                        path, -raw_tcp_x, name="spray_cone_roll_180")
+                    preferred_candidate["complete_spray_preflight"] = True
+                    alternate["complete_spray_preflight"] = True
+                    candidates = (preferred_candidate, alternate)
             else:
                 candidates = (
                     preferred_candidate,
@@ -6004,7 +6658,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         self._contact_search_cancel_token = None
         self._contact_search_distance_m = 0.0
 
-        target = get_target(self.cfg, self.active_target_name)
+        target = MoveItExecutor._active_target(self)
         _plane_point, normal = self._active_surface_plane(target)
         self.get_logger().info(
             f"[PAINT PATH] prepared {len(steps)} execution steps from "
@@ -6187,6 +6841,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
                 lambda ctx=context: MoveItExecutor._force_phase_lease_tick(
                     self, ctx
                 ),
+                clock=Clock(clock_type=ClockType.STEADY_TIME),
             )
         return context
 
@@ -6393,7 +7048,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             self.destroy_timer(self._process_timer)
             self._process_timer = None
 
-    def _schedule_process_once(self, delay_s, callback):
+    def _schedule_process_once(self, delay_s, callback, *, steady=False):
         self._cancel_process_timer()
         timer_ref = {}
 
@@ -6406,14 +7061,28 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
                 self._process_timer = None
             callback()
 
-        timer = self.create_timer(max(0.001, float(delay_s)), run_once)
+        timer_options = ({"clock": Clock(clock_type=ClockType.STEADY_TIME)}
+                         if steady else {})
+        timer = self.create_timer(max(0.001, float(delay_s)), run_once, **timer_options)
         timer_ref["timer"] = timer
         self._process_timer = timer
 
     @staticmethod
-    def _load_srdf_allowed_collision_pairs(model_id=DEFAULT_MODEL):
+    def _load_srdf_allowed_collision_pairs(model_id=DEFAULT_MODEL, srdf_path=None):
         """Load the semantic collision baseline used by the active MoveIt config."""
 
+        if srdf_path is not None:
+            # An explicit model must never fall back to the source CAD's old
+            # semantics when a generated EOAT has replaced its links.
+            try:
+                root = ET.fromstring(model_srdf(model_id, srdf_path))
+                pairs = tuple((e.attrib['link1'], e.attrib['link2'])
+                              for e in root.iter('disable_collisions'))
+            except (OSError, ET.ParseError, KeyError):
+                return ()
+            if any(not a.strip() or not b.strip() or a == b for a, b in pairs):
+                return ()
+            return pairs
         if model_id in CONSTRUCT_MODEL_LABELS:
             root = ET.fromstring(model_srdf(model_id))
             return tuple((e.attrib['link1'], e.attrib['link2']) for e in root.iter('disable_collisions'))
@@ -6770,7 +7439,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             not error
             and MoveItExecutor._acm_effective_pair_value(
                 baseline,
-                ROLLER_CONTACT_LINK,
+                getattr(self, "roller_contact_link", ROLLER_CONTACT_LINK),
                 context["target"],
             )
         ):
@@ -7003,7 +7672,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             self.get_logger().info(
                 "[ACM] roller contact pair allowed without changing the "
                 "SRDF collision baseline: %s <-> %s"
-                % (ROLLER_CONTACT_LINK, context["target"])
+                % (getattr(self, "roller_contact_link", ROLLER_CONTACT_LINK), context["target"])
             )
             self._notify_acm_callbacks(context.get("allow_callbacks", ()), True)
             return
@@ -7164,7 +7833,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
                 not error
                 and MoveItExecutor._acm_effective_pair_value(
                     baseline,
-                    ROLLER_CONTACT_LINK,
+                    getattr(self, "roller_contact_link", ROLLER_CONTACT_LINK),
                     context["target"],
                 )
             ):
@@ -7212,7 +7881,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         try:
             allowed_matrix = MoveItExecutor._acm_with_pair(
                 baseline,
-                ROLLER_CONTACT_LINK,
+                getattr(self, "roller_contact_link", ROLLER_CONTACT_LINK),
                 context["target"],
                 True,
             )
@@ -7483,6 +8152,50 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             0.02, lambda: self._wait_for_contact_search_mode_ack(step)
         )
 
+    def _contact_search_clock_sample(self, steady_now):
+        return MoveItExecutor._process_clock_sample(self, steady_now, "CONTACT_SEARCH")
+
+    def _process_clock_sample(self, steady_now, phase):
+        """Dynamics follow simulation time; safety receipts never use this clock."""
+        get_clock = getattr(self, 'get_clock', None)
+        clock = get_clock() if callable(get_clock) else None
+        simulated = bool(getattr(clock, 'ros_time_is_active', False))
+        value = (clock.now().nanoseconds * 1e-9 if simulated else float(steady_now))
+        if not math.isfinite(value) or value <= 0.:
+            raise ValueError(f'{phase}_CLOCK_INVALID')
+        return ('ros' if simulated else 'steady'), value
+
+    def _begin_process_progress(self, phase, steady_now):
+        basis, value = MoveItExecutor._process_clock_sample(self, steady_now, phase)
+        return {"phase": phase, "basis": basis, "started": value, "previous": value}
+
+    def _process_progress_elapsed(self, context, steady_now):
+        phase = context["phase"]
+        basis, value = MoveItExecutor._process_clock_sample(self, steady_now, phase)
+        if basis != context["basis"]:
+            raise ValueError(f"{phase}_CLOCK_DOMAIN_CHANGED")
+        if value < context["previous"]:
+            raise ValueError(f"{phase}_CLOCK_RESET")
+        context["previous"] = value
+        return value - context["started"]
+
+    def _begin_contact_search_progress(self, steady_now):
+        basis, value = MoveItExecutor._contact_search_clock_sample(self, steady_now)
+        self._contact_search_progress_context = (basis, value, value)
+
+    def _contact_search_progress_elapsed(self, steady_now):
+        context = getattr(self, '_contact_search_progress_context', None)
+        if context is None:
+            raise ValueError('CONTACT_SEARCH_CLOCK_UNINITIALIZED')
+        basis, started, previous = context
+        current_basis, value = MoveItExecutor._contact_search_clock_sample(self, steady_now)
+        if current_basis != basis:
+            raise ValueError('CONTACT_SEARCH_CLOCK_DOMAIN_CHANGED')
+        if value < previous:
+            raise ValueError('CONTACT_SEARCH_CLOCK_RESET')
+        self._contact_search_progress_context = (basis, started, value)
+        return value - started
+
     def _start_contact_search(self, step):
         if self.painting_force_enabled:
             blockers = self._real_force_runtime_blockers()
@@ -7497,8 +8210,13 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         self._contact_search_mode_published_at = float(
             self._contact_search_command_context["published_at_s"]
         )
-        self._transition_execution_state("CONTACT_SEARCH", "bounded search start")
         self._contact_search_started_at = time.monotonic()
+        try:
+            MoveItExecutor._begin_contact_search_progress(self, self._contact_search_started_at)
+        except ValueError as exc:
+            self._request_motion_abort(str(exc))
+            return
+        self._transition_execution_state("CONTACT_SEARCH", "bounded search start")
         self._contact_search_distance_m = 0.0
         self._contact_search_step_active = False
         self._contact_search_cancel_on_contact = False
@@ -7532,9 +8250,15 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             and now - self._safety_status_time <= self.ft_required_timeout_s
         )
         contact = self._contact_search_contact_sensed(now)
+        try:
+            progress_elapsed = MoveItExecutor._contact_search_progress_elapsed(self, now)
+        except ValueError as exc:
+            self._set_contact_collision_allowed(False)
+            self._request_motion_abort(str(exc))
+            return
         decision = evaluate_contact_search(
             self.contact_search_config,
-            elapsed_s=now - self._contact_search_started_at,
+            elapsed_s=progress_elapsed,
             cumulative_distance_m=self._contact_search_distance_m,
             contact_confirmed=contact,
             ft_valid=safety_fresh and self._safety_status.get("ft_valid") is True,
@@ -8173,6 +8897,11 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             "disable_command_context": None,
         }
         ramp_state = {"guard_acknowledged": False}
+        try:
+            progress_context = MoveItExecutor._begin_process_progress(self, mode, started_at)
+        except ValueError as exc:
+            self._request_motion_abort(str(exc))
+            return
 
         def fail_active_guard(reason, blockers):
             self._cancel_process_timer()
@@ -8191,6 +8920,12 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
                 self._cancel_process_timer()
                 return
             now = time.monotonic()
+            try:
+                progress_elapsed = MoveItExecutor._process_progress_elapsed(self, progress_context, now)
+            except ValueError as exc:
+                self._cancel_process_timer()
+                self._request_motion_abort(str(exc))
+                return
             ramp_status = self._painting_ramp_status
             feedback_is_fresh = bool(
                 isinstance(ramp_status, dict)
@@ -8383,7 +9118,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
                     self.painting_ramp_settle_s, self._complete_process_step
                 )
                 return
-            if now - started_at > self.painting_ramp_feedback_timeout_s:
+            if progress_elapsed > self.painting_ramp_feedback_timeout_s:
                 detail = (
                     "contact not confirmed"
                     if ramp_done and not contact_ok
@@ -8394,7 +9129,8 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
                     f"{mode} timeout: {detail}"
                 )
 
-        self._process_timer = self.create_timer(0.02, wait_for_ramp)
+        self._process_timer = self.create_timer(
+            0.02, wait_for_ramp, clock=Clock(clock_type=ClockType.STEADY_TIME))
 
     def _apply_contact_depth_correction(self, step, poses):
         """Move PAINT waypoints onto the wall CONTACT_SEARCH actually found.
@@ -8548,7 +9284,10 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
                 )
                 path_distance += float(np.linalg.norm(target - cursor))
                 cursor = target
-            if path_distance < 1e-6:
+            if path_distance < 1e-6 and not (
+                getattr(self, "process_mode", "paint") == "spray"
+                and self._spray_arrival_reason(poses[-1],require_stationary=False)
+            ):
                 if stationary_paint_hold:
                     self._start_stationary_paint_hold(step, poses[-1])
                     return
@@ -8562,7 +9301,23 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         req.link_name = getattr(self, 'ee_link', EE_LINK)
         rs = RobotState()
         seed_state = copy.deepcopy(self.current_joint_state)
-        rs.joint_state = copy.deepcopy(seed_state)
+        nominal_start = None
+        if force_committed and getattr(self, "paint_nominal_reference_topic", ""):
+            nominal_start, error = MoveItExecutor._paint_nominal_start_snapshot(self)
+            if error:
+                self._request_motion_abort(error)
+                return
+            self.get_logger().info(
+                "[PAINT NOMINAL START] " + json.dumps({
+                    "topic": self.paint_nominal_reference_topic,
+                    "nominal": nominal_start["reference"],
+                    "measured": nominal_start["measured"],
+                    "ages": nominal_start["ages"],
+                }, sort_keys=True)
+            )
+        rs.joint_state = copy.deepcopy(
+            nominal_start["seed_state"] if nominal_start is not None else seed_state
+        )
         rs.is_diff = False
         req.start_state = rs
         req.waypoints = poses
@@ -8582,6 +9337,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             "poses": poses,
             "stationary_paint_hold": stationary_paint_hold,
             "seed_state": seed_state,
+            "paint_nominal_start": nominal_start,
             "scene_revision": int(getattr(self, "_scene_revision", 0)),
             "execution_snapshot": getattr(self, "_execution_snapshot", None),
             "active_path": getattr(self, "_active_segment_path", None),
@@ -8681,10 +9437,16 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             step.speed_mps,
         )
         label = f"PAINT PROCESS {self._process_step_index + 1} {step.mode}"
+        nominal_start = context.get("paint_nominal_start")
+        if nominal_start is not None:
+            error = MoveItExecutor._paint_nominal_plan_start_error(self, trajectory, nominal_start)
+            if error:
+                reject_before_dispatch(f"{label}:{error}")
+                return
         start_ok, start_reason = self._d405_plan_start_matches_measured(
             trajectory,
             context["seed_state"],
-            max_age_s=1.0,
+            max_age_s=(D405_PREFLIGHT_JOINT_STATE_MAX_AGE_S if nominal_start is not None else 1.0),
         )
         if not start_ok:
             reject_before_dispatch(
@@ -8795,6 +9557,12 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
 
         duration_s = float(self.stationary_paint_hold_s)
         self._stationary_paint_hold_started_at = time.monotonic()
+        try:
+            progress_context = MoveItExecutor._begin_process_progress(
+                self, "PAINT_HOLD", self._stationary_paint_hold_started_at)
+        except ValueError as exc:
+            self._request_motion_abort(str(exc))
+            return
         self._stationary_paint_hold_samples = []
         self._transition_execution_state(
             "PAINT_HOLD",
@@ -8805,8 +9573,13 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             if self._motion_abort_requested:
                 return
             now = time.monotonic()
+            try:
+                progress_elapsed = MoveItExecutor._process_progress_elapsed(self, progress_context, now)
+            except ValueError as exc:
+                self._request_motion_abort(str(exc))
+                return
             decision = evaluate_stationary_paint_hold(
-                elapsed_s=now - self._stationary_paint_hold_started_at,
+                elapsed_s=progress_elapsed,
                 duration_s=duration_s,
                 now_s=now,
                 safety_status_received_at_s=self._safety_status_time,
@@ -8863,9 +9636,9 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
                 self._stationary_paint_hold_samples = []
                 self._process_motion_done(final_pose)
                 return
-            self._schedule_process_once(0.05, poll_hold)
+            self._schedule_process_once(0.05, poll_hold, steady=True)
 
-        self._schedule_process_once(0.05, poll_hold)
+        self._schedule_process_once(0.05, poll_hold, steady=True)
 
     def _publish_free_space_confirmation(self, confirmed):
         msg = Bool()
@@ -8887,6 +9660,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         self._runtime_tare_verify_started_at = 0.0
         self._runtime_tare_context = None
         self._runtime_tare_actual_metrics = {}
+        self._runtime_tare_pose_diagnostics = {}
         if reset_phase:
             self._runtime_tare_phase = "IDLE"
 
@@ -8903,7 +9677,36 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             state="PRECONTACT_TARE_FAILED",
             tare_failure_reason=str(reason),
             tare_phase="FAILED",
+            **getattr(self, "_runtime_tare_actual_metrics", {}),
+            **getattr(self, "_runtime_tare_pose_diagnostics", {}),
         )
+
+    def _runtime_tare_arrival_interlock_error(self):
+        """A position-only arrival wait may never hide contact or force faults."""
+        now = time.monotonic()
+        if (getattr(self, "_painting_command_enable", False)
+                or getattr(self, "_painting_command_force_n", 0.0) != 0.0):
+            return "approach arrival requires requested force OFF"
+        guard_blockers = MoveItExecutor._force_guard_status_blockers(
+            self, active=False, now=now)
+        if guard_blockers:
+            return "approach arrival guard: " + ",".join(guard_blockers)
+        guard = self._guard_status
+        if not (0 <= now - self._guard_status_time <= self.ft_required_timeout_s
+                and guard.get("compliance_active") is False
+                and guard.get("compliance_enabled") is False
+                and guard.get("forwarding") is False
+                and guard.get("requested_force_norm_n") == 0.0
+                and guard.get("requested_torque_norm_nm") == 0.0):
+            return "approach arrival requires fresh zero-output/compliance OFF guard"
+        safety = self._safety_status
+        if not (0 <= now - self._safety_status_time <= self.ft_required_timeout_s
+                and safety.get("ft_valid") is True
+                and safety.get("tf_valid") is True
+                and safety.get("abort_latched") is False
+                and safety.get("contact_confirmed") is False):
+            return "approach arrival requires fresh valid non-contact safety status"
+        return ""
 
     def _begin_runtime_tare_before_contact(self, step, planned_tcp_pose):
         """Tare at a stopped, execution-scoped pre-contact pose.
@@ -8986,17 +9789,29 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         self._runtime_tare_phase = "SETTLING"
         self._execution_tare_ready = False
         pose_ok, pose_error, metrics = self._runtime_tare_actual_pose_guard()
-        if not pose_ok:
-            self._runtime_tare_fail(pose_error)
-            return
         self._runtime_tare_actual_metrics = metrics
+        if not pose_ok:
+            interlock_error = MoveItExecutor._runtime_tare_arrival_interlock_error(self)
+            if (not pose_error.startswith("actual TCP position error ")
+                    or interlock_error):
+                self._runtime_tare_fail(interlock_error or pose_error)
+                return
+            self._runtime_tare_phase = "WAIT_APPROACH_ARRIVAL"
         self._transition_execution_state(
             "PRECONTACT_TARE",
-            "10 mm free-space pose reached; waiting for stationary interlocks",
+            ("waiting for measured APPROACH arrival; tare remains blocked"
+             if not pose_ok else
+             "10 mm free-space pose reached; waiting for stationary interlocks"),
+            tare_phase=self._runtime_tare_phase,
         )
-        self._runtime_tare_timer = self.create_timer(
-            0.05, self._runtime_tare_tick
-        )
+        # Arrival and quiet deadlines use wall time, including a later
+        # position-only settling excursion after an initially in-band pose.
+        if self.get_clock().ros_time_is_active:
+            self._runtime_tare_timer = self.create_timer(
+                0.05, self._runtime_tare_tick,
+                clock=Clock(clock_type=ClockType.STEADY_TIME))
+        else:
+            self._runtime_tare_timer = self.create_timer(0.05, self._runtime_tare_tick)
 
     def _runtime_tare_call(self, client, pending_phase, done_callback):
         token = self._runtime_tare_token
@@ -9111,11 +9926,25 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
     def _runtime_tare_actual_pose_guard(self):
         """Verify actual roller clearance and final-goal tracking before tare."""
 
+        self._runtime_tare_pose_diagnostics = {}
         identity_error = self._runtime_tare_identity_error()
         if identity_error:
             return False, f"plan/plane identity: {identity_error}", {}
         context = self._runtime_tare_context
+        try:
+            planned = context["planned_tcp_pose"]
+            planned_diagnostic = {
+                "position": [planned.position.x, planned.position.y, planned.position.z],
+                "quaternion": [planned.orientation.x, planned.orientation.y, planned.orientation.z, planned.orientation.w],
+            }
+        except (AttributeError, KeyError, TypeError):
+            return False, "runtime tare pose context malformed", {}
         actual, tf_error = self._runtime_tare_tcp_pose_sample()
+        self._runtime_tare_pose_diagnostics = {
+            "planned_tcp": planned_diagnostic,
+            "actual_tcp": None,
+            "tcp_tf_stamp_ns": getattr(self, "_runtime_tare_tcp_tf_stamp_ns", None),
+        }
         if actual is None:
             return False, tf_error or "actual TCP TF unavailable", {}
         try:
@@ -9207,6 +10036,8 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         }
         if not all(math.isfinite(value) for value in metrics.values()):
             return False, "computed runtime tare geometry is non-finite", metrics
+        self._runtime_tare_pose_diagnostics["actual_tcp"] = {
+            "position": tcp_position.tolist(), "quaternion": tcp_quaternion.tolist()}
         if actual_clearance_m < self.runtime_tare_min_actual_clearance_m:
             return (
                 False,
@@ -9214,16 +10045,6 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
                 % (
                     actual_clearance_m,
                     self.runtime_tare_min_actual_clearance_m,
-                ),
-                metrics,
-            )
-        if position_error_m > self.runtime_tare_max_tcp_position_error_m:
-            return (
-                False,
-                "actual TCP position error %.4fm exceeds %.4fm"
-                % (
-                    position_error_m,
-                    self.runtime_tare_max_tcp_position_error_m,
                 ),
                 metrics,
             )
@@ -9253,6 +10074,13 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
                 ),
                 metrics,
             )
+        if position_error_m > self.runtime_tare_max_tcp_position_error_m:
+            return (
+                False,
+                "actual TCP position error %.6fm exceeds %.6fm"
+                % (position_error_m, self.runtime_tare_max_tcp_position_error_m),
+                metrics,
+            )
         return True, "", metrics
 
     def _runtime_hardware_tare_done(self, future, expected_token):
@@ -9262,6 +10090,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         if response is None:
             return
         pose_ok, pose_error, metrics = self._runtime_tare_actual_pose_guard()
+        self._runtime_tare_actual_metrics = metrics
         if not pose_ok:
             self._runtime_tare_fail(pose_error)
             return
@@ -9342,6 +10171,34 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         # handshakes.  A valid pose only at service dispatch is insufficient:
         # drift/contact while any async response is pending must fail closed.
         pose_ok, pose_error, metrics = self._runtime_tare_actual_pose_guard()
+        self._runtime_tare_actual_metrics = metrics
+        # Crossing into the position band once does not prove settling is
+        # complete. Before hardware tare starts, allow a position-only
+        # excursion to reuse the original arrival budget, never a new one.
+        arrival_budget_s = min(2.0, self.runtime_tare_timeout_s)
+        settling_position_excursion = (
+            phase == "SETTLING" and not pose_ok
+            and pose_error.startswith("actual TCP position error ")
+            and now - self._runtime_tare_started_at <= arrival_budget_s
+        )
+        if phase == "WAIT_APPROACH_ARRIVAL" or settling_position_excursion:
+            interlock_error = MoveItExecutor._runtime_tare_arrival_interlock_error(self)
+            if interlock_error:
+                self._runtime_tare_fail(interlock_error)
+                return
+            if now - self._runtime_tare_started_at > arrival_budget_s:
+                self._runtime_tare_fail("approach arrival timed out: " + (pose_error or "arrival deadline exceeded"))
+                return
+            if not pose_ok and pose_error.startswith("actual TCP position error "):
+                self._runtime_tare_phase = "WAIT_APPROACH_ARRIVAL"
+                self._runtime_tare_quiet_started_at = 0.0
+                self._publish_painting_command("IDLE", 0.0, enable=False)
+                self._publish_free_space_confirmation(False)
+                return
+            if pose_ok:
+                self._runtime_tare_phase = phase = "SETTLING"
+                self._runtime_tare_phase_started_at = now
+                self._runtime_tare_quiet_started_at = 0.0
         if not pose_ok:
             self._runtime_tare_fail(pose_error)
             return
@@ -10015,7 +10872,13 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         for obj in self.cfg["objects"]:
             if not obj.get("enabled", True):
                 continue
-            if obj["name"] == self.active_target_name:
+            # An explicit static registry describes known physical fixture
+            # geometry, not the selected painting ROI. Keep its complete box
+            # (and declared padding) when ZED/D405 refines a smaller work area.
+            # Legacy nominal registries still require observed target geometry;
+            # task_scene/perception registries never contain a nominal target.
+            if (obj["name"] == self.active_target_name
+                    and self.cfg.get("active_target_source") != "static"):
                 dynamic_target = self._dynamic_target_collision_object(obj)
                 if dynamic_target is not None:
                     ps.world.collision_objects.append(dynamic_target)
@@ -10057,7 +10920,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
                     prim = SolidPrimitive()
                     prim.type = SolidPrimitive.BOX
                     prim.dimensions = [
-                        float(v) + 2.0 * WORLD_COLLISION_PADDING
+                        float(v) + 2.0 * _object_collision_padding(obj)
                         for v in obj["size"]
                     ]
                     pose = self._transform_xyz_quat_to_pose(
@@ -10067,7 +10930,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             else:
                 prim = SolidPrimitive()
                 prim.type = SolidPrimitive.BOX
-                padding = WORLD_COLLISION_PADDING
+                padding = _object_collision_padding(obj)
                 prim.dimensions = [
                     float(v) + 2.0 * padding for v in obj["size"]
                 ]
@@ -10251,7 +11114,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
 
         eoat_aco.object.operation = CollisionObject.ADD
         # 장착 플랜지 쪽 접촉만 허용. link5 는 손목 충돌을 잡기 위해 제외.
-        eoat_aco.touch_links = list(EOAT_TOUCH_LINKS)
+        eoat_aco.touch_links = list(getattr(self, "roller_tool_links", EOAT_TOUCH_LINKS))
         return eoat_aco
 
     def _dynamic_target_collision_object(self, obj):
@@ -11232,13 +12095,28 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             ):
                 return
             now = time.monotonic()
+            sim_deadline = getattr(
+                self, "_active_trajectory_sim_result_deadline", None
+            )
+            # Cancellation always uses steady wall time, including when the
+            # simulator clock is paused. Only a simulation goal's expected
+            # trajectory duration and result margin follow ROS time.
             watchdog_reason = follow_joint_watchdog_reason(
                 now_s=now,
-                result_deadline_s=self._active_trajectory_result_deadline,
+                result_deadline_s=(self._active_trajectory_result_deadline
+                                   if sim_deadline is None else 0.0),
                 cancel_requested=self._active_trajectory_cancel_requested,
                 cancel_deadline_s=self._active_trajectory_cancel_deadline,
                 abort_latched=self._motion_abort_requested,
             )
+            if not watchdog_reason and sim_deadline is not None:
+                watchdog_reason = follow_joint_watchdog_reason(
+                    now_s=self.get_clock().now().nanoseconds * 1e-9,
+                    result_deadline_s=sim_deadline,
+                    cancel_requested=False,
+                    cancel_deadline_s=0.0,
+                    abort_latched=self._motion_abort_requested,
+                )
             if watchdog_reason == "FJT_CANCEL_TIMEOUT":
                 self._latch_fjt_motion_unknown(
                     token, label, "FJT_CANCEL_TIMEOUT"
@@ -11302,7 +12180,12 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             if force_guard and self._ft_guard_triggered(label):
                 self._request_motion_abort(f"legacy FT guard triggered in {label}")
 
-        timer = self.create_timer(0.02, check_guard)
+        if getattr(self, "_active_trajectory_sim_result_deadline", None) is not None:
+            timer = self.create_timer(
+                0.02, check_guard, clock=Clock(clock_type=ClockType.STEADY_TIME)
+            )
+        else:
+            timer = self.create_timer(0.02, check_guard)
         timer_ref["timer"] = timer
         self._fjt_guard_timer = timer
 
@@ -11469,6 +12352,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         self._active_trajectory_cancel_requested = False
         self._active_trajectory_cancel_reason = ""
         self._active_trajectory_result_deadline = 0.0
+        self._active_trajectory_sim_result_deadline = None
         self._active_trajectory_cancel_deadline = 0.0
         if getattr(self, "_contact_search_cancel_token", None) is token:
             self._contact_search_cancel_on_contact = False
@@ -11552,6 +12436,15 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             + expected_duration_s
             + self.fjt_result_timeout_margin_s
         )
+        self._active_trajectory_sim_result_deadline = None
+        get_clock = getattr(self, "get_clock", None)
+        ros_clock = get_clock() if callable(get_clock) else None
+        if getattr(ros_clock, "ros_time_is_active", False):
+            self._active_trajectory_sim_result_deadline = (
+                ros_clock.now().nanoseconds * 1e-9
+                + expected_duration_s
+                + self.fjt_result_timeout_margin_s
+            )
         self._active_trajectory_cancel_deadline = 0.0
         try:
             send_future = self.traj_action_client.send_goal_async(goal)
@@ -11740,13 +12633,18 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         if surface_point is not None and surface_normal is not None:
             return surface_point, surface_normal
         if target is None:
-            target = get_target(self.cfg, self.active_target_name)
+            target = MoveItExecutor._active_target(self)
+        if target.get('source') in ('perception', 'task_scene'):
+            raise ValueError('dynamic target requires an observed surface')
         return get_surface_plane(target)
 
     def _active_ee_quat(self, target):
         if self._stage3_tcp_wps:
             q = self._stage3_tcp_wps[0].orientation
             return np.array([q.x, q.y, q.z, q.w], dtype=float)
+        if target.get('source') in ('perception', 'task_scene'):
+            _point, normal = MoveItExecutor._active_surface_plane(self, target)
+            return self._tcp_quat_for_surface_normal(normal)
         return ee_quat_for_target(target)
 
     def _offset_along_normal(self, pose, distance):
@@ -11920,7 +12818,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         target/n 은 caller 호환을 위해 yaml 에서 계속 반환 (offset_along_normal 에서 사용).
         Returns: (snapped_tip_wps, tcp_wps, target, n)
         """
-        target = get_target(self.cfg, self.active_target_name)
+        target = MoveItExecutor._active_target(self)
         _sp, n = self._active_surface_plane(target)
         snapped = [copy.deepcopy(wp) for wp in self.current_waypoints]
         densified = self._densify_waypoints(snapped, spacing_m=0.005)
@@ -11939,10 +12837,14 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         mean(waypoints) 에서 roller radius+clearance 를 빼 active target 의
         collision surface 를 normal 축 방향으로 갱신한다.
         """
+        if getattr(self, 'cfg', {}).get('active_target_source') is not None:
+            # Explicit registries describe either a known fixture or measured
+            # geometry. Commanded waypoints cannot relocate either one.
+            return
         if getattr(self, "process_mode", "paint") == "spray" or not waypoints:
             return
         try:
-            target = get_target(self.cfg, self.active_target_name)
+            target = MoveItExecutor._active_target(self)
         except Exception as e:
             self.get_logger().warn(f"active target lookup 실패: {e}")
             return
@@ -12003,7 +12905,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             norm = float(np.linalg.norm(normal))
             if norm > 1e-6:
                 return normal / norm
-        _plane_point, normal = get_surface_plane(target)
+        _plane_point, normal = MoveItExecutor._active_surface_plane(self, target)
         normal = np.asarray(normal, dtype=float)
         return normal / (np.linalg.norm(normal) + 1e-12)
 
@@ -12358,10 +13260,15 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         future.add_done_callback(self._stage1_ik_done)
 
     def _stage1_candidate_joint_metrics(
-        self, solution_joint_state, seed_state=None
+        self, solution_joint_state, seed_state=None, *,
+        joint_goal_tolerance=STAGE1_JOINT_GOAL_TOL,
     ):
         """Validate/canonicalize one IK result and return deterministic costs."""
 
+        if getattr(self,"process_mode","paint")=="spray":
+            # Reuse the existing precise IK-goal bound: a 0.02 rad OMPL region
+            # can place the spray TCP centimetres from its nominal entry pose.
+            joint_goal_tolerance=min(joint_goal_tolerance,D405_PREFLIGHT_JOINT_GOAL_TOL_RAD)
         if seed_state is None:
             seed_state = self._stage1_ik_seed_state
         required = tuple(getattr(self, 'arm_joint_names', READY_POSE_JOINTS))
@@ -12410,8 +13317,8 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             joint_constraint = JointConstraint()
             joint_constraint.joint_name = str(name)
             joint_constraint.position = float(goal)
-            joint_constraint.tolerance_above = STAGE1_JOINT_GOAL_TOL
-            joint_constraint.tolerance_below = STAGE1_JOINT_GOAL_TOL
+            joint_constraint.tolerance_above = float(joint_goal_tolerance)
+            joint_constraint.tolerance_below = float(joint_goal_tolerance)
             joint_constraint.weight = 1.0
             constraints.joint_constraints.append(joint_constraint)
         return {
@@ -12440,6 +13347,9 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         self._stage1_ik_candidate_results = {}
         self._stage1_ik_candidates_finalized_generation = -1
         self._stage1_ik_seed_state = copy.deepcopy(self.current_joint_state)
+        if any(c.get("complete_spray_preflight") for c in self._stage1_orientation_candidates):
+            self._stage1_orientation_candidates = tuple(self._spray_ik_seed_candidates(
+                self._stage1_orientation_candidates, self._stage1_ik_seed_state))
         candidate_count = len(self._stage1_orientation_candidates)
 
         for index, candidate in enumerate(self._stage1_orientation_candidates):
@@ -12450,6 +13360,9 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             req.ik_request.robot_state.joint_state = copy.deepcopy(
                 self._stage1_ik_seed_state
             )
+            overrides = candidate.get("ik_seed_positions", {})
+            seed = req.ik_request.robot_state.joint_state
+            seed.position = [overrides.get(name, value) for name, value in zip(seed.name, seed.position)]
             req.ik_request.robot_state.is_diff = False
             # This evaluates the complete MoveIt robot state, including the
             # D405, AFT cable guard and EOAT collision geometry in the URDF.
@@ -12504,7 +13417,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             self._finish_stage1_orientation_candidate_iks(generation, token)
 
         self._stage1_ik_candidate_timer = self.create_timer(
-            STAGE1_DUAL_IK_RESPONSE_TIMEOUT_S,
+            max(STAGE1_DUAL_IK_RESPONSE_TIMEOUT_S, candidate_count * STAGE1_IK_TIMEOUT_S + 1.),
             timeout_candidates,
         )
         self.get_logger().info(
@@ -12634,8 +13547,12 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
                 for index in range(len(self._stage1_orientation_candidates))
             )
             self._fail_stage1_before_motion(
-                "NO_COLLISION_FREE_ROLLER_ORIENTATION:" + reasons
+                ("NO_COLLISION_FREE_SPRAY_ORIENTATION:" if getattr(self,"process_mode","paint")=="spray"
+                 else "NO_COLLISION_FREE_ROLLER_ORIENTATION:") + reasons
             )
+            return
+        if any(record["candidate"].get("complete_spray_preflight") for record in valid):
+            self._preflight_spray_orientation_paths(valid, generation, token)
             return
         self._activate_stage1_orientation_rank(0)
 
@@ -12676,7 +13593,8 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             )
             return self._activate_stage1_orientation_rank(next_index)
         self._fail_stage1_before_motion(
-            "ALL_ROLLER_ORIENTATION_PLANS_REJECTED:" + str(reason)
+            ("ALL_SPRAY_ORIENTATION_PLANS_REJECTED:" if getattr(self,"process_mode","paint")=="spray"
+             else "ALL_ROLLER_ORIENTATION_PLANS_REJECTED:") + str(reason)
         )
         return False
 
@@ -12706,7 +13624,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             resp.solution.joint_state)
         joint_goal = self._make_joint_goal_constraints(
             resp.solution.joint_state,
-            tolerance=STAGE1_JOINT_GOAL_TOL,
+            tolerance=(D405_PREFLIGHT_JOINT_GOAL_TOL_RAD if getattr(self,"process_mode","paint")=="spray" else STAGE1_JOINT_GOAL_TOL),
             joint_names=list(getattr(self, 'arm_joint_names', READY_POSE_JOINTS)),
         )
         if not joint_goal.joint_constraints:
@@ -13061,7 +13979,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             )
             return
 
-        target = get_target(self.cfg, self.active_target_name)
+        target = MoveItExecutor._active_target(self)
         _, n = self._active_surface_plane(target)
 
         req = GetCartesianPath.Request()
@@ -13231,6 +14149,11 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
 
     # ---- Stage 3: Cartesian path 계획 + 실행 --------------------------------
     def plan_cartesian(self):
+        task_scene_reason = MoveItExecutor._task_scene_blocker(self)
+        if task_scene_reason:
+            self.get_logger().error(task_scene_reason)
+            self.executing = False
+            return
         if not self.cartesian_client.wait_for_service(timeout_sec=5.0):
             self.get_logger().error("/compute_cartesian_path 서비스 없음")
             return
@@ -13238,7 +14161,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
         # 새 perception 흐름: sketch_to_waypoints_node 가 이미 wall_plane 좌표를
         # roller center contact-clearance plane 으로 변환해서 보냄.
         # target/n 은 OrientationConstraint 계산을 위해 아래에서 계속 yaml 에서 받음.
-        target = get_target(self.cfg, self.active_target_name)
+        target = MoveItExecutor._active_target(self)
         _sp, n = self._active_surface_plane(target)
         snapped = self._stage3_tip_wps or [
             copy.deepcopy(wp) for wp in self.current_waypoints
@@ -13381,7 +14304,7 @@ class MoveItExecutor(WeldExecutionMixin, ZedSprayExecutionMixin, SprayExecutionM
             )
             return
 
-        target = get_target(self.cfg, self.active_target_name)
+        target = MoveItExecutor._active_target(self)
         _, n = self._active_surface_plane(target)
 
         req = GetCartesianPath.Request()

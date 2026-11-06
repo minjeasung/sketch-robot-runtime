@@ -1,0 +1,5 @@
+# Pure Python mesh decoder shared by API asset generation and ROS execution.
+# Install with --no-deps: ROS owns its system NumPy/SciPy ABI.
+trimesh==5.1.1
+# RB10 generated URDF visual meshes use COLLADA; system python-dateutil is kept.
+pycollada==0.9.3

@@ -124,3 +124,11 @@
 .seam-row { display:flex; align-items:center; flex-wrap:wrap; gap:6px; padding:8px 0; }
 .seam-row label { flex:1; font-size:13px; }
 .seam-row button { padding:4px 6px; font-size:12px; }
+
+/* Stage-specific panels must stay hidden even when layout uses flex/grid. */
+[hidden] { display: none !important; }
+#workflow-stage-reason { min-height: 1.4em; overflow-wrap: anywhere; }
+#btn-workflow-next { margin: 0.6rem 0; }
+#weld-seam-list .seam-row { display: flex; flex-wrap: wrap; gap: 0.5rem; padding: 0.6rem 0; }
+#weld-seam-list label { flex: 1 1 180px; }
+#workflow-validation-scope, #workflow-ready-detail { overflow-wrap: anywhere; }

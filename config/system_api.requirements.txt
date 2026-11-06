@@ -13,3 +13,8 @@ typing_extensions==4.16.0
 uvicorn==0.53.0
 wsproto==1.2.0
 websockets==15.0.1
+# In-process runtime asset generation; Isaac/ROS remain separately installed.
+numpy==1.26.4
+scipy==1.11.4
+PyYAML==6.0.1
+-r platform_ros.requirements.txt

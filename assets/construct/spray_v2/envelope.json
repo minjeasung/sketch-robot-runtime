@@ -1,0 +1,10 @@
+{
+  "profile_id": "spray_v2_original_cad_cone",
+  "source_file": "EOAT ass_y_ROBOI_Sharing_v2 (2).stp",
+  "source_sha256": "b8c4d8ce18572932fde019faf4b55f5a9289acf5d324d5dcc1a68006abba73b9",
+  "basis": "nozzle_tcp_+z",
+  "axial_start_m": -0.002,
+  "start_radius_m": 0.003,
+  "length_m": 0.5,
+  "end_radius_m": 0.3
+}

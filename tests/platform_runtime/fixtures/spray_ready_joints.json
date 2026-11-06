@@ -1,0 +1,16 @@
+{
+  "left_manipulator_joint1": 0.00010107029811479151,
+  "right_manipulator_joint1": 3.1399528980255127,
+  "robot_head_rev_joint1": 5.989837745801196e-07,
+  "left_manipulator_joint2": -0.777748703956604,
+  "right_manipulator_joint2": 0.3146592080593109,
+  "robot_head_rev_joint2": 3.7249373008307884e-07,
+  "left_manipulator_joint3": -1.5710229873657227,
+  "right_manipulator_joint3": 1.4314273595809937,
+  "left_manipulator_joint4": 0.0007338735740631819,
+  "right_manipulator_joint4": 1.100281000137329,
+  "left_manipulator_joint5": -0.7767623066902161,
+  "right_manipulator_joint5": 0.26180264353752136,
+  "left_manipulator_joint6": 0.000627568457275629,
+  "right_manipulator_joint6": 2.897249937057495
+}

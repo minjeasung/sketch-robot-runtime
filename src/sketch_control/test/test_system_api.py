@@ -36,7 +36,15 @@ def make_supervisor(tmp_path, commands=None):
 
 
 @pytest.fixture
-def supervisor(tmp_path):
+def supervisor(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    import sketch_control.process_supervisor as module
+    # These subprocesses only sleep/print; they do not bind ROS bridge ports.
+    # Isolate the one host TCP probe without replacing graph/dependency guards
+    # or touching the global socket module used by asyncio/TestClient.
+    probe=MagicMock();probe.__enter__.return_value=probe;probe.connect_ex.return_value=111
+    monkeypatch.setattr(module,'socket',SimpleNamespace(socket=lambda:probe))
     return make_supervisor(tmp_path)
 
 
@@ -321,3 +329,38 @@ def test_zed_preview_cannot_start_robot_process_via_api(client):
     assert result.status_code == 200, result.text
     for name in ('robot_control', 'force_pipeline', 'executor'):
         assert client.post(f'/processes/{name}/start').status_code == 404
+
+
+def test_dummy_supervisor_does_not_probe_live_host_ports(supervisor,monkeypatch):
+    import socket
+    def forbidden(*args):
+        raise AssertionError('dummy subprocess test queried a live host port')
+    monkeypatch.setattr(socket.socket,'connect_ex',forbidden)
+    supervisor.preflight('rosbridge')
+
+
+def test_occupied_rosbridge_port_still_rejects_start(supervisor,monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    import sketch_control.process_supervisor as module
+    probe=MagicMock();probe.__enter__.return_value=probe;probe.connect_ex.return_value=0
+    monkeypatch.setattr(module,'socket',SimpleNamespace(socket=lambda:probe))
+    with pytest.raises(SupervisorError,match='already occupied'):
+        supervisor.preflight('rosbridge')
+    probe.connect_ex.assert_called_once_with(('127.0.0.1',9090))
+
+
+def test_api_installer_declares_asset_generation_dependencies():
+    import re
+    root=Path(__file__).resolve().parents[3]
+    requirements=(root/'config/system_api.requirements.txt').read_text()
+    # This explicit local include is shared with the system-Python ROS installer.
+    # Do not resolve arbitrary requirement URLs or execute installer directives.
+    assert '-r platform_ros.requirements.txt' in requirements.splitlines()
+    requirements+='\n'+(root/'config/platform_ros.requirements.txt').read_text()
+    pinned={match.group(1).lower():match.group(2) for line in requirements.splitlines()
+            if (match:=re.fullmatch(r'([A-Za-z0-9_-]+)==([^\s]+)',line.strip()))}
+    # These are imported in-process by generate_assets before the isolated Isaac
+    # USD importer starts; system-site-packages availability is not an install contract.
+    assert {name:pinned.get(name) for name in ('numpy','scipy','pyyaml','trimesh')}=={
+        'numpy':'1.26.4','scipy':'1.11.4','pyyaml':'6.0.1','trimesh':'5.1.1'}

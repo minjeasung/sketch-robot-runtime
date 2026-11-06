@@ -365,7 +365,7 @@ def generate_launch_description():
         executable="target_selector",
         name="target_selector",
         output="screen",
-        parameters=[{"zed_image_reliable": ParameterValue(
+        parameters=[painting_config_file, {"zed_image_reliable": ParameterValue(
             LaunchConfiguration("zed_image_reliable"), value_type=bool)}],
     )
 

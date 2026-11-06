@@ -4,10 +4,12 @@ The hardware adapter is deliberately external. It must independently expire ON
 commands, default OFF on disconnect, and report actual output acknowledgement.
 """
 import json
+import math
 import time
 import uuid
 from std_msgs.msg import Bool, String
 from rclpy.qos import QoSProfile, DurabilityPolicy
+from rclpy.clock import Clock, ClockType
 from rcl_interfaces.msg import ParameterDescriptor
 
 
@@ -42,12 +44,24 @@ class SprayExecutionMixin:
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.process_mode_pub = self.create_publisher(String, '/painting_system/process_mode', latched)
         self.spray_command_pub = self.create_publisher(String, '/spray_gun/command', 1)
+        # This separate telemetry channel never enables the physical gun or
+        # fabricates its acknowledgement. Only simulated motion tests expose it.
+        simulated = self.has_parameter('use_sim_time') and self.get_parameter('use_sim_time').value is True
+        self._spray_visual_pub = (self.create_publisher(String, '/painting_system/spray_visualization', 1)
+                                  if simulated and self._is_spray_motion_test() else None)
         self.create_subscription(String, '/painting_system/set_process_mode', self._set_process_mode, 10)
         self.create_subscription(String, '/spray_gun/status', self._on_spray_status, 1)
         self.create_subscription(Bool, '/admittance_controller/compliance_active', self._on_spray_compliance, 1)
-        self.create_timer(.05, self._spray_tick)
-        self.create_timer(.25, self._publish_process_mode)
+        self._start_spray_timers()
         self._publish_process_mode()
+
+    def _start_spray_timers(self):
+        # Output leases and compliance freshness are wall-time contracts.
+        # This does not renew measured feedback: _spray_tick still checks it.
+        self._spray_timer = self.create_timer(
+            .05, self._spray_tick, clock=Clock(clock_type=ClockType.STEADY_TIME))
+        self._process_mode_timer = self.create_timer(
+            .25, self._publish_process_mode, clock=Clock(clock_type=ClockType.STEADY_TIME))
 
     def _is_spray(self):
         return getattr(self, 'process_mode', 'paint') == 'spray'
@@ -147,6 +161,18 @@ class SprayExecutionMixin:
         return tuple(blockers)
 
     def _spray_set_output(self, enabled):
+        visual = getattr(self, '_spray_visual_pub', None)
+        if visual is not None:
+            path = getattr(self, '_active_segment_path', None)
+            active = bool(enabled and self._is_spray() and self._is_spray_motion_test()
+                          and not self.dry_run and self.executing and self._spray_dispatch
+                          and self._active_trajectory_goal_handle is not None
+                          and not self._motion_abort_requested and path is not None)
+            visual.publish(String(data=json.dumps(dict(
+                enabled=active, simulation_only=True, lease_ms=250,
+                session_id=self._spray_session,
+                timestamp_ns=int(self.get_clock().now().nanoseconds),
+                path_id=getattr(path, 'path_id', ''), plan_hash=getattr(path, 'plan_hash', '')))))
         enabled = bool(enabled and not self.dry_run and self._is_spray()
                        and not self._is_spray_motion_test())
         if enabled != self._spray_on:
@@ -182,6 +208,33 @@ class SprayExecutionMixin:
             self._spray_off()
             self._request_motion_abort(','.join(blockers))
 
+    def _spray_arrival_reason(self, target, *, require_stationary=True):
+        """Fresh measured TCP arrival before output; no nominal pose is evidence."""
+        now=time.monotonic()
+        received=float(getattr(self,'current_joint_state_time',0.))
+        if (getattr(self,'current_joint_state',None) is None or not math.isfinite(received)
+                or received<=0 or not 0<=now-received<=.20):
+            return 'SPRAY_ENTRY_JOINT_STATE_STALE'
+        sample,reason=self._runtime_tare_tcp_pose_sample()
+        if sample is None: return 'SPRAY_ENTRY_TF_INVALID:'+reason
+        try:
+            xyz,quat,_age=sample
+            expected=[target.position.x,target.position.y,target.position.z]
+            desired=[target.orientation.x,target.orientation.y,target.orientation.z,target.orientation.w]
+            if len(xyz)!=3 or len(quat)!=4 or not all(math.isfinite(float(v)) for v in [*xyz,*quat,*expected,*desired]):
+                return 'SPRAY_ENTRY_POSE_INVALID'
+            norm=math.sqrt(sum(float(v)**2 for v in quat));desired_norm=math.sqrt(sum(v*v for v in desired))
+            if norm<1e-8 or desired_norm<1e-8:return 'SPRAY_ENTRY_POSE_INVALID'
+            distance=math.sqrt(sum((float(a)-b)**2 for a,b in zip(xyz,expected)))
+            angle=2*math.acos(min(1.,abs(sum(float(a)*b for a,b in zip(quat,desired))/(norm*desired_norm))))
+            # Entry is stricter than the process probe's 10 mm / 5 degree band;
+            # approach correction and settling must finish with output OFF.
+            if distance>.005:return 'SPRAY_ENTRY_POSITION_ERROR'
+            if angle>math.radians(1.):return 'SPRAY_ENTRY_ORIENTATION_ERROR'
+        except (TypeError,ValueError,OverflowError):return 'SPRAY_ENTRY_POSE_INVALID'
+        if require_stationary and not self._robot_stationary_for_bias():return 'SPRAY_ENTRY_NOT_STATIONARY'
+        return ''
+
     def _spray_execute_step(self, step):
         self._spray_off()
         self._publish_painting_command('IDLE', 0., enable=False)
@@ -189,9 +242,11 @@ class SprayExecutionMixin:
             self._complete_process_step()
             return
         started = time.monotonic()
+        snapshot=getattr(self,'_execution_snapshot',None);step_index=self._process_step_index
         def wait_off():
             if self._motion_abort_requested or not self.executing:
                 return
+            if snapshot is not getattr(self,'_execution_snapshot',None) or step_index!=self._process_step_index:return
             blockers = self._spray_motion_blockers()
             if blockers:
                 if time.monotonic()-started > 1.:
@@ -199,6 +254,12 @@ class SprayExecutionMixin:
                 else:
                     self._schedule_process_once(.05, wait_off)
                 return
+            if step.mode=='SPRAY':
+                reason=self._spray_arrival_reason(self._process_row_tcp_poses[step.rows[0].row_number])
+                if reason:
+                    if time.monotonic()-started>=5.:self._request_motion_abort(reason)
+                    else:self._schedule_process_once(.05,wait_off,steady=True)
+                    return
             self._transition_execution_state(step.mode, 'non-contact spray path')
             self._plan_process_motion_step(step)
         wait_off()

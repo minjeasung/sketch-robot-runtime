@@ -5,10 +5,11 @@ const {loadUI} = require('./ui_harness.js');
 
 test('control socket retries startup failure and unlocks sketch only after mode acknowledgement', async () => {
   const ui = loadUI();
+  const initialConnections = ui.ros.connectCalls?.length || 0;
   ui.ros.emit('error');
   ui.ros.emit('close');
   ui.runTimers(1500);
-  assert.equal(ui.ros.connectCalls?.length, 1);
+  assert.equal(ui.ros.connectCalls?.length, initialConnections + 1);
   ui.ros.emit('connection');
   await ui.previewFrame('/zed/zed_node/rgb/color/rect/image');
   await ui.rectangle();
@@ -22,24 +23,26 @@ test('control socket retries startup failure and unlocks sketch only after mode 
 
 test('duplicate control failures schedule one retry and successful connection cancels it', () => {
   const ui = loadUI();
+  const initialConnections = ui.ros.connectCalls?.length || 0;
   ui.ros.emit('error');
   ui.ros.emit('close');
   ui.ros.emit('close');
   ui.runTimers(1500);
-  assert.equal(ui.ros.connectCalls?.length, 1);
+  assert.equal(ui.ros.connectCalls?.length, initialConnections + 1);
   ui.ros.emit('close');
   ui.ros.emit('connection');
   ui.runTimers(1500);
-  assert.equal(ui.ros.connectCalls?.length, 1);
+  assert.equal(ui.ros.connectCalls?.length, initialConnections + 1);
 });
 
 test('control reconnect invalidates old mode and plan until new backend acknowledgement', () => {
   const ui = loadUI();
+  const initialConnections = ui.ros.connectCalls?.length || 0;
   ui.ros.emit('connection');
   ui.emit('/painting_system/process_mode', {mode:'paint'});
   ui.ros.emit('close');
   ui.runTimers(1500);
-  assert.equal(ui.ros.connectCalls?.length, 1);
+  assert.equal(ui.ros.connectCalls?.length, initialConnections + 1);
   ui.ros.emit('connection');
   assert.equal(ui.evaluate('processModePending'), true);
   assert.equal(ui.element('btn-run-robot').disabled, true);

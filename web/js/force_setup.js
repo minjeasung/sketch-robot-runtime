@@ -1,6 +1,6 @@
 // sketch_robot Force Setup UI - camera-derived surface normal + F/T target setup.
 
-const WS_URL = `ws://${window.location.hostname || "localhost"}:9090`;
+let WS_URL = `ws://${window.location.hostname || "localhost"}:9090`;
 
 const SCAN_TRIGGER_TOPIC = "/perception/scan_trigger";
 const PLANES_TOPIC = "/perception/planes";
@@ -152,7 +152,7 @@ function clonePoseWithNormal(pose, normal) {
   };
 }
 
-const ros = new ROSLIB.Ros({ url: WS_URL });
+const ros = new ROSLIB.Ros();
 
 ros.on("connection", () => {
   setStatus("connected", "connected");
@@ -1082,3 +1082,33 @@ renderPlaneList();
 subscribeView(currentView);
 updateSurfacePanel();
 updateForceSetupPanel();
+
+// Resolve the supervisor's transport before connecting to an existing ROS graph.
+async function connectOwnedRosTransport() {
+  let port = 9090;
+  try {
+    if (typeof fetch === 'function') {
+      const response = await fetch(new URL('/runtime-connection', window.location.href));
+      if (response.ok) {
+        const config = await response.json();
+        if (config.rosbridge_port !== undefined) {
+          if (!Number.isInteger(config.rosbridge_port) || config.rosbridge_port < 1 || config.rosbridge_port > 65535) {
+            throw new Error('Invalid ROS WebSocket port');
+          }
+          port = config.rosbridge_port;
+        }
+      } else if (response.status !== 404) {
+        throw new Error('ROS connection configuration is unavailable');
+      }
+    }
+    WS_URL = `ws://${window.location.hostname || "localhost"}:${port}`;
+    $("ws-url").textContent = WS_URL;
+    ros.connect(WS_URL);
+
+  } catch (error) {
+    setStatus('error', 'error');
+    logEvent(error.message);
+    setTimeout(connectOwnedRosTransport, 1000);
+  }
+}
+connectOwnedRosTransport();

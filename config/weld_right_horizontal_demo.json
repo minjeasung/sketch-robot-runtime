@@ -1,0 +1,15 @@
+{
+  "speed_mps": 0.01,
+  "approach_m": 0.12,
+  "retreat_m": 0.02,
+  "standoff_m": 0.015,
+  "work_angle_deg": 0.0,
+  "travel_angle_deg": 0.0,
+  "weave_enabled": true,
+  "width_m": 0.004,
+  "frequency_hz": 1.0,
+  "left_dwell_s": 0.0,
+  "right_dwell_s": 0.0,
+  "current_a": 100.0,
+  "pose_profile_id": ""
+}

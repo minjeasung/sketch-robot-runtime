@@ -35,6 +35,14 @@ def test_isaac_sim_uses_zed2i_not_zedx_asset():
     assert "ZED_2i.usdc" in script
     assert "/base_link/ZED_2i/CameraLeft" in script
     assert "/base_link/ZED_2i/CameraRight" in script
-    assert "/base_link/ZED_2i/Imu_Sensor" in script
+    # Resolve the two literal suffixes; the IMU path is now composed in code.
+    import ast
+    values = {'CAMERA_PATH': '/World/Camera'}
+    for statement in ast.parse(script).body:
+        if isinstance(statement, ast.Assign) and len(statement.targets)==1:
+            name = getattr(statement.targets[0], 'id', '')
+            if name in ('IMU_PARENT_PATH', 'IMU_PRIM_PATH'):
+                values[name] = eval(compile(ast.Expression(statement.value), '<imu-path>', 'eval'), {'__builtins__': {}}, values)
+    assert values['IMU_PRIM_PATH'].endswith('/base_link/ZED_2i/Imu_Sensor')
     assert "ZED_X.usdc" not in script
     assert "/base_link/ZED_X/" not in script

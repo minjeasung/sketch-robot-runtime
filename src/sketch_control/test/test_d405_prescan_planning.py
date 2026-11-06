@@ -849,3 +849,98 @@ def test_surface_offset_and_source_handoff_are_real_scene_changes(monkeypatch):
     assert node._scene_revision == 3
     assert node.scene_confirmed is False
     assert node.scene_initialized is False
+
+
+def test_d405_moveit_goal_is_precise_without_changing_general_stage1_default():
+    node, ik, move, finalized, logger = _dual_ik_executor()
+    seed = _joint_state([0.0] * 6)
+    metrics, reason = node._stage1_candidate_joint_metrics(_joint_state([0.1] * 6), seed_state=seed)
+    assert reason == ''
+    assert all(j.tolerance_above == 0.02 and j.tolerance_below == 0.02
+               for j in metrics['constraints'].joint_constraints)
+    node._request_d405_orientation_candidate_iks('D405_PRESCAN_1', node._d405_prescan_queue[0], finalized.append)
+    ik.futures[0].resolve(_ik_response([0.1] * 6))
+    ik.futures[1].resolve(_ik_response([0.2] * 6))
+    assert len(move.goals) == 1
+    constraints = move.goals[0].request.goal_constraints[0].joint_constraints
+    assert len(constraints) == 6
+    assert all(j.tolerance_above == 1e-4 and j.tolerance_below == 1e-4 for j in constraints)
+
+
+@pytest.mark.parametrize('drift', [math.radians(1.1), 0.001])
+def test_d405_rejects_planned_endpoint_drift_allowed_by_general_stage1(drift):
+    node, ik, move, finalized, logger = _dual_ik_executor()
+    goal = _joint_state([0.1] * 6)
+    endpoint = [0.1] * 6
+    endpoint[-1] += drift
+    record = dict(joint_state=goal, candidate=dict(name='precision_case', poses=[_pose(1.052, -.337, 1.057)]))
+    valid, reason = moveit_executor.MoveItExecutor._d405_plan_endpoint_matches_ik(
+        node, _trajectory([[0.0] * 6, endpoint]), record,
+        tolerance_rad=1.01e-4, diagnostic_label='D405')
+    assert not valid and reason == f'ENDPOINT_MISMATCH:{goal.name[-1]}'
+
+
+def test_d405_precise_endpoint_logs_requested_tcp_ik_and_planned_values():
+    import json
+    node, ik, move, finalized, logger = _dual_ik_executor()
+    goal = _joint_state([0.1] * 6)
+    endpoint = [0.1] * 6
+    endpoint[-1] += 5e-5
+    record = dict(joint_state=goal, candidate=dict(name='precision_case', poses=[_pose(1.052, -.337, 1.057)]))
+    valid, reason = moveit_executor.MoveItExecutor._d405_plan_endpoint_matches_ik(
+        node, _trajectory([[0.0] * 6, endpoint]), record,
+        tolerance_rad=1.01e-4, diagnostic_label='D405')
+    assert valid and reason == ''
+    diagnostic = next(line for line in logger.infos if line.startswith('[D405 PLANNED ENDPOINT] '))
+    payload = json.loads(diagnostic.split('] ', 1)[1])
+    assert payload['requested_tcp']['position'] == pytest.approx([1.052, -.337, 1.057])
+    assert payload['ik_positions'] == pytest.approx(goal.position)
+    assert payload['planned_positions'] == pytest.approx(endpoint)
+    assert payload['max_abs_error_rad'] == pytest.approx(5e-5)
+    assert payload['allowed_error_rad'] == pytest.approx(1.01e-4)
+
+
+def test_shared_stage1_endpoint_validation_preserves_original_tolerance():
+    node, ik, move, finalized, logger = _dual_ik_executor()
+    goal = _joint_state([0.1] * 6)
+    endpoint = [0.1] * 6
+    endpoint[-1] += math.radians(1.1)
+    record = dict(joint_state=goal, candidate=dict(name='general_stage1'))
+    valid, reason = moveit_executor.MoveItExecutor._d405_plan_endpoint_matches_ik(
+        node, _trajectory([[0.0] * 6, endpoint]), record)
+    assert valid and reason == ''
+
+
+def test_d405_planning_result_applies_precise_endpoint_gate_before_dispatch():
+    node, ik, move, finalized, logger = _dual_ik_executor()
+    _bind(node, '_d405_plan_endpoint_matches_ik')
+    node._request_d405_orientation_candidate_iks('D405_PRESCAN_1', node._d405_prescan_queue[0], finalized.append)
+    ik.futures[0].resolve(_ik_response([0.1] * 6))
+    ik.futures[1].resolve(_ik_response([0.2] * 6))
+    rejected = []
+    node._try_next_d405_orientation_rank = lambda context, reason: rejected.append(reason)
+    node._d405_prescan_trajectory_is_safe = lambda *_args: pytest.fail('drifted endpoint must not proceed to dispatch')
+    endpoint = [0.1] * 6
+    endpoint[-1] += 0.001
+    result = SimpleNamespace(error_code=SimpleNamespace(val=1),
+        planned_trajectory=_trajectory([[0.0] * 6, endpoint]))
+    moveit_executor.MoveItExecutor._d405_orientation_plan_result(node,
+        SimpleNamespace(result=lambda: SimpleNamespace(result=result)), node._d405_orientation_context, 0)
+    assert rejected == [f'ENDPOINT_MISMATCH:{list(moveit_executor.READY_POSE_JOINTS)[-1]}']
+
+
+def test_work_area_measurement_pose_rejection_publishes_terminal_failed_status():
+    statuses = []
+    node = SimpleNamespace(
+        current_joint_state=_joint_state([0.] * 6),
+        dynamic_surface_point=np.array([0., 0., 1.]),
+        dynamic_surface_normal=np.array([0., 0., -1.]),
+        dynamic_work_area_corners=np.zeros((4, 3)),
+        _work_area_refine_previous_corner_signature=None,
+        _cancel_work_area_refine_wait_timer=lambda: None,
+        _publish_work_area_refine_status=lambda status, **details: statuses.append((status, details)),
+        _begin_d405_prescan=lambda mode: False,
+        get_logger=lambda: _Logger(),
+    )
+    moveit_executor.MoveItExecutor._try_begin_work_area_refine(node)
+    assert statuses[-1] == ('failed', {'reason': 'D405_APPROACH_UNAVAILABLE'})

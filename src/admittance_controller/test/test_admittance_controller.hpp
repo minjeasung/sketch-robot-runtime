@@ -70,6 +70,7 @@ class TestableAdmittanceController : public admittance_controller::AdmittanceCon
   FRIEND_TEST(AdmittanceControllerTest, check_frame_ids_in_controller_state);
   FRIEND_TEST(AdmittanceControllerTest, damping_absolute_overrides_ratio_per_axis);
   FRIEND_TEST(AdmittanceControllerTest, damping_defaults_to_the_ratio_derivation);
+  FRIEND_TEST(AdmittanceControllerTest, simulation_zero_period_holds_last_command);
 
 public:
   CallbackReturn on_init() override

@@ -123,3 +123,57 @@ test('Stop remains callable while Start awaits managed simulation readiness', as
   ui.evaluate('finishPrepare()');
   await starting;
 });
+
+test('RB20 painting Isaac locks native simulated inputs and sends the fixed painting profile', async () => {
+  const {ui, requests} = await supervisor();
+  ui.element('profile').value = 'isaac_rb20_paint';
+  await ui.element('profile').fire('change');
+  assert.equal(ui.element('model-id').value, 'rb20_1900es');
+  assert.equal(ui.element('process-mode').value, 'paint');
+  assert.equal(ui.element('camera-backend').value, 'native');
+  for (const id of ['model-id', 'process-mode', 'robot-ip', 'zed', 'd405', 'camera-backend']) {
+    assert.equal(ui.element(id).disabled, true);
+  }
+  assert.equal(ui.element('zed').checked, false);
+  assert.equal(ui.element('d405').checked, false);
+  assert.equal(ui.element('outpost-settings').hidden, true);
+  assert.match(ui.element('profile-help').textContent, /시뮬레이션/);
+  await ui.element('start').fire('click');
+  const config = JSON.parse(requests.find(r => r.url === '/configuration').body);
+  assert.equal(config.profile, 'isaac_rb20_paint');
+  assert.equal(config.model_id, 'rb20_1900es');
+  assert.equal(config.process_mode, 'paint');
+  assert.equal(config.camera_backend, 'native');
+  assert.equal(config.launch_zed_driver, false);
+  assert.equal(config.launch_d405_driver, false);
+});
+
+test('saved RB20 painting environment is identified as simulation', async () => {
+  const {ui, state} = await supervisor({profile: 'isaac_rb20_paint', model_id: 'rb20_1900es'});
+  state.runtime = {simulation: true};
+  await ui.evaluate('refresh()');
+  assert.match(ui.element('detail').textContent, /시뮬레이션/);
+  assert.equal(ui.element('model-id').value, 'rb20_1900es');
+  assert.equal(ui.element('process-mode').disabled, true);
+});
+test('running legacy RB20 is shown in the basic applied summary with its exact model identity', async()=>{
+ const {ui,state}=await supervisor({profile:'isaac_rb20_paint',model_id:'rb20_1900es'});
+ state.processes[0].pid=123;
+ await ui.evaluate('refresh()');
+ assert.match(ui.element('runtime-applied').textContent,/RB20-1900ES/);
+ assert.doesNotMatch(ui.element('runtime-applied').textContent,/RB10/);
+});
+
+test('basic readiness stays concise while full diagnostics remain available',async()=>{
+ const {ui,state}=await supervisor();
+ state.ros.readiness={ready:false,running:false,abort_reason:'motion_abort',checks:{long_identifier:'x'.repeat(4000)}};
+ await ui.evaluate('refresh()');
+ assert.equal(ui.element('readiness').textContent,'작업 중단 상태 · 고급 설정 / 진단에서 상세 상태를 확인하세요.');
+ assert.match(ui.element('status-json').textContent,/long_identifier/);
+ state.ros.readiness={ready:true,running:false};await ui.evaluate('refresh()');
+ assert.equal(ui.element('readiness').textContent,'작업 준비됨');
+ state.ros.readiness={ready:false,running:true};await ui.evaluate('refresh()');
+ assert.equal(ui.element('readiness').textContent,'작업 실행 중');
+ state.ros.readiness={ready:false,running:false};await ui.evaluate('refresh()');
+ assert.equal(ui.element('readiness').textContent,'작업 준비되지 않음 · 고급 설정 / 진단에서 상세 상태를 확인하세요.');
+});

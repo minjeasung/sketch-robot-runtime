@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Simulation-only, loopback UDP. Jazzy LOCALHOST discovery adds SHM itself,
+     so the paired environment helper must select SYSTEM_DEFAULT discovery. -->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>rb20_loopback_udp</transport_id>
+      <type>UDPv4</type>
+      <interfaceWhiteList>
+        <address>127.0.0.1</address>
+      </interfaceWhiteList>
+      <maxInitialPeersRange>64</maxInitialPeersRange>
+    </transport_descriptor>
+  </transport_descriptors>
+  <participant profile_name="rb20_painting_loopback" is_default_profile="true">
+    <rtps>
+      <userTransports>
+        <transport_id>rb20_loopback_udp</transport_id>
+      </userTransports>
+      <useBuiltinTransports>false</useBuiltinTransports>
+      <builtin>
+        <metatrafficUnicastLocatorList>
+          <locator><udpv4><address>127.0.0.1</address></udpv4></locator>
+        </metatrafficUnicastLocatorList>
+        <initialPeersList>
+          <locator><udpv4><address>127.0.0.1</address></udpv4></locator>
+        </initialPeersList>
+      </builtin>
+    </rtps>
+  </participant>
+</profiles>

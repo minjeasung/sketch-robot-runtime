@@ -650,16 +650,27 @@ controller_interface::return_type AdmittanceController::update_and_write_command
   }
 
   // apply admittance control to reference to determine desired state
-  const auto update_result = admittance_->update(
+  // Under simulated time controller_manager can dispatch twice at one clock
+  // tick after an overrun. No simulated time elapsed, so retain the previous
+  // trim and hardware command. Freshness/inhibition above still use steady
+  // time. Physical zero periods and backwards time retain the rule's ERROR.
+  const bool hold_zero_sim_period =
+    period.nanoseconds() == 0 && get_node()->get_clock()->ros_time_is_active();
+  const auto update_result = hold_zero_sim_period ? controller_interface::return_type::OK :
+    admittance_->update(
     joint_state_, ft_values_, wrench_command_msg_.wrench, reference_, period,
     reference_admittance_);
+  if (hold_zero_sim_period) {
+    RCLCPP_WARN_ONCE(get_node()->get_logger(),
+      "Holding previous command for a zero simulated-time control period; steady watchdogs remain active");
+  }
 
   // write calculated values to joint interfaces
   // On failure leave the last hardware command untouched. Returning ERROR
   // deactivates the controller chain; never jump back to the untrimmed path.
-  if (update_result == controller_interface::return_type::OK) {
+  if (update_result == controller_interface::return_type::OK && !hold_zero_sim_period) {
     write_state_to_hardware(reference_admittance_);
-  } else {
+  } else if (update_result != controller_interface::return_type::OK) {
     compliance_active_ = false;
   }
 

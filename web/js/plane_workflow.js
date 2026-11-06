@@ -53,7 +53,7 @@ function renderPlaneList() {
   if (processMode === "weld") { if (window.WeldWorkflow) WeldWorkflow.render(); return; }
   const spray = processMode === "spray";
   const running = paintingDerivedState().running;
-  const blocked = !rosConnected || running || processModePending;
+  const blocked = !rosConnected || running || processModePending || !workflowView().canEdit;
   const signature = JSON.stringify([planeCatalog, planeState, [...selectedPlaneIds], blocked, processMode, sprayMotionTest, planningOnly]);
   if (signature === lastPlaneRender) return;
   lastPlaneRender = signature;
@@ -71,7 +71,7 @@ function renderPlaneList() {
     checkbox.checked = selectedPlaneIds.has(plane.id);
     checkbox.disabled = blocked;
     checkbox.addEventListener("change", () => {
-      if (blocked) return;
+      if (blocked || !workflowView().canEdit) return;
       if (checkbox.checked) selectedPlaneIds.add(plane.id);
       else selectedPlaneIds.delete(plane.id);
       invalidateSelection("catalog plane selection edited");
@@ -153,7 +153,7 @@ new ROSLIB.Topic({ ros, name: "/perception/target_planes", messageType: "std_msg
 });
 
 $("btn-refine-planes").addEventListener("click", () => {
-  if (!rosConnected || processModePending || paintingDerivedState().running || !selectedPlaneIds.size) return;
+  if (!workflowView().canEdit || !rosConnected || processModePending || paintingDerivedState().running || !selectedPlaneIds.size) return;
   if (processMode === "paint" && !window.confirm("선택한 평면들을 D405로 측정하기 위해 로봇이 순서대로 접근합니다. 시작할까요?")) return;
   invalidateSelection("selected catalog planes requested");
   if (processMode === "spray" && !zedSelection.selectPlanes(planeCatalog.generation, [...selectedPlaneIds])) return;
@@ -184,7 +184,7 @@ new ROSLIB.Topic({ ros, name: "/painting_system/planes", messageType: "std_msgs/
         strokesMap.work_area = [];
         strokesMap.path = [];
         beginD405Refresh("active plane changed");
-        switchToWorkAreaMode();
+        // Explicit next-step navigation preserves the current view.
       }
     }
   }
@@ -195,7 +195,7 @@ new ROSLIB.Topic({ ros, name: "/painting_system/planes", messageType: "std_msgs/
 
 $("active-plane").addEventListener("change", event => {
   const id = event.target.value;
-  if (!id || !rosConnected || processModePending || paintingDerivedState().running) return;
+  if (!workflowView().canEdit || !id || !rosConnected || processModePending || paintingDerivedState().running) return;
   if (processMode === "paint" && !window.confirm("선택한 면의 작업영역을 그릴 수 있도록 D405가 다시 접근합니다. 시작할까요?")) {
     event.target.value = planeState.active_id || "";
     return;
@@ -237,8 +237,11 @@ new ROSLIB.Topic({ ros, name: "/painting_system/process_mode", messageType: "std
   processModeError = payload.error || "";
   renderProcessModeState();
   if (changed || wasPending) {
+    paintingState.execution = {};
+    if(window.WeldWorkflow)WeldWorkflow.reset();
     invalidateSelection("process mode acknowledged; select a new target");
     strokesMap.target = [];
+    pathMethod="auto";$("path-method").value="auto";
     clearPlaneSelection(true);
     document.querySelector('input[name="workflow-mode"][value="target"]').checked = true;
     switchWorkflow("target");

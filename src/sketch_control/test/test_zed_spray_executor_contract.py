@@ -59,7 +59,7 @@ _CONSTANTS = {
     "STAGE1_LARGE_JOINT_DELTA_WARN_RAD", "D405_PREFLIGHT_SCAN_ENABLED",
     "D405_PREFLIGHT_SCAN_STANDOFF", "PLANNER_ID", "ALLOWED_PLANNING_TIME",
     "PLANNING_ATTEMPTS", "STAGE1_SPEED_SCALE",
-    "TOOL_AXIS", "EOAT_TIP_OFFSET",
+    "TOOL_AXIS", "EOAT_TIP_OFFSET", "D405_PREFLIGHT_JOINT_GOAL_TOL_RAD",
 }
 
 
@@ -755,3 +755,26 @@ def test_rejected_spray_reselection_cannot_leave_active_target_outside_selected_
     else:
         assert not node._zed_plane_accepted
         assert not node._accepted_plan_hash and not node._accepted_plan_path_id
+
+
+def test_spray_stage1_goal_preserves_exact_ik_endpoint_not_two_centiradian_region():
+    node=_executor();node._stage1_ik_seed_state=copy.deepcopy(node.current_joint_state)
+    metrics,error=node._stage1_candidate_joint_metrics(node.current_joint_state)
+    assert not error
+    assert all(c.tolerance_above<=1e-4 and c.tolerance_below<=1e-4 for c in metrics['constraints'].joint_constraints)
+
+
+def test_circular_cone_roll_candidates_keep_nozzle_points_and_inward_axis():
+    node = _prepare()
+    node._active_segment_path.raw_payload["spray_envelope_profile_id"] = "spray_v2_original_cad_cone"
+    assert node._prepare_segment_process() is not None
+    first, second = node._stage1_orientation_candidates
+    assert first["complete_spray_preflight"] and second["complete_spray_preflight"]
+    for number, p in first["row_tip_poses"].items():
+        other = second["row_tip_poses"][number]
+        np.testing.assert_allclose([p.position.x,p.position.y,p.position.z],
+                                   [other.position.x,other.position.y,other.position.z])
+        qa=[p.orientation.x,p.orientation.y,p.orientation.z,p.orientation.w]
+        qb=[other.orientation.x,other.orientation.y,other.orientation.z,other.orientation.w]
+        np.testing.assert_allclose(quat_apply(qa,[0.,0.,1.]),quat_apply(qb,[0.,0.,1.]),atol=1e-9)
+        np.testing.assert_allclose(quat_apply(qa,[1.,0.,0.]),-np.asarray(quat_apply(qb,[1.,0.,0.])),atol=1e-9)

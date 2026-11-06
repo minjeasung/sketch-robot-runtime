@@ -42,6 +42,7 @@ from rclpy.qos import (
     QoSProfile,
 )
 
+from .refined_plane_record import refined_pose_from_status
 from tf2_ros import Buffer, TransformListener, TransformException
 from geometry_msgs.msg import Pose, PoseArray, PoseStamped, Point
 from sensor_msgs.msg import Image
@@ -62,6 +63,7 @@ from rbpodo_painting_control.spray_path import (
     make_spray_rows, resolve_spray_tool_axis, rotation_from_spray_path,
     spray_spacing_m,
 )
+from rbpodo_painting_control.spray_envelope import load_spray_envelope
 from rbpodo_painting_control.spray_eoat import (
     load_spray_eoat_profile, compensate_spray_endpoint,
 )
@@ -148,6 +150,8 @@ class SketchToWaypointsNode(Node):
         self.spray_speed_mps = float(self.declare_parameter("spray_speed_mps", 0.020, startup_only).value)
         self.spray_standoff_m = float(self.declare_parameter("spray_standoff_m", 0.5, startup_only).value)
         self.spray_eoat_profile = str(self.declare_parameter("spray_eoat_profile", "", startup_only).value)
+        self.spray_envelope_profile = str(self.declare_parameter("spray_envelope_profile", "", startup_only).value)
+        self._configured_spray_envelope()
         spray_spacing_m(self.spray_footprint_width_m, self.spray_overlap)
         if any(not math.isfinite(v) or v <= 0 for v in (self.spray_speed_mps, self.spray_standoff_m)):
             raise ValueError("spray speed and standoff must be finite and positive")
@@ -404,6 +408,14 @@ class SketchToWaypointsNode(Node):
     def _on_refined_work_area(self, msg: PoseStamped):
         if getattr(self, "process_mode", "paint") == "spray":
             return
+        self.get_logger().info(
+            "compatibility refined Pose ignored; accepted geometry record owns plane",
+            throttle_duration_sec=2.0,
+        )
+
+    def _apply_identity_bound_refined_work_area(self, msg: PoseStamped):
+        if getattr(self, "process_mode", "paint") == "spray":
+            return
         if not getattr(self, "d405_refined_pose_armed", False):
             self.get_logger().warn(
                 "arm되지 않은 D405 refined Pose 무시 (stale/extra sample)"
@@ -582,6 +594,30 @@ class SketchToWaypointsNode(Node):
             reason = str(
                 payload.get("rejection_reason", payload.get("reason", ""))
             ).strip()
+        refined_pose = None
+        if accepted:
+            try:
+                refined_pose = refined_pose_from_status(payload)
+            except ValueError as exc:
+                accepted = False
+                reason = f"invalid_refined_geometry:{exc}"
+        previous = getattr(self, "d405_status", {})
+        previous_pose = getattr(self, "latest_refined_work_area", None)
+        same_committed_generation = bool(
+            accepted and previous.get("accepted") is True and previous_pose is not None
+            and previous.get("work_area_id") == work_area_id
+            and previous.get("plane_generation_id") == plane_generation_id)
+        if same_committed_generation and (refined_pose is None or refined_pose == previous_pose):
+            # A lifecycle replay is not a new measurement. Keep the immutable
+            # pose and its original receipt time across paint locking/unlocking.
+            self.d405_status_time = time.monotonic()
+            return
+        if same_committed_generation and refined_pose != previous_pose:
+            accepted = False
+            reason = "accepted_generation_geometry_changed"
+        if accepted and refined_pose is None:
+            accepted = False
+            reason = "accepted_geometry_missing"
         self.d405_status = {
             "accepted": accepted,
             "work_area_id": work_area_id,
@@ -589,15 +625,16 @@ class SketchToWaypointsNode(Node):
             "reason": reason,
         }
         self.d405_status_time = time.monotonic()
-        # Status-before-pose is the lifecycle barrier. Clear any transient pose
-        # cached from an older generation and consume exactly one subsequent
-        # PoseStamped for this accepted generation.
+        # The accepted identity and measured geometry are one transaction.
+        # Bare Pose callbacks cannot establish generation ownership.
         self.latest_refined_work_area = None
         self.latest_refined_work_area_time = 0.0
-        self.d405_refined_pose_armed = accepted
+        self.d405_refined_pose_armed = accepted and refined_pose is not None
         self.d405_refined_pose_generation_id = (
-            plane_generation_id if accepted else ""
+            plane_generation_id if self.d405_refined_pose_armed else ""
         )
+        if refined_pose is not None and self.d405_refined_pose_armed:
+            self._apply_identity_bound_refined_work_area(refined_pose)
         self._publish_plan_status(
             "plane_accepted" if accepted else "plane_rejected",
             reason=reason,
@@ -1134,10 +1171,12 @@ class SketchToWaypointsNode(Node):
         try:
             width_m, height_m = self._current_work_area_size_m()
             if spray:
+                envelope = self._configured_spray_envelope()
                 footprint, overlap = self.spray_footprint_width_m, self.spray_overlap
                 strokes = generate_spray_fill_strokes(
                     rect, work_area_width_m=width_m, work_area_height_m=height_m,
-                    footprint_width_m=footprint, overlap=overlap)
+                    footprint_width_m=footprint, overlap=overlap,
+                    direction="auto" if envelope is not None else None)
                 boundary = self.zed_surface_status.get("boundary_pixels")
                 if boundary is not None:
                     strokes = clip_strokes_to_polygon(strokes, boundary)
@@ -1326,6 +1365,7 @@ class SketchToWaypointsNode(Node):
                 self._publish_plan_status("rejected", reason="SPRAY_ZED_PATH_REQUIRED")
                 return None
             try:
+                envelope = self._configured_spray_envelope()
                 spray_profile = load_spray_eoat_profile(
                     self.spray_eoat_profile, self.model_id, self.spray_tool_axis)
             except (OSError, TypeError, ValueError) as exc:
@@ -1503,6 +1543,7 @@ class SketchToWaypointsNode(Node):
                     raise ValueError("spray path source must be ZED wall_front")
                 spray_metadata = {
                     **spray_profile.metadata(),
+                    **(envelope.metadata() if envelope is not None else {}),
                     "model_id": self.model_id,
                     "spray_tool_axis": resolve_spray_tool_axis(self.model_id, self.spray_tool_axis),
                     "spray_footprint_width_m": float(self.spray_footprint_width_m),
@@ -1614,6 +1655,20 @@ class SketchToWaypointsNode(Node):
         )
         return path
 
+    def _configured_spray_envelope(self):
+        """Validate the optional source cone against the configured surface footprint."""
+        path = getattr(self, "spray_envelope_profile", "")
+        if not path:
+            return None
+        try:
+            envelope = load_spray_envelope(path)
+            diameter = envelope.diameter_at(self.spray_standoff_m)
+            if not math.isclose(self.spray_footprint_width_m, diameter, rel_tol=1e-9, abs_tol=1e-9):
+                raise ValueError("spray footprint width does not match source cone at configured standoff")
+            return envelope
+        except ValueError as exc:
+            raise WorkAreaGeometryError(str(exc)) from exc
+
     def _spray_coverage_world(self, pixel_strokes=None):
         """Map fill or manual pixels through the accepted atomic ZED surface."""
         status = self._accepted_zed_work_area()
@@ -1624,6 +1679,7 @@ class SketchToWaypointsNode(Node):
             self.latest_work_area_rect_px,
             work_area_width_m=width, work_area_height_m=height,
             footprint_width_m=self.spray_footprint_width_m, overlap=self.spray_overlap,
+            direction="auto" if getattr(self, "spray_envelope_profile", "") else None,
         ) if pixel_strokes is None else pixel_strokes
         boundary = status.get("boundary_pixels")
         if boundary is not None:

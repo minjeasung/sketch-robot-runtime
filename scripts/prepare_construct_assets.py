@@ -55,10 +55,15 @@ def mount_left_spray_v2(robot, root, config, output):
                      'mass_calibrated': False, 'tcp_calibrated': False}}
 
 
-def prepare(root: Path, output: Path) -> dict:
+def prepare(root: Path, output: Path, source_model='original') -> dict:
     description = root / 'src/construct_description'
     config = root / 'src/construct_moveit_config/config'
-    robot = ET.parse(description / 'urdf_0528/construct_robot_0528.urdf').getroot()
+    if source_model not in ('original', 'hongik_v4'):
+        raise ValueError('Unknown Construct source model: ' + source_model)
+    vendor = root / 'assets/construct/hongik_v4/source/construct_description'
+    source = (vendor / 'urdf_0528/construct_robot_0528_hongik_v2.urdf'
+              if source_model == 'hongik_v4' else description / 'urdf_0528/construct_robot_0528.urdf')
+    robot = ET.parse(source).getroot()
     initial = yaml.safe_load((description / 'config/initial_positions.yaml').read_text())['initial_positions']
     joints = [j for j in robot.findall('joint') if j.get('type') == 'revolute']
     names = {j.get('name') for j in joints}
@@ -69,7 +74,12 @@ def prepare(root: Path, output: Path) -> dict:
         prefix = 'package://construct_description/'
         if not filename.startswith(prefix):
             raise ValueError(f'Unexpected mesh URI: {filename}')
-        resolved = (description / filename[len(prefix):]).resolve()
+        relative = Path(filename[len(prefix):])
+        if relative.is_absolute() or '..' in relative.parts:
+            raise ValueError('Invalid Construct mesh path: ' + filename)
+        resolved = (description / relative).resolve()
+        if source_model == 'hongik_v4' and (vendor / relative).is_file():
+            resolved = (vendor / relative).resolve()
         if not resolved.is_file():
             raise FileNotFoundError(resolved)
         mesh.set('filename', str(resolved))
@@ -78,7 +88,7 @@ def prepare(root: Path, output: Path) -> dict:
     right = robot.find("link[@name='right_D435_link']")
     left = robot.find("link[@name='left_D435_link']")
     overrides = []
-    original_mass = float(right.find('inertial/mass').get('value'))
+    original_mass = float(right.find('inertial/mass').get('value')) if right is not None else 0.
     if original_mass > 200:
         geometry = []
         for link in (left, right):
@@ -100,6 +110,24 @@ def prepare(root: Path, output: Path) -> dict:
             raise ValueError(f'Initial position outside limits: {joint.get("name")}')
     output.mkdir(parents=True, exist_ok=True)
     equipment = mount_left_spray_v2(robot, root, config, output)
+    if source_model == 'hongik_v4':
+        # The vendor model hides the old testbed visually but retains its collider.
+        # New workpiece geometry is supplied separately, in both planning/physics.
+        testbed = robot.find("link[@name='testbed_link']")
+        for kind in ('visual', 'collision'):
+            for element in list(testbed.findall(kind)):
+                testbed.remove(element)
+        semantic = ET.parse(output / 'construct.srdf').getroot()
+        links = {link.get('name') for link in robot.findall('link')}
+        for pair in list(semantic.findall('disable_collisions')):
+            if not {pair.get('link1'), pair.get('link2')} <= links:
+                semantic.remove(pair)
+        ET.SubElement(semantic, 'disable_collisions', link1='hongik_eoat_base_link',
+                      link2='right_manipulator_link6', reason='Adjacent')
+        ET.ElementTree(semantic).write(output / 'construct.srdf', encoding='unicode', xml_declaration=True)
+        equipment['right'] = dict(model='hongik_v4', tcp_basis='contact_tip_face_center',
+                                 tcp_calibrated=False, mass_calibrated=False,
+                                 legacy_demo_torch_compatible=False)
     ET.ElementTree(robot).write(output / 'construct.urdf', encoding='unicode', xml_declaration=True)
     controlled = copy.deepcopy(robot)
     # ROS resource_retriever expects a URI, while Isaac importer uses local paths.
@@ -141,10 +169,15 @@ def prepare(root: Path, output: Path) -> dict:
                                            'has_jerk_limits':True,'max_jerk':2.0}
             limit.update(head_motion_overrides[name])
     (output/'moveit_joint_limits.yaml').write_text(yaml.safe_dump(planning_limits,sort_keys=False))
-    manifest = {'equipment':equipment, 'head_motion_overrides':head_motion_overrides, 'inertia_overrides':overrides, 'name':robot.get('name'),'joint_names':[j.get('name') for j in joints], 'initial_positions':initial, 'limits':limits, 'groups':groups}
+    manifest = {'source_model':source_model, 'source_urdf':str(source), 'equipment':equipment, 'head_motion_overrides':head_motion_overrides, 'inertia_overrides':overrides, 'name':robot.get('name'),'joint_names':[j.get('name') for j in joints], 'initial_positions':initial, 'limits':limits, 'groups':groups}
     (output / 'construct_manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
     return manifest
 
 if __name__ == '__main__':
+    import argparse
     root = Path(__file__).resolve().parents[1]
-    print(json.dumps(prepare(root, root/'isaac_assets'),indent=2))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--source-model', choices=['original', 'hongik_v4'], default='original')
+    parser.add_argument('--output', type=Path, default=root/'isaac_assets')
+    args = parser.parse_args()
+    print(json.dumps(prepare(root, args.output, args.source_model),indent=2))

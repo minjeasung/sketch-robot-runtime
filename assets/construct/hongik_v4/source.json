@@ -1,0 +1,12 @@
+{
+  "archive": "hongik_urdf_v4_2026-10-13.zip",
+  "sha256": "054fea92b2b46cb73212aa6892c61a322b5da35cc224c48d9beb84cad362b33d",
+  "files": {
+    "hongik_v2_r4_tool.png": "cf8cd481c0f7399fc0a0c704012f7cddb873cc5ea4023a52fc924443ffd03b52",
+    "README_hongik_v2_r4.md": "7cea6930005791eee7584b5e67eacf173cc62d319f471b48b929380425813611",
+    "SHA256SUMS": "c5ed9383170520fc4fb10353a5708ddcc8051a61b598308a798196455abde671",
+    "construct_description/meshes_0528/hongik_eoat_bracket1_torch_sensor.stl": "20ca78645520c350a11f3c68d870776098f774805fc135179314ddc9b1778bbd",
+    "construct_description/meshes_0528/hongik_eoat_bracket1_torch_sensor_collision.stl": "92d2694068057e000b23890e32fdfa0ffc0d503f9dbe817653cc968402189d1a",
+    "construct_description/urdf_0528/construct_robot_0528_hongik_v2.urdf": "a9bc475f641039b3a1d475554773ca22368a32202436a468a90792331c4c10ee"
+  }
+}

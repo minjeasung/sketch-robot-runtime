@@ -204,6 +204,8 @@ controller_interface::return_type AdmittanceRule::update(
 {
   const double dt = period.seconds();
   if (!std::isfinite(dt) || dt <= 0.0) {
+    RCLCPP_ERROR(rclcpp::get_logger("AdmittanceRule"),
+      "admittance update rejected control period %.9g s (must be finite and positive)", dt);
     return controller_interface::return_type::ERROR;
   }
 
@@ -213,6 +215,10 @@ controller_interface::return_type AdmittanceRule::update(
 
   bool success = get_all_transforms(current_joint_state, reference_joint_state);
   if (!success) {
+    RCLCPP_ERROR(rclcpp::get_logger("AdmittanceRule"),
+      "admittance FK/frame lookup failed: period=%.9g s base=%s tip=%s sensor=%s control=%s", dt,
+      parameters_.kinematics.base.c_str(), parameters_.kinematics.tip.c_str(),
+      parameters_.ft_sensor.frame.id.c_str(), parameters_.control.frame.id.c_str());
     return controller_interface::return_type::ERROR;
   }
 
@@ -368,6 +374,8 @@ controller_interface::return_type AdmittanceRule::update(
   // Do not replace the previous safe output with the nominal path on failure:
   // dropping an existing trim would be a discontinuous position command.
   if (!success) {
+    RCLCPP_ERROR(rclcpp::get_logger("AdmittanceRule"),
+      "admittance differential dynamics/IK failed: period=%.9g s", dt);
     return controller_interface::return_type::ERROR;
   }
 

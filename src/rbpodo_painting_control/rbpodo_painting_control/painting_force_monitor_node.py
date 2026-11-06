@@ -9,6 +9,7 @@ import time
 
 from geometry_msgs.msg import WrenchStamped
 import rclpy
+from rclpy.clock import Clock, ClockType
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
@@ -212,6 +213,7 @@ class PaintingForceMonitorNode(Node):
         self.declare_parameter("max_message_age_s", 0.20)
         self.declare_parameter("tf_valid_timeout_s", 0.20)
         self.declare_parameter("tf_lookup_timeout_s", 0.02)
+        self.declare_parameter('startup_readiness_grace_s', 0.0)
         self.declare_parameter("reset_max_force_norm_n", 1.0)
         self.declare_parameter("reset_max_torque_norm_nm", 0.2)
         self.declare_parameter("publish_rate_hz", 50.0)
@@ -304,6 +306,12 @@ class PaintingForceMonitorNode(Node):
                 mode_limits[mode] = replace(limits, unexpected_contact_n=threshold)
 
         started_at = time.monotonic()
+        self._startup_started_at = started_at
+        self._sim_clock_ready_seen = False
+        self._startup_pair_ready_seen = False
+        self._startup_readiness_grace_s = float(self.get_parameter('startup_readiness_grace_s').value)
+        if not math.isfinite(self._startup_readiness_grace_s) or not 0.0 <= self._startup_readiness_grace_s <= 5.0:
+            raise ValueError('startup_readiness_grace_s must be finite within 0..5 seconds')
         contact_force_sign = float(self.get_parameter("contact_force_sign").value)
         if not math.isfinite(contact_force_sign) or contact_force_sign not in (
             -1.0,
@@ -347,7 +355,7 @@ class PaintingForceMonitorNode(Node):
         )
         self._safety = ForceSafetyMonitor(config, started_at=started_at)
 
-        self._mode = "UNKNOWN"
+        self._mode = 'IDLE' if self._startup_readiness_grace_s > 0.0 else 'UNKNOWN'
         self._mode_received = False
         self._force_enabled = False
         self._enable_received = False
@@ -450,7 +458,10 @@ class PaintingForceMonitorNode(Node):
         self.create_service(
             Trigger, "/painting_admittance/reset_safety", self._on_reset
         )
-        self.create_timer(1.0 / self._rate_hz, self._on_timer)
+        # Dispatch watchdogs and heartbeat publications even when /clock stops.
+        # Sensor stamps and force-ramp dynamics retain the node's ROS clock.
+        self._steady_clock = Clock(clock_type=ClockType.STEADY_TIME)
+        self.create_timer(1.0 / self._rate_hz, self._on_timer, clock=self._steady_clock)
 
         self.get_logger().info(
             "Painting F/T safety ready: filtered=%s raw=%s normal=%s "
@@ -630,6 +641,57 @@ class PaintingForceMonitorNode(Node):
         except Exception:
             return math.inf
 
+    def _startup_grace_active(self, now):
+        return bool(
+            getattr(self, '_startup_readiness_grace_s', 0.0) > 0.0
+            and now - self._startup_started_at < self._startup_readiness_grace_s
+            and self._safety.last_tf_ok_at is None
+            and self._mode == 'IDLE' and not self._force_enabled)
+
+    def _startup_pair_grace_active(self, now):
+        # Filtered and raw topics arrive independently. Discovering TF or the
+        # first filtered sample does not establish that the first raw callback
+        # has run. Keep missing-channel readiness false during the bounded
+        # startup window, then permanently arm the ordinary wall watchdogs.
+        if getattr(self, '_startup_pair_ready_seen', False):
+            return False
+        if (self._safety.ft_valid(now, require_raw=getattr(self, '_require_raw', True))
+                and self._safety.tf_is_valid(now)):
+            self._startup_pair_ready_seen = True
+            return False
+        return bool(
+            getattr(self, '_startup_readiness_grace_s', 0.0) > 0.0
+            and now - self._startup_started_at < self._startup_readiness_grace_s
+            and self._mode == 'IDLE' and not self._force_enabled)
+
+    def _initial_sim_clock_grace_active(self, now):
+        # A wrench may arrive before this node's first /clock callback. Reject
+        # it as unready rather than comparing its stamp against time zero.
+        # Once any positive ROS time has been seen, reset/future/stale stamps
+        # follow the original fail-closed checks; this grace cannot recur.
+        if getattr(self, '_startup_readiness_grace_s', 0.0) <= 0.0:
+            return False
+        clock = self.get_clock()
+        if not getattr(clock, 'ros_time_is_active', False):
+            return False
+        clock_ns = clock.now().nanoseconds
+        if clock_ns > 0:
+            self._sim_clock_ready_seen = True
+            return False
+        return bool(
+            clock_ns == 0 and not getattr(self, '_sim_clock_ready_seen', False)
+            and now - self._startup_started_at < self._startup_readiness_grace_s
+            and self._mode == 'IDLE' and not self._force_enabled)
+
+    def _observe_transform_validity(self, valid, now, source_age=None):
+        if not valid and PaintingForceMonitorNode._startup_grace_active(self, now):
+            # Report unavailable TF without manufacturing a valid transform,
+            # sample or timestamp. Guard readiness remains false throughout.
+            self._safety.tf_valid = False
+            self._safety.tf_source_age_s = source_age
+            return
+        self._safety.observe_tf(valid, now, source_age)
+
     def _transform_wrench(self, msg: WrenchStamped, now: float):
         source_frame = msg.header.frame_id or self._ft_frame
         force = (
@@ -643,7 +705,7 @@ class PaintingForceMonitorNode(Node):
             float(msg.wrench.torque.z),
         )
         if source_frame == self._tcp_frame:
-            self._safety.observe_tf(True, now, 0.0)
+            self._observe_transform_validity(True, now, 0.0)
             return (*force, *torque)
         try:
             transform = self._tf_buffer.lookup_transform(
@@ -653,7 +715,7 @@ class PaintingForceMonitorNode(Node):
                 timeout=Duration(seconds=self._tf_lookup_timeout),
             )
         except Exception as exc:
-            self._safety.observe_tf(False, now)
+            self._observe_transform_validity(False, now)
             self._invalidate_bias()
             if self._safety.latched_reason == "TF_INVALID":
                 self._safety.latched_detail = "%s <- %s: %s" % (
@@ -683,12 +745,12 @@ class PaintingForceMonitorNode(Node):
         if source_age is not None and (
             source_age < -0.05 or source_age > self._safety.config.tf_timeout_s
         ):
-            self._safety.observe_tf(False, now, source_age)
+            self._observe_transform_validity(False, now, source_age)
             self._invalidate_bias()
             if self._safety.latched_reason == "TF_INVALID":
                 self._safety.latched_detail = "transform source age %.6f s" % source_age
             return None
-        self._safety.observe_tf(True, now, source_age)
+        self._observe_transform_validity(True, now, source_age)
         return (*rotated_force, *shifted_torque)
 
     def _reset_bias_window(self) -> None:
@@ -774,6 +836,9 @@ class PaintingForceMonitorNode(Node):
 
     def _on_wrench(self, msg: WrenchStamped) -> None:
         now = time.monotonic()
+        if self._initial_sim_clock_grace_active(now):
+            self._invalidate_bias()
+            return
         transformed = self._transform_wrench(msg, now)
         if transformed is None:
             return
@@ -834,6 +899,9 @@ class PaintingForceMonitorNode(Node):
 
     def _on_raw_wrench(self, msg: WrenchStamped) -> None:
         now = time.monotonic()
+        if self._initial_sim_clock_grace_active(now):
+            self._invalidate_bias()
+            return
         transformed = self._transform_wrench(msg, now)
         if transformed is not None:
             self._process_raw_values(transformed, msg, now)
@@ -891,7 +959,9 @@ class PaintingForceMonitorNode(Node):
                 "roller balance rotation trim limit sustained",
                 now,
             )
-        self._safety.tick(now, require_raw=self._require_raw)
+        initial_clock_grace = self._initial_sim_clock_grace_active(now)
+        if not initial_clock_grace and not PaintingForceMonitorNode._startup_pair_grace_active(self, now):
+            self._safety.tick(now, require_raw=self._require_raw)
         status = self._safety.status(now, self._mode, require_raw=self._require_raw)
         if not status["ft_valid"] or not status["tf_valid"]:
             self._invalidate_bias()

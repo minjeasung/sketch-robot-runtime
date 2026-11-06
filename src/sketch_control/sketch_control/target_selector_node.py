@@ -23,7 +23,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, qos_profile_sensor_data
 
-from geometry_msgs.msg import PoseArray, PoseStamped
+from geometry_msgs.msg import PoseArray, PoseStamped, Pose
 from sensor_msgs.msg import CameraInfo, Image
 from sketch_control.pointcloud_utils import ransac_plane
 
@@ -82,6 +82,15 @@ class TargetSelectorNode(Node):
         self.latest_depth_header = None
         self.latest_depth_received_at = 0.0
         self.rgb_frames = deque(maxlen=4)
+        self.physical_frames = None
+        if self.declare_parameter('require_bound_frame', False).value:
+            from sketch_control.camera_registration import load_registration
+            from sketch_control.rgbd_weld_provider import RGBDFrameStore
+            registration=load_registration(self.declare_parameter('camera_registration_file','').value,'zed')
+            self.physical_frames=RGBDFrameStore(registration)
+            self.create_subscription(String,'/perception/zed_frame_identity',self._on_physical_identity,10)
+            self.create_subscription(String,'/perception/selection_pin',self._on_physical_pin,10)
+            self.create_subscription(String,'/task_scene/selection',self._on_physical_selection,10)
 
         self.create_subscription(
             CameraInfo, CAMERA_INFO_TOPIC, self._on_info, qos_profile_sensor_data)
@@ -103,12 +112,19 @@ class TargetSelectorNode(Node):
 
     def _on_info(self, msg: CameraInfo):
         self.K = np.asarray(msg.k, dtype=float).reshape(3, 3)
+        store=getattr(self,'physical_frames',None)
+        if store is not None and msg.header.frame_id==store.registration.optical_frame:
+            try:store.add_intrinsics(self._capture_stamp(msg),dict(fx=msg.k[0],fy=msg.k[4],cx=msg.k[2],cy=msg.k[5]))
+            except (ValueError,TypeError):store.clear()
 
     def _on_depth(self, msg: Image):
         try:
             self.latest_depth = self._decode_depth(msg)
             self.latest_depth_header = msg.header
             self.latest_depth_received_at = time.monotonic()
+            store=getattr(self,'physical_frames',None)
+            if store is not None and msg.header.frame_id==store.registration.optical_frame:
+                store.add_depth(self._capture_stamp(msg),self.latest_depth)
         except Exception as e:
             self.get_logger().warn(f"depth decode 실패: {e}")
 
@@ -128,6 +144,9 @@ class TargetSelectorNode(Node):
                     rgb = rgb[:, :, ::-1]
             stamp = msg.header.stamp.sec*1_000_000_000 + msg.header.stamp.nanosec
             self.rgb_frames.append((stamp, rgb.copy()))
+            store=getattr(self,'physical_frames',None)
+            if store is not None and msg.header.frame_id==store.registration.optical_frame:
+                store.add_rgb(stamp,rgb.shape[:2],rgb=rgb)
         except (ValueError, TypeError) as exc:
             self.get_logger().warn(f"RGB decode 실패: {exc}")
 
@@ -143,7 +162,49 @@ class TargetSelectorNode(Node):
             return None
         return rgb
 
-    def _on_selection(self, msg: PoseArray):
+    @staticmethod
+    def _capture_stamp(msg):
+        return msg.header.stamp.sec*1_000_000_000+msg.header.stamp.nanosec
+
+    def _on_physical_identity(self,msg):
+        try:
+            payload=json.loads(msg.data)
+            if payload.get('valid') is not True:raise ValueError('physical frame invalid')
+            self.physical_frames.add_identity(payload)
+        except (ValueError,KeyError,TypeError):self.physical_frames.clear()
+
+    def _on_physical_pin(self,msg):
+        try:
+            identity,_selected=self.physical_frames.selected_payload(json.loads(msg.data),time.monotonic())
+            self.physical_frames.selected_rgb(identity,time.monotonic())
+            self.physical_frames.pin(identity,time.monotonic())
+        except (ValueError,KeyError,TypeError) as exc:
+            self.physical_frames.pinned=None;self.physical_frames.pinned_rgb=None;self.physical_frames.lease.clear()
+            self.get_logger().warn('Physical target pin rejected: '+str(exc))
+
+    def _on_physical_selection(self,msg):
+        generation=''
+        try:
+            payload=json.loads(msg.data)
+            sec,ns=map(int,payload['request_id'].split('.'))
+            if sec<0 or not 0<=ns<1_000_000_000 or payload['target_revision']!=payload['request_id']:raise ValueError('invalid physical selection request identity')
+            generation=str(sec*1_000_000_000+ns)
+            identity,(depth,k,binding)=self.physical_frames.selected_payload(payload,time.monotonic())
+            rgb=self.physical_frames.selected_rgb(identity,time.monotonic())
+            selected=PoseArray();selected.header.frame_id='zed_raw';selected.header.stamp.sec=sec;selected.header.stamp.nanosec=ns
+            polygon=np.asarray(payload['polygon'],dtype=float)
+            if polygon.ndim!=2 or polygon.shape[1:]!=(2,) or len(polygon)<3 or not np.isfinite(polygon).all():raise ValueError('invalid physical selection polygon')
+            if np.any(polygon<0) or np.any(polygon[:,0]>=depth.shape[1]) or np.any(polygon[:,1]>=depth.shape[0]):raise ValueError('physical polygon outside selected image')
+            for x,y in polygon:
+                pose=Pose();pose.position.x=float(x);pose.position.y=float(y);selected.poses.append(pose)
+            snapshot=dict(depth=depth,K=np.array([[k['fx'],0,k['cx']],[0,k['fy'],k['cy']],[0,0,1.]]),rgb=rgb,frame_id=identity['frame_id'],frame_binding=identity['frame_binding'])
+            self._on_selection(selected,physical_selection=snapshot)
+        except (ValueError,KeyError,TypeError) as exc:
+            self.catalog_pub.publish(String(data=json.dumps(dict(generation=generation,planes=[],error=str(exc)))))
+
+    def _on_selection(self, msg: PoseArray, physical_selection=None):
+        if getattr(self,'physical_frames',None) is not None and physical_selection is None:
+            return  # Mixed mode accepts only the bound JSON request shared with task_scene.
         if (msg.header.frame_id or "") != "zed_raw":
             self.get_logger().warn(
                 f"target selection frame_id='{msg.header.frame_id}' skip")
@@ -154,7 +215,7 @@ class TargetSelectorNode(Node):
             # would make a stale refinement indistinguishable from this request.
             self.get_logger().warn("target selection stamp invalid/zero — skip")
             return
-        if self.K is None or self.latest_depth is None:
+        if physical_selection is None and (self.K is None or self.latest_depth is None):
             self.get_logger().warn("CameraInfo/depth 미수신 — target selection 보류")
             return
         if not msg.poses:
@@ -162,24 +223,25 @@ class TargetSelectorNode(Node):
             return
 
         try:
-            age = time.monotonic() - getattr(self, "latest_depth_received_at", 0.0)
-            if not 0.0 <= age <= 1.0:
-                raise ValueError("ZED_DEPTH_STALE")
-            if (not np.isfinite(self.K).all() or self.K[0, 0] <= 0.0
-                    or self.K[1, 1] <= 0.0):
+            if physical_selection is None:
+                age = time.monotonic() - getattr(self, "latest_depth_received_at", 0.0)
+                if not 0.0 <= age <= 1.0: raise ValueError("ZED_DEPTH_STALE")
+                depth=self.latest_depth;K=self.K;rgb=self._rgb_for_depth();frame_id=self.latest_depth_header.frame_id
+            else:
+                depth=physical_selection['depth'];K=physical_selection['K'];rgb=physical_selection['rgb'];frame_id=physical_selection['frame_id']
+            if (not np.isfinite(K).all() or K[0, 0] <= 0.0
+                    or K[1, 1] <= 0.0):
                 raise ValueError("ZED_INTRINSICS_INVALID")
             polygons = {}
             for p in msg.poses:
                 polygons.setdefault(int(round(p.position.z)), []).append([p.position.x, p.position.y])
-            depth = self.latest_depth
             vv, uu = np.mgrid[0:depth.shape[0]:ROI_SAMPLE_STRIDE, 0:depth.shape[1]:ROI_SAMPLE_STRIDE]
             pixels = np.column_stack((uu.ravel(), vv.ravel()))
             z = depth[vv, uu].ravel()
             valid = polygon_mask(pixels, polygons.values()) & np.isfinite(z) & (z > .15) & (z < 5.)
             pixels, z = pixels[valid], z[valid]
-            points = np.column_stack(((pixels[:,0]-self.K[0,2])*z/self.K[0,0],
-                                      (pixels[:,1]-self.K[1,2])*z/self.K[1,1], z))
-            rgb = self._rgb_for_depth()
+            points = np.column_stack(((pixels[:,0]-K[0,2])*z/K[0,0],
+                                      (pixels[:,1]-K[1,2])*z/K[1,1], z))
             planes = extract_planes(
                 points,
                 pixels,
@@ -200,9 +262,10 @@ class TargetSelectorNode(Node):
             generation = str(msg.header.stamp.sec*1_000_000_000 + msg.header.stamp.nanosec)
             for index, plane in enumerate(planes):
                 plane["id"] = generation + ":" + str(index+1)
-            payload = dict(generation=generation, frame_id=self.latest_depth_header.frame_id,
+            payload = dict(generation=generation, frame_id=frame_id,
                            image_width=depth.shape[1], image_height=depth.shape[0], planes=planes,
                            extraction_method="rgb_depth_regions" if rgb is not None else "depth_regions")
+            if physical_selection is not None:payload['frame_binding']=physical_selection['frame_binding']
         except (ValueError, TypeError, RuntimeError) as exc:
             payload = dict(generation=str(msg.header.stamp.sec*1_000_000_000+msg.header.stamp.nanosec),
                            planes=[], error=str(exc))

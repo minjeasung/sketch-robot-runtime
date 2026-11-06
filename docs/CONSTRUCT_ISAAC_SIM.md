@@ -6,11 +6,29 @@ GitHub `main`의 `ebc36dd676602ad913a187b32762b3aedd15b88f`에서 새로 복제�
 추가 설정은 로컬 `codex/construct-isaac-sim` 브랜치에 있습니다.
 기존 `/home/minjea/robotics/sketch-robot-runtime` 작업은 수정하지 않았습니다.
 
-## 모델
+## 최신 기준 구성
 
-Downloads의 `construct_description (1).zip`, `construct_moveit_config (1).zip`을
-각각 `src/construct_description`, `src/construct_moveit_config`에 풀었습니다.
-원본 URDF, STL, 초기 자세와 SRDF를 사용합니다. 양팔 각 6축, 헤드 2축입니다.
+2026-10-15 사용자 확정 구성이다. 상용로봇 플랫폼의 기본 장착은 다음과 같다.
+
+| 항목 | 확정 구성 |
+| --- | --- |
+| 플랫폼 | Hongik V4 기반 상용로봇 플랫폼, 양팔 각 6축·헤드 2축 |
+| 왼팔 | 내화뿜칠 spray v2 EOAT |
+| 오른팔 | Hongik V4 용접 토치·브라켓·레이저 센서 |
+| 용접·뿜칠 대상체 | H_STEEL_USD의 `Steel Structure.usdc` |
+
+양팔 EOAT에 D435는 포함하지 않는다. 레이저 센서는 형상과 CAD 프레임을 포함하며,
+광학 교정 TF 및 실제 측정 데이터 수신은 아직 연결하지 않았다.
+로봇 본체·팔·헤드의 메시와 14축 정의는 제공된 Hongik 패키지의 참조 원본을 사용한다.
+
+**적용 상태:** 최신 구성의 URDF·EOAT·H형강 충돌 자산은
+`.runtime/imports/hongik_v4_hsteel/`에 생성했다. 2026-10-15 확인 시 Isaac Sim·관련 ROS
+프로세스와 관리 서버(8081)는 종료 상태다. 운영 `isaac_assets`는 아직 전환하지 않았다.
+아래 실행 명령만으로 새 구성이 적용되지는 않는다.
+새 USD·용접 TCP/프로필·충돌 장면·용접선을 함께 갱신한 뒤 전환한다.
+세부 사양과 생성 명령은 [최신 자산 구성](HONGIK_H_STEEL_IMPORT.md)을 따른다.
+
+운영 자산 경로:
 
 - `isaac_assets/construct.usd`: 로봇 USD
 - `isaac_assets/construct_scene.usda`: 바닥·조명·ROS 그래프를 포함한 씬
@@ -72,14 +90,7 @@ ROS 2 Jazzy 및 MoveIt/ros2_control은 `/opt/ros/jazzy`에 설치되어 있습�
 Isaac 환경 기본값은 `../.venvs/isaacsim-6.1`이며 `ISAACSIM_VENV`로 바꿀 수 있습니다.
 빌드한 파일과 생성한 URDF에는 절대경로가 있으므로 폴더 이동 후 두 명령을 다시 실행하세요.
 
-## 원본 관성값 보정
-
-원본 `right_D435_link`는 질량이 236.6848 kg, 무게중심이 링크에서 2 m 이상 떨어져 있어
-시뮬레이션에서 오른팔이 무너졌습니다. 좌우 D435 STL 1,252개 삼각형의 정점이
-약 1e-12 m 이내로 일치하는 것을 확인했습니다. 생성 URDF에서는 오른쪽 카메라에
-왼쪽의 관성(질량 0.0817263 kg, 로컬 무게중심, 관성텐서)을 복사합니다.
-원본 `src/construct_description` 파일과 ZIP은 유지됩니다. 이 값은 대칭 형상에 기반한
-시뮬레이션 보정이며 실측 관성 보정이 아닙니다. 내역은 manifest의 `inertia_overrides`에 있습니다.
+## 관절 제한
 
 헤드 원본 설정은 가속도 제한을 비활성화하므로 Jazzy의 시간 매개화(TOTG)가 실패합니다.
 생성되는 `moveit_joint_limits.yaml`에만 헤드 가속도 0.5 rad/s², 저크 2.0 rad/s³를
@@ -88,32 +99,18 @@ Isaac 환경 기본값은 `../.venvs/isaacsim-6.1`이며 `ISAACSIM_VENV`로 바�
 
 ## 범위
 
-- 기본 실행은 로봇만 구성합니다. 아래 통합 실행기로 ZED 2i stereo, 공식 Outpost와 Michelo 영상/깊이 스트림을 사용합니다. D435와 Helios는 아직 외형만 있습니다.
+- 기본 실행은 로봇만 구성합니다. 아래 통합 실행기로 ZED 2i stereo, 공식 Outpost와 Michelo 영상/깊이 스트림을 사용합니다. Hongik 레이저 센서의 데이터 수신은 별도 연결 대상입니다.
 - PhysX 관절 구동은 동작 검증용 게인입니다. 실제 모터나 접촉 동역학의 교정값이 아닙니다.
 - PhysX 내부 self-collision은 비활성화합니다. MoveIt은 원본 충돌 형상과 SRDF 제외쌍으로 경로를 검사합니다.
 - 기존 스케치 웹 앱은 RB10/RB20 단일 팔용입니다. RB 도장 워크플로는 유지합니다. Construct에는 아래 별도 로봇 모드로 영상 스케치와 선택한 팔의 경로 추종을 제공합니다.
 
 Isaac 6.x importer 변경은 [NVIDIA 문서](https://docs.isaacsim.omniverse.nvidia.com/latest/migration_guides/isaac_sim_6_0/urdf_mjcf_importer_exporter_pipeline.html)를 참고했습니다.
 
-## 검증 결과 (2026-10-12)
+## EOAT와 ZED / Outpost
 
-- 설정 테스트 4개 통과, 14축 USD 변환 및 PhysX 속도 제한 확인
-- 양팔·헤드 각 FollowJointTrajectory 왕복 성공
-- 양팔·헤드 각 MoveIt 경로 계획·실행·복귀 성공
-- 초기 자세 충돌 검사 통과, Ruckig 활성화 확인
-- GUI Stop→Play 초기 자세 복귀 오차 최대 0.000338 rad
-
-상세 결과: `logs/construct-validation.json`, `logs/construct-validation.log`,
-`logs/construct-scene-final.log`. 화면: `logs/construct-scene.png`.
-
-
-## EOAT와 ZED / Outpost 확장
-
-원본 좌우 `*_manipulator_link_ee`는 고정 공구입니다. 오른쪽은 긴 토치형,
-왼쪽은 짧은 오프셋 공구형 CAD이며 각 손목에 D435가 있습니다. 원본에 용접용
-기준점 이름이 있지만 공구 제조사·제품명·구동 인터페이스는 없으므로 특정 제품으로
-단정하지 않습니다. 용접 아크·와이어 송급·공구 개폐는 구현하지 않았습니다.
-`logs/construct-eoat.png`에 두 공구 메시를 따로 그린 참고 이미지가 있습니다.
+기본 장착은 왼팔 spray v2, 오른팔 Hongik V4 용접 EOAT와 레이저 센서다.
+용접 TCP는 컨택트 팁 끝면 중심이며 와이어 돌출은 별도 공정값으로 처리한다.
+용접 아크·와이어 송급 및 레이저 센서의 실제 데이터 수신은 구현하지 않았다.
 
 ZED 확장은 **ZED SDK가 좌우 영상으로 깊이를 계산**할 수 있도록 stereo 영상을 송신합니다.
 공식 Outpost에 추가한 로컬 입력 어댑터가 이 스트림을 받아 Michelo로 전달합니다.
@@ -292,7 +289,7 @@ Construct 장비 설정은 원래 실행기에 양팔의 그룹·TCP·관절·�
 현재 Construct 프로파일은 **ZED 평면을 이용한 비접촉 경로 이동 검증**입니다.
 기본 팔은 왼팔, 표면 이격은 0.30m, 채우기 폭은 0.05m입니다. 기존
 `spray_motion_test` 동작을 사용하여 분사 출력은 항상 꺼집니다. 가상 TCP와
-장착물은 원본 Construct URDF에서 가져오며, `isaac_assets/construct_*_eoat.json`
+장착물은 해당 실행에 적용된 생성 URDF에서 가져오며, `isaac_assets/construct_*_eoat.json`
 프로파일은 시뮬레이션 전용입니다. 실제 노즐 보정값으로 사용하지 않습니다.
 D405 접촉 도장·F/T 센서 시뮬레이션을 구현한 것으로 표시하지 않습니다.
 
@@ -318,37 +315,6 @@ rbpodo_painting_control, rbpodo_msgs를 동일한 Construct overlay에 빌드합
 이전에 만든 별도 Construct UI와 HTTP 스케치 실행기는 실행 경로에서 제거했고,
 로컬 `.runtime/retired-construct-sketch/`에 보관했습니다. 이전 스케치 검증 수치는
 그 별도 구현에 대한 것이므로 현재 원본 런타임의 검증 결과로 인용하지 않습니다.
-
-### 원본 런타임 통합 검사 (2026-10-13)
-
-원본 브라우저 화면에서 Isaac ZED 영상 → 평면 추출 → 작업영역 →
-스케치 경로 생성 → 원래 MoveIt 실행기의 충돌 검사 및 관절 명령까지 확인했습니다.
-H형강의 단색 재질은 스테레오 깊이를 불안정하게 만들어, 동일한 충돌 형상 위에
-밀스케일을 표현한 표면 질감을 추가했습니다. 깊이는 계속 실제 ZED SDK가
-좌우 영상에서 산출하며 Isaac의 정답 깊이로 대체하지 않습니다. 검사 ROI에서
-평면 RMS는 약 1.3mm, World 좌표 높이는 약 1.201m(모델 상면 1.200m),
-법선은 약 (0, 0, 1)이었습니다. 이는 해당 장면의 한 측정 결과입니다.
-
-통합 중 확인한 원래 실행기 문제도 수정했습니다. 충돌 장면을 topic과 service로
-중복 적용하던 부분은 응답을 확인하는 service만 사용합니다. 진단용 TF 조회는
-콜백 처리를 막지 않도록 즉시 조회하여, 기존 300ms 상태 신선도 검사를 유지합니다.
-관리 화면에서 시작 중에도 종료가 가능하며, 새 시작 요청과 종료 요청이 경합해
-종료 후 프로세스가 다시 시작되지 않도록 회귀 검사했습니다.
-
-검사 로그는 `logs/original-runtime-*-tests.log`에 있습니다. 관리 API 83개,
-브라우저 68개, 주요 연결 72개가 통과했고 최종 실행기/장비 검사 49개도 통과했습니다
-(검사 범위는 일부 중복됩니다). 전체 기존 실행기 검사에는 원본에서도 재현되는
-fixture 실패 및 Construct overlay에 설치하지 않은 RB 패키지 의존 오류가 남아
-있으므로 전체 테스트가 통과한 것으로 간주하지 않습니다.
-
-최종 왼팔 통합 실행에서 접근 궤적 79점과 스케치 Cartesian 궤적 14점이 모두
-컨트롤러 `Goal reached, success!`로 완료됐고, 원래 실행기는
-`all explicit segments complete`를 기록했습니다. 이어 별도 실행 중 원본 UI의
-작업 중단을 눌러 컨트롤러 취소 수락과 `running=false`, `motion_abort`를 확인했습니다.
-증거: `logs/original-runtime-ui-completed.json`, `logs/original-runtime-final-status.json`,
-`logs/construct-moveit.log`, `logs/system_api/executor.log`,
-`logs/original-sketch-completed.png`, `logs/original-sketch-cancelled.png`.
-오른팔 모델 계약/설정은 검사했지만 브라우저에서 끝까지 이동한 검증은 왼팔 기준입니다.
 
 ### 렌더링과 물리 주기 분리 (2026-10-13)
 
@@ -376,10 +342,10 @@ ROS로 별도 측정한 9.19초 동안 시뮬레이션은 6.44초 진행했고, 
 
 기존 시스템관리의 작업 방식을 `용접`으로 선택하면 동일한 ZED 스케치 화면에서 시험 심 선택과 Settings를 사용할 수 있습니다. 실행 순서, 추출기 계약, 통합 검증 방법은 [Isaac 용접 이동 시험](WELDING_ISAAC.md)을 참고하세요.
 
-## 왼팔 뿜칠 v2 EOAT (2026-10-13)
+## 왼팔 내화뿜칠 EOAT
 
 생성 모델의 왼팔을 Downloads의 `EOAT ass_y_ROBOI_Sharing_v2 (2).stp`에서
-추출한 강체 EOAT로 교체했다. 원본 Construct URDF와 오른팔은 유지한다.
+추출한 강체 EOAT를 사용한다. 오른팔은 Hongik V4 용접 EOAT와 레이저 센서를 사용한다.
 `assets/construct/spray_v2/mount.json`에 원본 해시, 좌표 변환, 포함·제외 부품과
 시뮬레이션 가정을 기록했다. 기존 왼팔 작업툴과 D435는 생성 모델에서 제거한다.
 
@@ -398,9 +364,7 @@ ROS로 별도 측정한 9.19초 동안 시뮬레이션은 6.44초 진행했고, 
 - MoveIt은 생성 `isaac_assets/construct.srdf`를 사용한다. 기존 왼팔 작업툴의
   충돌 제외쌍을 이어받지 않으며, 손목과 EOAT의 인접 제외쌍만 유지한다.
 
-현재 왼팔은 뿜칠 공정으로 사용한다. 용접 시험 토치를 사용하려면 적합한 팔·도구
-구성을 선택해야 한다. 기존 용접 토치를 새 분사건 TCP에 덧붙이는 것은 올바른
-장착 모델이 아니다.
+기본 작업 배정은 왼팔 내화뿜칠, 오른팔 용접이다. 공정별 TCP와 장착 형상을 함께 사용한다.
 
 메시 재추출은 독립 CAD 환경에서 `cadquery-ocp==8.0.1.1.0`, `trimesh`,
 `fast-simplification`, `numpy`, `scipy`를 설치하고 실행한다. 기존 체크인된
@@ -408,10 +372,28 @@ ROS로 별도 측정한 9.19초 동안 시뮬레이션은 6.44초 진행했고, 
 
 ```bash
 python scripts/export_spray_v2_step.py '/path/to/EOAT ass_y_ROBOI_Sharing_v2 (2).stp'
-python3 scripts/prepare_construct_assets.py
-.venv-api/bin/python scripts/prepare_construct_runtime.py
-OMNI_KIT_ACCEPT_EULA=YES bash scripts/setup_construct_isaac.sh
 ```
 
-USD 재생성 전에는 실행 중인 시뮬레이션을 종료한다. 기존 USD 백업은
-`.runtime/backups/before-spray-v2-*`에 있다. ROS와 Isaac은 재생성 후 함께 재시작한다.
+플랫폼 자산 생성은 [최신 자산 구성](HONGIK_H_STEEL_IMPORT.md)의 Hongik V4 명령을 사용한다.
+운영 전환 시 USD·ROS 설정을 함께 재생성하고 재시작한다.
+
+### 실행기 충돌 기준 동기화 (2026-10-15)
+
+`construct_executor.launch.py`는 `collision_srdf_path`로
+`isaac_assets/construct.srdf`를 실행기에 전달한다. MoveIt과 실행기가 같은 생성
+SRDF를 사용하므로 제거된 `left_D435_link`의 원본 충돌 제외쌍을 요구하지 않는다.
+명시한 파일이 없거나 파싱할 수 없으면 원본 SRDF로 되돌아가지 않고 실행을 차단한다.
+기존 충돌 검증은 유지한다.
+
+## 오른팔 Hongik V4 용접 EOAT와 레이저 센서
+
+- 구성: 브라켓·어댑터판·토치·레이저 센서·센서 가드.
+- 공구 메시 링크: `hongik_eoat_base_link`.
+- 센서 CAD 프레임: `hongik_laser_link`. 광학 교정 TF와 데이터 드라이버는 별도 연결한다.
+- TCP: `right_manipulator_ee_point`, 컨택트 팁 끝면 중심.
+- `right_manipulator_link_ee` → TCP: 위치 `(0.206216, 0.118535, -0.300173)` m,
+  rpy `(-3.141585, 0.523594, -2.617990)` rad.
+- TCP +Z는 와이어 방향, +Y는 위빙 기준축이다. 실측 보정 완료를 뜻하지 않는다.
+- 공구 질량 2 kg과 관성은 제공 원본의 payload·근사값이다.
+
+이 구성의 실행 통합 및 검증 상태는 [최신 자산 구성](HONGIK_H_STEEL_IMPORT.md)을 따른다.

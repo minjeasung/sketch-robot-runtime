@@ -1,5 +1,6 @@
 import json
 import time
+from types import SimpleNamespace
 
 from rbpodo_painting_control.painting_wrench_guard_node import (
     _log_guard_decision,
@@ -10,6 +11,7 @@ import rclpy
 from rclpy.context import Context
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
+from std_msgs.msg import Bool, String
 
 
 class _CapturePublisher:
@@ -162,6 +164,80 @@ def test_timer_status_provenance_is_monotonic_across_guard_transitions():
             published >= received
             for published, received in zip(published_at, received_at)
         )
+    finally:
+        if node is not None:
+            node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_public_motion_abort_immediately_blocks_output_and_cannot_be_cleared_by_monitor():
+    """A public stop must reach the output owner without an executor/monitor hop."""
+    rclpy.init(args=['--ros-args', '-p', 'public_motion_abort_requires_restart:=true'],
+               domain_id=231, signal_handler_options=SignalHandlerOptions.NO)
+    node = None
+    try:
+        node = PaintingWrenchGuardNode()
+        assert '/motion_abort' in [sub.topic_name for sub in node.subscriptions]
+        node._real_painting_enabled = True
+        node._status_pub = _CapturePublisher()
+        node._controller_pub = _CapturePublisher()
+        node._compliance_pub = _CapturePublisher()
+        node._motion_abort_pub = _CapturePublisher()
+        def accept_tf(now):
+            node._tf_valid = True
+            node._tf_checked_at = now
+        node._check_tf = accept_tf
+        _set_fresh_guard_state(node, mode='PAINT', force_enabled=True,
+                               force_y=-1.6, compliance_active=True)
+        node._on_timer()
+        assert node._controller_pub.messages[-1].wrench.force.y == -1.6
+
+        def unavailable_tf(now):
+            raise AssertionError('Emergency zero must not wait for a TF lookup')
+        node._check_tf = unavailable_tf
+        count = len(node._controller_pub.messages)
+        node._on_motion_abort(Bool(data=True))
+        assert len(node._controller_pub.messages) == count + 1
+        assert node._wrench_tuple(node._controller_pub.messages[-1]) == ZERO_WRENCH
+        assert node._compliance_pub.messages[-1].data is False
+        status = json.loads(node._status_pub.messages[-1].data)
+        assert status['abort_latched'] and not status['forwarding']
+        # The real compliance acknowledgement remains observable, never faked.
+        assert status['compliance_active'] is True
+
+        node._on_abort(Bool(data=False))
+        node._on_motion_abort(Bool(data=False))
+        node._on_mode(String(data='PAINT'))
+        node._on_enable(Bool(data=True))
+        node._on_timer()
+        assert node._wrench_tuple(node._controller_pub.messages[-1]) == ZERO_WRENCH
+        assert node._compliance_pub.messages[-1].data is False
+        node._on_mode(String(data='IDLE'))
+        node._on_enable(Bool(data=False))
+        response = node._on_reset_guard(None, SimpleNamespace())
+        assert not response.success
+        assert 'MOTION_ABORT_RESTART_REQUIRED' in response.message
+    finally:
+        if node is not None:
+            node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_legacy_guard_keeps_explicit_safe_reset_after_monitor_abort():
+    rclpy.init(args=[], domain_id=231, signal_handler_options=SignalHandlerOptions.NO)
+    node = None
+    try:
+        node = PaintingWrenchGuardNode()
+        assert '/motion_abort' not in [sub.topic_name for sub in node.subscriptions]
+        _set_fresh_guard_state(node, mode='IDLE', force_enabled=False,
+                               force_y=0.0, compliance_active=False)
+        node._tf_valid = True
+        node._on_abort(Bool(data=True))
+        node._on_abort(Bool(data=False))
+        node._external_fault_latched = True
+        response = node._on_reset_guard(None, SimpleNamespace())
+        assert response.success
+        assert not node._external_fault_latched
     finally:
         if node is not None:
             node.destroy_node()

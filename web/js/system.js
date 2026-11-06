@@ -5,7 +5,8 @@ const labels = {STOPPED: "종료", STARTING: "기동 중", RUNNING: "실행 중"
 const processLabels = {robot_control: "robot control"};
 const processLabel = name => processLabels[name] || name;
 function options() {
-  return {profile: byId("profile").value, robot_ip: byId("robot-ip").value.trim(), model_id: byId("model-id").value,
+  const runtime = RuntimeSettings.snapshot();
+  return {...(runtime ? {expected_revision: runtime.revision} : {}), profile: byId("profile").value, robot_ip: byId("robot-ip").value.trim(), model_id: byId("model-id").value,
     process_mode: ["spray_motion_test", "zed_preview"].includes(byId("profile").value) ? "spray" : byId("process-mode").value,
     spray_eoat_profile: byId("spray-eoat-profile").value,
     launch_zed_driver: byId("zed").checked, launch_d405_driver: byId("d405").checked,
@@ -19,14 +20,22 @@ async function api(path, method = "GET", body) {
   if (body !== undefined) headers["Content-Type"] = "application/json";
   const res = await fetch(path, {method, headers, ...(body === undefined ? {} : {body: JSON.stringify(body)})});
   const payload = await res.json();
-  if (!res.ok) throw new Error(typeof payload.detail === "string" ? payload.detail : JSON.stringify(payload.detail));
+  if (!res.ok) { const error = new Error(typeof payload.detail === "string" ? payload.detail : JSON.stringify(payload.detail)); error.status = res.status; throw error; }
   return payload;
 }
 function profileHelp() {
   const isaac = byId("profile").value === "isaac_construct";
+  const rb20 = byId("profile").value === "isaac_rb20_paint";
   if (["spray_motion_test", "zed_preview"].includes(byId("profile").value)) byId("process-mode").value = "spray";
-  for (const item of byId("model-id").options) item.disabled = item.value.startsWith("construct_") !== isaac;
+  for (const item of byId("model-id").options) item.disabled = rb20 ? item.value !== "rb20_1900es" : item.value.startsWith("construct_") !== isaac;
   if (byId("model-id").value.startsWith("construct_") !== isaac) byId("model-id").value = isaac ? "construct_left" : "rb10_1300e_u";
+  if (rb20) {
+    byId("model-id").value = "rb20_1900es";
+    byId("process-mode").value = "paint";
+    byId("camera-backend").value = "native";
+    for (const id of ["zed", "d405", "rviz"]) byId(id).checked = false;
+    for (const id of ["outpost-zed-hw-id", "outpost-zed-serial", "outpost-d405-hw-id", "outpost-d405-serial", "spray-eoat-profile"]) byId(id).value = "";
+  }
   if (isaac && !["spray", "weld"].includes(byId("process-mode").value)) byId("process-mode").value="spray";
   if (isaac) {
     byId("camera-backend").value = "outpost";
@@ -37,7 +46,8 @@ function profileHelp() {
       ? configured.spray_eoat_profile : `isaac_assets/${byId("model-id").value}_eoat.json`;
   }
   byId("profile-help").textContent = {
-    isaac_construct: "Construct Isaac Sim의 ZED 스트림을 기존 Outpost·Michelo·스케치 작업 흐름에 연결합니다. 선택한 팔로 뿜칠 또는 용접 경로를 실행합니다. 시뮬레이션 준비는 최대 5분 걸릴 수 있습니다.",
+    isaac_rb20_paint: "RB20 롤러 도장 시뮬레이션입니다. Isaac 카메라와 측정 관절·힘을 사용합니다. 시스템 준비 후 기존 스케치 화면의 작업 시작으로 실행합니다.",
+    isaac_construct: "상용로봇 플랫폼 Isaac Sim의 ZED 스트림을 기존 Outpost·Michelo·스케치 작업 흐름에 연결합니다. 선택한 팔로 뿜칠 또는 용접 경로를 실행합니다. 시뮬레이션 준비는 최대 5분 걸릴 수 있습니다.",
     zed_preview: "로봇 없이 ZED에서 대상·작업영역·도포 경로를 생성합니다. 로봇 도달성·충돌 검증과 이동 실행은 하지 않습니다.",
     dry_run: "실제 로봇·카메라에 연결하지만 작업 경로와 힘 출력은 모의 실행합니다.",
     work: "실제 이동과 도장 힘 제어를 허용합니다. 작업 실행은 스케치 화면에서 진행합니다.",
@@ -48,8 +58,10 @@ function profileHelp() {
 function controls() {
   const active = latest && latest.processes.some(p => p.pid !== null);
   const starting = latest && latest.processes.some(p => p.pid !== null && p.state === 'STARTING');
-  byId("start").disabled = pending || stopping || !latest || latest.system_prepared;
-  byId("stop").disabled = stopping || (pending && !starting) || !latest || (!active && !latest.degraded);
+  const runtimeApplying = ['stopping','building','starting'].includes(latest?.runtime_configuration?.phase || window.RuntimeSettings?.snapshot()?.phase);
+  byId("start").disabled = pending || stopping || runtimeApplying || !latest || latest.system_prepared;
+  byId("stop").disabled = stopping || (pending && !starting) || !latest || (!active && !latest.degraded && !runtimeApplying);
+  byId("runtime-stop").disabled = byId("stop").disabled;
   for (const id of ["profile", "process-mode", "spray-eoat-profile", "robot-ip", "model-id", "zed", "d405", "rviz", 'camera-backend',
     'outpost-http', 'outpost-zed-hw-id', 'outpost-zed-serial', 'outpost-d405-hw-id', 'outpost-d405-serial',
     'outpost-load', 'outpost-zed-select', 'outpost-d405-select']) byId(id).disabled = pending || stopping || active;
@@ -65,6 +77,13 @@ function controls() {
   if (byId("profile").value === "isaac_construct") {
     for (const id of ['spray-eoat-profile', 'outpost-http', 'outpost-zed-hw-id', 'outpost-zed-serial',
       'outpost-d405-hw-id', 'outpost-d405-serial', 'outpost-load', 'outpost-zed-select', 'outpost-d405-select']) byId(id).disabled = true;
+  }
+  if (byId("profile").value === "isaac_rb20_paint") {
+    byId("model-id").value = "rb20_1900es";
+    byId("process-mode").value = "paint";
+    byId("camera-backend").value = "native";
+    for (const id of ['model-id', 'process-mode', 'robot-ip', 'rviz', 'zed', 'd405', 'camera-backend', 'spray-eoat-profile']) byId(id).disabled = true;
+    for (const id of ['rviz', 'zed', 'd405']) byId(id).checked = false;
   }
   byId('outpost-settings').hidden = byId('camera-backend').value !== 'outpost';
   for (const button of document.querySelectorAll(".process-row button")) button.disabled = pending || stopping || !latest;
@@ -113,10 +132,15 @@ async function refresh() {
     }
     byId("state").textContent = state.degraded ? "프로세스 오류" : state.system_prepared ? "전체 프로세스 실행 중" : "API 연결됨";
     byId("domain").textContent = `ROS domain ${state.ros_domain_id}`;
-    byId("detail").textContent = `로봇: ${state.configuration.model_id || "rb10_1300e_u"} · 서버 실행 모드: ${state.configuration.profile} · 작업 방식: ${state.configuration.process_mode === "weld" ? "용접" : state.configuration.process_mode === "spray" || state.configuration.profile === "spray_motion_test" ? "내화뿜칠" : "롤러 도장"} · ${state.processes.filter(p => p.state === "RUNNING").length}/${state.processes.length} 실행 중`;
-    byId("readiness").textContent = state.ros.readiness ? JSON.stringify(state.ros.readiness) : "최신 ROS 작업 준비 상태를 기다리는 중입니다.";
+    byId("detail").textContent = `로봇: ${state.configuration.model_id || "rb10_1300e_u"} · ${state.runtime && state.runtime.simulation ? "시뮬레이션 · " : ""}서버 실행 모드: ${state.configuration.profile} · 공정: ${state.configuration.process_mode === "weld" ? "용접" : state.configuration.process_mode === "spray" || state.configuration.profile === "spray_motion_test" ? "내화뿜칠" : "롤러 도장"} · ${state.processes.filter(p => p.state === "RUNNING").length}/${state.processes.length} 실행 중`;
+    const readiness = state.ros.readiness;
+    byId("readiness").textContent = !readiness ? "최신 ROS 작업 준비 상태를 기다리는 중입니다."
+      : readiness.running ? "작업 실행 중" : readiness.ready ? "작업 준비됨"
+      : `${readiness.abort_reason ? "작업 중단 상태" : "작업 준비되지 않음"} · 고급 설정 / 진단에서 상세 상태를 확인하세요.`;
     byId("status-json").textContent = JSON.stringify(state, null, 2);
     renderProcesses(state);
+    RuntimeSettings.setLegacyStatus(state);
+    await RuntimeSettings.refresh();
     const logs = await api(`/processes/${encodeURIComponent(byId("log-process").value)}/logs?lines=150`);
     const box = byId("logs"), follow = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
     box.textContent = logs.lines.join("\n") || "아직 실행 로그가 없습니다.";
@@ -138,16 +162,18 @@ byId("start").addEventListener("click", () => perform(async () => {
   if (!latest.processes.some(p => p.pid !== null)) await api("/configuration", "POST", options());
   await api("/prepare-system", "POST");
 }));
-byId("stop").addEventListener("click", async () => {
+async function stopSystem() {
   const starting = latest && latest.processes.some(p => p.pid !== null && p.state === 'STARTING');
   if (stopping || !latest || (pending && !starting)) return;
   stopping = true; controls(); byId("error").textContent = "";
   try { await api("/shutdown-system", "POST"); }
   catch (error) { byId("error").textContent = error.message; }
   finally { stopping = false; await refresh(); }
-});
+}
+byId("stop").addEventListener("click", stopSystem);
+byId("runtime-stop").addEventListener("click", stopSystem);
 byId("profile").addEventListener("change", () => {
-  for (const id of ["zed", "d405", "rviz"]) byId(id).checked = !["fake", "zed_preview", "isaac_construct"].includes(byId("profile").value);
+  for (const id of ["zed", "d405", "rviz"]) byId(id).checked = !["fake", "zed_preview", "isaac_construct", "isaac_rb20_paint"].includes(byId("profile").value);
   if (byId("profile").value === "isaac_construct" || byId("outpost-zed-serial").value === "stream://127.0.0.1:30000") {
     for (const id of ['outpost-zed-hw-id', 'outpost-zed-serial', 'outpost-d405-hw-id', 'outpost-d405-serial', 'spray-eoat-profile']) byId(id).value = '';
   }
@@ -182,5 +208,6 @@ for (const name of ['zed', 'd405']) byId(`outpost-${name}-select`).addEventListe
 });
 const micheloUrl = new URL(location.href); micheloUrl.port = '8101'; micheloUrl.pathname = '/test/manual/camera/'; micheloUrl.search = ''; micheloUrl.hash = '';
 byId('michelo-link').href = micheloUrl.href;
+byId('runtime-michelo-link').href = micheloUrl.href;
 async function poll() { await refresh(); setTimeout(poll, 1500); }
 poll();

@@ -189,18 +189,49 @@ def validate_zed_surface_status(payload):
 
 
 def generate_spray_fill_strokes(rect, *, work_area_width_m, work_area_height_m,
-                               footprint_width_m, overlap):
-    """Generate spray coverage, with one center stroke for a narrow area.
+                               footprint_width_m, overlap, direction=None):
+    """Generate parallel spray strokes; overspray never reduces the cone.
 
-    The actual fan width is unchanged: a narrow area's spray footprint extends
-    beyond its sides, while the nozzle center path stays inside the selection.
+    Explicit horizontal/vertical/auto direction uses exact transverse footprint
+    spacing, centered on the selection. Auto follows its physical long axis to
+    minimize pass count. An omitted direction preserves legacy vertical fills.
     """
-    return generate_fill_strokes(
-        rect, work_area_width_m=work_area_width_m,
-        work_area_height_m=work_area_height_m,
-        roller_length_m=footprint_width_m, overlap=overlap,
-        allow_footprint_overhang=True,
-    )
+    if direction is None:
+        return generate_fill_strokes(
+            rect, work_area_width_m=work_area_width_m,
+            work_area_height_m=work_area_height_m,
+            roller_length_m=footprint_width_m, overlap=overlap,
+            allow_footprint_overhang=True,
+        )
+    if direction not in {"horizontal", "vertical", "auto"}:
+        raise WorkAreaGeometryError("spray direction must be horizontal, vertical, or auto")
+    u0, v0, u1, v1 = map(float, rect)
+    width, height = float(work_area_width_m), float(work_area_height_m)
+    diameter, overlap = float(footprint_width_m), float(overlap)
+    if not all(math.isfinite(v) for v in (u0, v0, u1, v1, width, height, diameter, overlap)):
+        raise WorkAreaGeometryError("spray fill geometry must be finite")
+    if u1 <= u0 or v1 <= v0 or width <= 0 or height <= 0 or diameter <= 0:
+        raise WorkAreaGeometryError("spray fill geometry must have positive extents")
+    if not 0 <= overlap < 1:
+        raise WorkAreaGeometryError("overlap must be in [0, 1)")
+    if direction == "auto":
+        direction = "horizontal" if width >= height else "vertical"
+    horizontal = direction == "horizontal"
+    cross_m = height if horizontal else width
+    step_m = diameter * (1 - overlap)
+    intervals = max(0., cross_m - diameter) / step_m
+    # An exact coverage boundary can round one ULP above an integer.
+    count = max(1, math.ceil(math.nextafter(intervals, -math.inf)) + 1)
+    low, high = (v0, v1) if horizontal else (u0, u1)
+    step_px = step_m / cross_m * (high - low)
+    first = (low + high) / 2 - (count - 1) * step_px / 2
+    strokes = []
+    for index in range(count):
+        center = first + index * step_px
+        a, b = (((u0, center), (u1, center)) if horizontal
+                else ((center, v0), (center, v1)))
+        strokes.append((a, b) if index % 2 == 0 else (b, a))
+    return tuple(strokes)
 
 
 def _finite_point2(point: Sequence[float], label: str) -> PixelPoint:

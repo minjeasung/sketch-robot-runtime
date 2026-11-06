@@ -32,12 +32,15 @@ test('image reconnect clears the old view and resubscribes without changing cont
   const ui = loadUI();
   const imageRos = ui.connections[1];
   assert.ok(imageRos);
+  const initialImageConnections = imageRos.connectCalls?.length || 0;
+  const initialControlConnections = ui.ros.connectCalls?.length || 0;
   await ui.previewFrame('/zed/zed_node/rgb/color/rect/image');
   imageRos.emit('close');
   assert.equal(ui.element('camera-empty').hidden, false);
   assert.equal(ui.evaluate('zedFrameCount'), 0);
   ui.runTimers(1500);
-  assert.equal(imageRos.connectCalls?.length, 1);
+  assert.equal(imageRos.connectCalls?.length, initialImageConnections + 1);
+  assert.equal(ui.ros.connectCalls?.length, initialControlConnections);
   imageRos.emit('connection');
   await ui.previewFrame('/zed/zed_node/rgb/color/rect/image');
   assert.equal(ui.evaluate('zedFrameCount'), 1);

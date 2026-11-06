@@ -617,6 +617,74 @@ TEST_F(AdmittanceControllerTest, failed_rule_does_not_write_nominal_position_to_
   EXPECT_EQ(joint_command_values_, previous_command);
 }
 
+TEST_F(AdmittanceControllerTest, simulation_zero_period_holds_last_command)
+{
+  SetUpController("test_admittance_controller", {rclcpp::Parameter("use_sim_time", true)});
+  ASSERT_EQ(controller_->on_configure(rclcpp_lifecycle::State()), NODE_SUCCESS);
+  ASSERT_EQ(controller_->on_activate(rclcpp_lifecycle::State()), NODE_SUCCESS);
+  ASSERT_EQ(controller_->update(rclcpp::Time(1, 0, RCL_ROS_TIME),
+      rclcpp::Duration::from_seconds(0.01)), controller_interface::return_type::OK);
+  const auto previous_command = joint_command_values_;
+  const auto previous_state = controller_->admittance_->get_controller_state();
+  ASSERT_TRUE(controller_->get_node()->get_clock()->ros_time_is_active());
+  // A new upstream reference must wait for advancing simulation time too.
+  auto references = controller_->export_reference_interfaces();
+  ASSERT_FALSE(references.empty());
+  ASSERT_TRUE(references[0]->set_value(previous_command[0] + 0.1));
+  EXPECT_EQ(controller_->update(rclcpp::Time(1, 0, RCL_ROS_TIME),
+      rclcpp::Duration::from_seconds(0.0)), controller_interface::return_type::OK);
+  EXPECT_EQ(joint_command_values_, previous_command);
+  EXPECT_EQ(controller_->admittance_->get_controller_state().joint_state.position,
+    previous_state.joint_state.position);
+  EXPECT_EQ(controller_->admittance_->get_controller_state().joint_state.velocity,
+    previous_state.joint_state.velocity);
+}
+
+TEST_F(AdmittanceControllerTest, simulation_negative_period_is_still_an_error)
+{
+  SetUpController("test_admittance_controller", {rclcpp::Parameter("use_sim_time", true)});
+  ASSERT_EQ(controller_->on_configure(rclcpp_lifecycle::State()), NODE_SUCCESS);
+  ASSERT_EQ(controller_->on_activate(rclcpp_lifecycle::State()), NODE_SUCCESS);
+  const auto previous_command = joint_command_values_;
+  EXPECT_EQ(controller_->update(rclcpp::Time(1, 0, RCL_ROS_TIME),
+      rclcpp::Duration::from_seconds(-0.01)), controller_interface::return_type::ERROR);
+  EXPECT_EQ(joint_command_values_, previous_command);
+}
+
+TEST_F(AdmittanceControllerTest, simulation_zero_period_does_not_skip_force_input_inhibition)
+{
+  SetUpController("test_admittance_controller", {rclcpp::Parameter("use_sim_time", true)});
+  ASSERT_EQ(controller_->on_configure(rclcpp_lifecycle::State()), NODE_SUCCESS);
+  ASSERT_EQ(controller_->on_activate(rclcpp_lifecycle::State()), NODE_SUCCESS);
+  controller_->seed_fresh_force_inputs_for_test();
+  ASSERT_EQ(controller_->update(rclcpp::Time(1, 0, RCL_ROS_TIME),
+      rclcpp::Duration::from_seconds(0.01)), controller_interface::return_type::OK);
+  ASSERT_TRUE(controller_->compliance_active_for_test());
+  fts_state_values_[0] = std::numeric_limits<double>::quiet_NaN();
+  const auto previous_command = joint_command_values_;
+  EXPECT_EQ(controller_->update(rclcpp::Time(1, 0, RCL_ROS_TIME),
+      rclcpp::Duration::from_seconds(0.0)), controller_interface::return_type::OK);
+  EXPECT_FALSE(controller_->compliance_active_for_test());
+  EXPECT_EQ(joint_command_values_, previous_command);
+}
+
+TEST_F(AdmittanceControllerTest, simulation_zero_period_keeps_steady_command_watchdogs)
+{
+  SetUpController("test_admittance_controller", {rclcpp::Parameter("use_sim_time", true)});
+  ASSERT_EQ(controller_->on_configure(rclcpp_lifecycle::State()), NODE_SUCCESS);
+  ASSERT_EQ(controller_->on_activate(rclcpp_lifecycle::State()), NODE_SUCCESS);
+  controller_->seed_fresh_force_inputs_for_test();
+  ASSERT_EQ(controller_->update(rclcpp::Time(1, 0, RCL_ROS_TIME),
+      rclcpp::Duration::from_seconds(0.01)), controller_interface::return_type::OK);
+  ASSERT_TRUE(controller_->compliance_active_for_test());
+  const auto previous_command = joint_command_values_;
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  EXPECT_EQ(controller_->update(rclcpp::Time(1, 0, RCL_ROS_TIME),
+      rclcpp::Duration::from_seconds(0.0)), controller_interface::return_type::OK);
+  EXPECT_FALSE(controller_->compliance_active_for_test());
+  EXPECT_EQ(joint_command_values_, previous_command);
+}
+
 int main(int argc, char ** argv)
 {
   ::testing::InitGoogleTest(&argc, argv);

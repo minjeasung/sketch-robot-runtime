@@ -20,17 +20,21 @@ def transform(origin):
     return matrix
 
 
-def prepare(root, output=None):
+def prepare(root, output=None, urdf_path=None):
     root = Path(root)
     output = Path(output or root / 'isaac_assets')
     output.mkdir(parents=True, exist_ok=True)
-    urdf = root / 'isaac_assets/construct_control.urdf'
+    urdf = Path(urdf_path) if urdf_path is not None else root / 'isaac_assets/construct_control.urdf'
     robot = ET.parse(urdf).getroot()
     links = {node.get('name'): node for node in robot.findall('link')}
     fixed = [node for node in robot.findall('joint') if node.get('type') == 'fixed']
     for side in ('left', 'right'):
         model = 'construct_' + side
         anchor = side + '_manipulator_link_ee'
+        hongik = side == 'right' and 'hongik_eoat_base_link' in links
+        # Hongik's physical tool and the TCP are sibling branches under link6.
+        if hongik:
+            anchor = 'right_manipulator_link6'
         tcp = side + '_manipulator_ee_point'
         poses = {anchor: np.eye(4)}
         for _ in fixed:
@@ -40,6 +44,8 @@ def prepare(root, output=None):
                     poses[child] = poses[parent] @ transform(joint.find('origin'))
         meshes = []
         for name, pose in poses.items():
+            if hongik and name == anchor:
+                continue  # include fixed tool branches, not the robot wrist
             for collision in links[name].findall('collision'):
                 element = collision.find('geometry/mesh')
                 if element is None:
@@ -70,8 +76,8 @@ def prepare(root, output=None):
         (output / (model + '_eoat.json')).write_text(json.dumps(profile, indent=2) + '\n')
         (output / (model + '_equipment.json')).write_text(json.dumps(dict(
             source='Construct URDF collision geometry; simulation only',
-            urdf=str(urdf), tcp=tcp, links=list(poses),
-            equipment_model='spray_v2' if side == 'left' else 'original',
+            urdf=str(urdf), tcp=tcp, links=[name for name in poses if not hongik or name != anchor],
+            equipment_model='spray_v2' if side == 'left' else 'hongik_v4' if hongik else 'original',
             tcp_calibrated=False,
             purpose='CAD nominal nozzle TCP; simulated motion only, no fluid/force output'
                     if side == 'left' else 'Non-contact path motion at the modeled TCP; no spray gun or force output'), indent=2) + '\n')

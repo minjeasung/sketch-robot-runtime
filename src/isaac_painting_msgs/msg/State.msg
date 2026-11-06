@@ -1,0 +1,13 @@
+std_msgs/Header header
+string session_id
+string scene_revision
+uint64 step_index
+string[] joint_names
+float64[] positions
+float64[] velocities
+float64[] efforts
+geometry_msgs/Wrench wrench
+geometry_msgs/Wrench gravity_wrench
+bool joints_valid
+bool wrench_valid
+bool playing

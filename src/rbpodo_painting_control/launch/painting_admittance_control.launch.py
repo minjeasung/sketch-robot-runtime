@@ -5,6 +5,7 @@ from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
+from rbpodo_painting_control.runtime_topics import painting_control_remappings
 
 
 RUNTIME_OVERRIDE_PARAMETERS = frozenset({
@@ -12,25 +13,30 @@ RUNTIME_OVERRIDE_PARAMETERS = frozenset({
     "dry_run",
     "enable_force",
     "real_painting_enabled",
+    "public_motion_abort_requires_restart",
 })
 
 
-def _parameter_layers(config_path, parameter_overrides):
+def _parameter_layers(config_path, parameter_overrides, wiring_overrides=None):
     """Use the shared YAML for tuning, with only explicit run interlocks on top."""
+    wiring = [wiring_overrides] if wiring_overrides else []
     if not config_path:
-        return [parameter_overrides]
+        return [parameter_overrides] + wiring
     runtime_overrides = {
         key: value
         for key, value in parameter_overrides.items()
         if key in RUNTIME_OVERRIDE_PARAMETERS
     }
-    return [config_path, runtime_overrides] if runtime_overrides else [config_path]
+    return ([config_path, runtime_overrides] if runtime_overrides else [config_path]) + wiring
 
 
 def _node_with_optional_config(context, *, node_kwargs, parameter_overrides):
     config_path = LaunchConfiguration("config_file").perform(context).strip()
-    parameters = _parameter_layers(config_path, parameter_overrides)
-    return [Node(parameters=parameters, **node_kwargs)]
+    namespace = LaunchConfiguration("namespace").perform(context).strip().rstrip('/')
+    wiring = {name: LaunchConfiguration(name).perform(context) for name in ("ft_frame", "tcp_frame")} if namespace else None
+    parameters = _parameter_layers(config_path, parameter_overrides, wiring_overrides=wiring)
+    return [Node(parameters=parameters, namespace=namespace,
+                 remappings=painting_control_remappings(namespace), **node_kwargs)]
 
 
 def generate_launch_description():
@@ -53,8 +59,10 @@ def generate_launch_description():
 
     args = [
         DeclareLaunchArgument("config_file", default_value=""),
+        DeclareLaunchArgument("namespace", default_value=""),
         DeclareLaunchArgument("dry_run", default_value="true"),
         DeclareLaunchArgument("real_painting_enabled", default_value="false"),
+        DeclareLaunchArgument("public_motion_abort_requires_restart", default_value="false"),
         DeclareLaunchArgument("enable_force", default_value="false"),
         DeclareLaunchArgument("desired_contact_force_n", default_value="0.0"),
         DeclareLaunchArgument("publish_rate_hz", default_value="100.0"),
@@ -151,6 +159,7 @@ def generate_launch_description():
                 "target_wrench_sign": float_param("target_wrench_sign"),
                 "desired_contact_force_n": float_param("desired_contact_force_n"),
                 "enable_force": bool_param("enable_force"),
+                "public_motion_abort_requires_restart": bool_param("public_motion_abort_requires_restart"),
                 "dry_run": bool_param("dry_run"),
                 "publish_rate_hz": float_param("publish_rate_hz"),
                 "force_ramp_up_duration_s": float_param("force_ramp_up_duration_s"),
@@ -193,6 +202,7 @@ def generate_launch_description():
                 "ft_frame": LaunchConfiguration("ft_frame"),
                 "tcp_frame": LaunchConfiguration("tcp_frame"),
                 "real_painting_enabled": bool_param("real_painting_enabled"),
+                "public_motion_abort_requires_restart": bool_param("public_motion_abort_requires_restart"),
                 "publish_rate_hz": float_param("publish_rate_hz"),
                 "requested_wrench_timeout_s": float_param(
                     "requested_wrench_timeout_s"
@@ -273,7 +283,9 @@ def generate_launch_description():
         },
     )
 
-    segment_mode = Node(
+    segment_mode = OpaqueFunction(function=lambda context: [Node(
+        namespace=LaunchConfiguration("namespace").perform(context),
+        remappings=painting_control_remappings(LaunchConfiguration("namespace").perform(context)),
         package="rbpodo_painting_control",
         executable="painting_segment_mode_node",
         name="painting_segment_mode",
@@ -287,7 +299,7 @@ def generate_launch_description():
                 "start_enable_force": bool_param("start_enable_force"),
             }
         ],
-    )
+    )])
 
     return LaunchDescription(
         args + [wrench_reference, force_monitor, wrench_guard, segment_mode]

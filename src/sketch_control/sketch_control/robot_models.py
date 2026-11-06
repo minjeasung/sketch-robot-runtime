@@ -6,7 +6,7 @@ import xml.etree.ElementTree as ET
 
 DEFAULT_MODEL = 'rb10_1300e_u'
 MODEL_LABELS = {DEFAULT_MODEL: 'RB10-1300E', 'rb20_1900es': 'RB20-1900ES'}
-CONSTRUCT_MODEL_LABELS = {'construct_left': 'Construct left arm', 'construct_right': 'Construct right arm'}
+CONSTRUCT_MODEL_LABELS = {'construct_left': '상용로봇 플랫폼 · 왼팔', 'construct_right': '상용로봇 플랫폼 · 오른팔'}
 JOINT_NAMES = ('base', 'shoulder', 'elbow', 'wrist1', 'wrist2', 'wrist3')
 
 

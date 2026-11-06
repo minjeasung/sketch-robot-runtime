@@ -1,0 +1,8 @@
+{
+  "archive": "h_steel_USD.zip",
+  "sha256": "6c5ba13883791f5337ec414694753be3009594ed0680f075e28367be05231748",
+  "files": {
+    "Steel Structure.usdc": "d030fd163469b01bcabb6c403d2685b9c3049ec804511e6ac412790e0ba226f8",
+    "textures/color_121212.hdr": "c4c6bc7a125abb414d9336a2b03c698f9db650c7917b69068beaedb569cb2291"
+  }
+}

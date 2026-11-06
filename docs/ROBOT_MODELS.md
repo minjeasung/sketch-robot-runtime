@@ -11,6 +11,10 @@
 이 두 모델만 지원한다. 다른 제조사/기종의 자동 호환을 의미하지 않는다.
 기존 `rb10_*.launch.py` 파일명은 호환성을 위해 유지하며 실제 모델은 `model_id`로 결정한다.
 
+RB20 롤러 도장의 Isaac 실행은 별도 `isaac_rb20_paint` 프로파일을 사용한다.
+준비·관리 화면·headless 진단과 현재 검증 범위는
+[RB20 도장 · Isaac Sim 실행 안내](RB20_PAINTING_ISAAC.md)를 참고한다.
+
 ```bash
 # PC별 config/sketch_runtime.env (Git 제외)
 SKETCH_MODEL_ID=rb20_1900es

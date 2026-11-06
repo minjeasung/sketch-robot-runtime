@@ -15,6 +15,55 @@ from .process_settings import settings_snapshot
 from .weld_trajectory import retime_travel
 
 
+def validate_weld_runtime(model_id, use_sim_time, profile_path, generated_description_file=''):
+    """Admit generated native welding only with the matching simulation description."""
+    from .robot_models import model_execution_contract
+    import xml.etree.ElementTree as ET
+    if not use_sim_time or model_id not in ('construct_left', 'construct_right', 'rb10_1300e_u'):
+        raise ValueError('welding requires a supported simulation robot')
+    profile = load_tool_profile(profile_path, model_id)
+    if not generated_description_file:
+        if model_id == 'rb10_1300e_u' or profile.collision_mode == 'native_urdf':
+            raise ValueError('native welding requires a generated simulation description')
+        return profile  # Existing Construct fixture and attached demonstration torch.
+    metadata = json.loads(Path(profile_path).read_text())
+    if (profile.collision_mode != 'native_urdf' or profile.profile_id != 'hongik_v4' or
+            Path(metadata['robot_description_file']).resolve() != Path(generated_description_file).resolve()):
+        raise ValueError('generated welding requires its matching native torch profile')
+    robot = ET.parse(generated_description_file).getroot()
+    controls = robot.findall('ros2_control')
+    if not controls:
+        raise ValueError('generated welding requires simulation hardware')
+    commanded = []
+    for control in controls:
+        if control.findtext('hardware/plugin') != 'topic_based_ros2_control/TopicBasedSystem':
+            raise ValueError('generated welding refuses physical or fake hardware plugins')
+        params = {p.get('name'): p.text for p in control.findall('hardware/param')}
+        if params.get('joint_commands_topic') != '/isaac_joint_command' or params.get('joint_states_topic') != '/joint_states':
+            raise ValueError('generated welding requires Isaac joint topics')
+        commanded.extend(j.get('name') for j in control.findall('joint')
+                         if j.find("command_interface[@name='position']") is not None)
+    contract = model_execution_contract(model_id)
+    if any(commanded.count(name) != 1 for name in contract['arm_joint_names']):
+        raise ValueError('generated welding requires exactly one simulator controller per active joint')
+    side = 'single' if model_id == 'rb10_1300e_u' else model_id.removeprefix('construct_')
+    native = f'{side}_hongik_v4_hongik_eoat_base_link'
+    if profile.native_collision_links != (native,):
+        raise ValueError('generated welding requires the selected native torch collision link')
+    # The native TCP and collision body must share the fixed wrist subtree.
+    descendants = {'link6' if side == 'single' else f'{side}_manipulator_link6'}
+    for _ in robot.findall('joint'):
+        previous = len(descendants)
+        for joint in robot.findall("joint[@type='fixed']"):
+            if joint.find('parent').get('link') in descendants:
+                descendants.add(joint.find('child').get('link'))
+        if len(descendants) == previous:
+            break
+    if native not in descendants or contract['ee_link'] not in descendants:
+        raise ValueError('native torch and TCP must be fixed to the selected wrist')
+    return profile
+
+
 def check_cartesian_result(result):
     if result.error_code.val!=1 or result.fraction<1.-1e-9: raise ValueError('complete collision-free Cartesian path required')
 
@@ -76,6 +125,7 @@ def scene_signature(scene):
 
 
 def tool_attachment(profile,ee_link):
+    if profile.collision_mode=='native_urdf':return None
     from moveit_msgs.msg import AttachedCollisionObject,CollisionObject
     from shape_msgs.msg import SolidPrimitive
     from geometry_msgs.msg import Pose
@@ -93,6 +143,10 @@ def tool_attachment(profile,ee_link):
 
 def check_tool_attachment(scene,profile,ee_link):
     expected=tool_attachment(profile,ee_link)
+    if expected is None:
+        if any(a.object.id=='weld_demo_torch' for a in scene.robot_state.attached_collision_objects):
+            raise ValueError('Native tool cannot have an additional demo torch')
+        return
     matches=[a for a in scene.robot_state.attached_collision_objects if a.object.id==expected.object.id]
     if len(matches)!=1: raise ValueError('torch collision attachment missing or duplicated')
     actual=matches[0]; obj=actual.object; want=expected.object
@@ -144,13 +198,13 @@ class WeldExecutionMixin:
         from moveit_msgs.msg import PlanningScene
         from control_msgs.action import FollowJointTrajectory
         from tf2_ros import Buffer,TransformListener
-        if not self.model_id.startswith('construct_') or not self.get_parameter('use_sim_time').value:
-            raise ValueError('welding currently requires Construct simulation')
         self.process_mode='weld'; self.executing=False
         self._weld_provider=self.declare_parameter('weld_input_provider','fixture').value
         if self._weld_provider not in ('fixture','external'): raise ValueError('invalid seam provider')
         path=self.declare_parameter('weld_tool_profile','').value
-        self._weld=WeldSession(load_tool_profile(path,self.model_id)); self._weld_output=SimWeldOutput()
+        profile=validate_weld_runtime(self.model_id,self.get_parameter('use_sim_time').value,path,
+                                     self.get_parameter('generated_description_file').value)
+        self._weld=WeldSession(profile); self._weld_output=SimWeldOutput()
         self._weld_pending_results={}
         self._weld_command_ack=None
         self._weld_seen=set(); self._weld_joints={}; self._weld_joint_stamp=0.; self._weld_joint_arrival=0.
@@ -263,6 +317,8 @@ class WeldExecutionMixin:
             elif op=='settings':
                 self._weld_output.configure(self._weld.apply_settings(p['values'])); self._weld_publish('/welding/preview',{'invalidated':True})
             elif op=='plan':
+                blocker=getattr(self,'_task_scene_blocker',lambda:'')()
+                if blocker:raise ValueError(blocker)
                 if self._weld.state=='PLANNING': raise ValueError('planning already in progress')
                 identity=self._weld.begin_plan()
                 self._weld_stationary_joints=tuple((n,v) for n,v in self._weld_joints.items() if n not in self.arm_joint_names)
@@ -284,6 +340,8 @@ class WeldExecutionMixin:
         if catalog!=self._weld.catalog: self._weld.accept_catalog(catalog)
 
     def _weld_ready_to_move(self):
+        blocker=getattr(self,'_task_scene_blocker',lambda:'')()
+        if blocker:raise ValueError(blocker)
         if (self._weld_scene_ready is not True or not self._weld_scene_signature or
                 self._weld_scene_dirty or self._weld_scene_refreshing): raise ValueError('collision scene not ready')
         if not set(self.arm_joint_names)<=self._weld_joints.keys(): raise ValueError('robot joints unavailable')
@@ -346,6 +404,9 @@ class WeldExecutionMixin:
         from moveit_msgs.srv import ApplyPlanningScene
         try:
             attached=tool_attachment(self._weld.profile,self.ee_link)
+            if attached is None:
+                self._weld_scene_dirty=True
+                return
             request=ApplyPlanningScene.Request(); request.scene.is_diff=True; request.scene.robot_state.is_diff=True
             request.scene.robot_state.attached_collision_objects=[attached]
             response=await self._weld_wait(self._weld_apply.call_async(request))

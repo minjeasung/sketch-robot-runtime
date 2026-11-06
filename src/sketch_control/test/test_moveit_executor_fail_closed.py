@@ -327,6 +327,9 @@ def _zero_distance_paint_executor(hold_s):
         _process_row_tcp_poses={1: _pose(0.4, 0.0, 0.5)},
         _process_last_tcp_pose=_pose(0.4, 0.0, 0.5),
         stationary_paint_hold_s=float(hold_s),
+        # The contact search found the nominal surface: no depth shift.
+        precontact_clearance_m=0.01,
+        _contact_search_distance_m=0.01,
         _start_stationary_paint_hold=lambda step, pose: calls.append(
             ("hold", step, pose)
         ),
@@ -548,7 +551,7 @@ def _dual_stage1_ik_executor():
             )
         ),
         get_logger=lambda: logger,
-        create_timer=lambda _period, callback: _FakeTimer(callback),
+        create_timer=lambda _period, callback, **_kwargs: _FakeTimer(callback),
         destroy_timer=lambda timer: destroyed_timers.append(timer),
         _send_stage1_plan=lambda constraints, label, **kwargs: plans.append(
             (constraints, label, kwargs)
@@ -1835,6 +1838,161 @@ def test_runtime_tare_correct_pose_with_stale_tf_sends_no_service(monkeypatch):
     assert "TF stale" in failures[0]
 
 
+def _arrival_tare_executor(monkeypatch, *, position_error=.0031):
+    clock = {"now": 10.0}
+    monkeypatch.setattr(moveit_executor.time, "monotonic", lambda: clock["now"])
+    executor, services, failures = _runtime_tare_geometry_executor(
+        tangent_position_error_m=position_error)
+    original_sample = executor._runtime_tare_tcp_pose_sample
+    sample = {"value": original_sample()}
+    executor._runtime_tare_tcp_pose_sample = lambda: sample["value"]
+    executor._active_segment_path.contact_geometry_offset_m = .026
+    executor.painting_force_enabled = executor.runtime_tare_enabled = True
+    executor._execution_free_space_confirmed = True
+    executor._runtime_tare_services_ready = lambda: True
+    executor.runtime_tare_min_clearance_m = .010
+    executor._active_surface_plane = lambda: ([0, 0, 0], [1, 0, 0])
+    executor._runtime_tare_timer = None
+    executor._runtime_tare_actual_metrics = {}
+    executor._runtime_tare_quiet_started_at = 0.0
+    executor.ft_required_timeout_s = .20
+    executor._safety_status_time = 10.0
+    executor._safety_status = {"ft_valid": True, "tf_valid": True,
+        "abort_latched": False, "contact_confirmed": False}
+    executor._guard_status.update(requested_force_norm_n=0.0, requested_torque_norm_nm=0.0)
+    executor._guard_status.update(ft_valid=True, tf_valid=True, abort_latched=False,
+        controller_fault=False, force_enable=False)
+    executor._guard_status_source_time = 10.0
+    executor._guard_status_sequence = 20
+    executor._painting_contact_confirmed = False
+    executor._painting_command_enable = False
+    executor._painting_command_force_n = 0.0
+    executor.get_clock = lambda: SimpleNamespace(ros_time_is_active=True)
+    timers = []
+    executor.create_timer = lambda period, callback, **kwargs: timers.append(
+        SimpleNamespace(cancel=lambda: timers.append("cancel"), callback=callback,
+            options=kwargs)) or timers[-1]
+    executor.destroy_timer = lambda timer: None
+    executor._cancel_runtime_tare_timer = lambda: moveit_executor.MoveItExecutor._cancel_runtime_tare_timer(executor)
+    executor._cancel_runtime_tare = lambda: moveit_executor.MoveItExecutor._cancel_runtime_tare(executor)
+    executor._transition_execution_state = lambda *_args, **_kwargs: None
+    executor._runtime_tare_tick = lambda: moveit_executor.MoveItExecutor._runtime_tare_tick(executor)
+    step = SimpleNamespace(mode="APPROACH_PRECONTACT", rows=[SimpleNamespace(offset_m=.010)])
+    planned = executor._runtime_tare_context["planned_tcp_pose"]
+    return executor, step, planned, sample, clock, services, failures, timers
+
+
+def test_precontact_arrival_converges_before_tare_and_starts_new_quiet_window(monkeypatch):
+    executor, step, planned, sample, clock, services, failures, timers = _arrival_tare_executor(monkeypatch)
+    moveit_executor.MoveItExecutor._begin_runtime_tare_before_contact(executor, step, planned)
+    assert failures == [] and services == []
+    assert executor._runtime_tare_phase == "WAIT_APPROACH_ARRIVAL"
+    assert timers[-1].options["clock"].clock_type == moveit_executor.ClockType.STEADY_TIME
+    position, quaternion, age = sample["value"][0]
+    position[1] = .0029
+    clock["now"] = 10.1
+    executor._guard_status_time = executor._guard_status_source_time = executor._safety_status_time = 10.1
+    moveit_executor.MoveItExecutor._runtime_tare_tick(executor)
+    assert executor._runtime_tare_phase == "SETTLING" and services == []
+    assert executor._runtime_tare_quiet_started_at == pytest.approx(10.1)
+    clock["now"] = 10.9
+    executor._guard_status_time = executor._guard_status_source_time = executor._safety_status_time = 10.9
+    moveit_executor.MoveItExecutor._runtime_tare_tick(executor)
+    assert failures == [] and len(services) == 1
+
+
+def test_precontact_arrival_persistent_error_times_out_without_hardware_tare(monkeypatch):
+    executor, step, planned, _, clock, services, failures, _ = _arrival_tare_executor(monkeypatch)
+    moveit_executor.MoveItExecutor._begin_runtime_tare_before_contact(executor, step, planned)
+    assert failures == []
+    clock["now"] = 12.01
+    executor._guard_status_time = executor._guard_status_source_time = executor._safety_status_time = 12.01
+    moveit_executor.MoveItExecutor._runtime_tare_tick(executor)
+    assert services == [] and "arrival" in failures[0]
+
+
+@pytest.mark.parametrize("fault", ["stale_tf", "contact", "clearance", "orientation", "identity", "force", "compliance", "guard_controller", "guard_abort", "guard_source"])
+def test_precontact_arrival_wait_never_defers_other_interlock_failure(monkeypatch, fault):
+    executor, step, planned, sample, _, services, failures, _ = _arrival_tare_executor(monkeypatch)
+    moveit_executor.MoveItExecutor._begin_runtime_tare_before_contact(executor, step, planned)
+    assert failures == [] and executor._runtime_tare_phase == "WAIT_APPROACH_ARRIVAL"
+    position, quaternion, age = sample["value"][0]
+    if fault == "stale_tf": sample["value"] = (None, "actual TCP TF stale")
+    if fault == "contact": executor._safety_status["contact_confirmed"] = True
+    if fault == "clearance": position[0] -= .004
+    if fault == "orientation":
+        sample["value"] = ((position, moveit_executor.quat_multiply(
+            [0, 0, .10, (.99)**.5], quaternion), age), "")
+    if fault == "identity": executor._current_plane_generation_id = "changed"
+    if fault == "force": executor._painting_command_enable = True
+    if fault == "compliance": executor._guard_status["compliance_active"] = True
+    if fault == "guard_controller": executor._guard_status["controller_fault"] = True
+    if fault == "guard_abort": executor._guard_status["abort_latched"] = True
+    if fault == "guard_source": executor._guard_status_source_time = 1.0
+    moveit_executor.MoveItExecutor._runtime_tare_tick(executor)
+    assert failures and services == []
+
+
+def test_abort_cancels_pending_precontact_arrival_without_tare(monkeypatch):
+    executor, step, planned, _, _, services, failures, timers = _arrival_tare_executor(monkeypatch)
+    moveit_executor.MoveItExecutor._begin_runtime_tare_before_contact(executor, step, planned)
+    assert failures == []
+    executor._motion_abort_requested = True
+    moveit_executor.MoveItExecutor._runtime_tare_tick(executor)
+    assert executor._runtime_tare_timer is None
+    assert "cancel" in timers and services == []
+
+
+def test_tare_geometry_failure_publishes_exact_metrics_and_pose_diagnostics(monkeypatch):
+    executor, _, planned, _, _, services, _, _ = _arrival_tare_executor(monkeypatch)
+    _, error, metrics = moveit_executor.MoveItExecutor._runtime_tare_actual_pose_guard(executor)
+    executor._runtime_tare_actual_metrics = metrics
+    published = []
+    executor._fail_workflow_known_safe = lambda reason, **fields: published.append(fields)
+    moveit_executor.MoveItExecutor._runtime_tare_fail(executor, error)
+    assert services == []
+    status = published[0]
+    assert status["tcp_position_error_m"] == pytest.approx(.0031)
+    assert status["planned_tcp"]["position"][1] == 0.0
+    assert status["actual_tcp"]["position"][1] == .0031
+
+
+def test_noop_second_approach_really_publishes_both_edges_before_tare(monkeypatch):
+    executor, step, planned, _, _, services, failures, _ = _arrival_tare_executor(monkeypatch)
+    step.force_n = 0.0
+    step.speed_mps = .005
+    step.rows[0].row_number = 9
+    executor.real_painting_enabled = False
+    executor._process_steps = [step]
+    executor._process_step_index = 0
+    executor._process_force_ready = False
+    executor._contact_collision_allowed = executor.ft_contact = False
+    executor.cartesian_client = SimpleNamespace(service_is_ready=lambda: True)
+    executor.stationary_paint_hold_s = 0.0
+    executor._process_last_tcp_pose = planned
+    executor._process_row_tcp_poses = {9: planned}
+    executor._contact_search_distance_m = .011
+    executor._execution_state = "TRAVEL"
+    executor.ft_normal_force_n = None
+    executor.get_logger = lambda: _Logger()
+    executor.get_clock = lambda: SimpleNamespace(ros_time_is_active=True,
+        now=lambda: SimpleNamespace(nanoseconds=20_000_000_000))
+    published = []
+    event_stream = []
+    executor.execution_status_pub = SimpleNamespace(publish=lambda msg: published.append(json.loads(msg.data)))
+    executor.execution_event_pub = SimpleNamespace(publish=lambda msg: event_stream.append(json.loads(msg.data)))
+    for name in ["_transition_execution_state", "_publish_execution_status", "_plan_process_motion_step",
+                 "_process_motion_done", "_begin_runtime_tare_before_contact"]:
+        setattr(executor, name, MethodType(getattr(moveit_executor.MoveItExecutor, name), executor))
+    moveit_executor.MoveItExecutor._execute_next_process_step(executor)
+    assert [event["state"] for event in published] == [
+        "APPROACH_PRECONTACT", "APPROACH_PRECONTACT", "PRECONTACT_TARE"]
+    assert published[-1]["previous_state"] == "APPROACH_PRECONTACT"
+    assert event_stream == published
+    assert [event["execution_sequence"] for event in event_stream] == [1, 2, 3]
+    assert failures == [] and services == []
+
+
 def _contact_search_ack_executor(
     *,
     safety_mode="CONTACT_SEARCH",
@@ -2029,7 +2187,8 @@ def test_early_contact_restores_acm_then_advances_to_ramp_up():
         _motion_abort_requested=False,
         _contact_search_cancel_on_contact=True,
         _contact_search_step_active=True,
-        _contact_search_context=object(),
+        _contact_search_context={"distance_m": 0.0005, "target": _pose(0.3, 0.0, 0.4)},
+        _contact_search_distance_m=0.002,
         _contact_search_confirmed=False,
         _process_step_index=0,
         _process_steps=[contact_step, ramp_step],
@@ -2073,6 +2232,8 @@ def test_early_contact_restores_acm_then_advances_to_ramp_up():
 
     assert executor._contact_search_confirmed is True
     assert executor._contact_search_step_active is False
+    assert executor._contact_search_distance_m == pytest.approx(0.0025)
+    assert executor._process_last_tcp_pose.position.x == pytest.approx(0.3)
     assert restores == [False]
     assert transitions == [
         ("CONTACT_SEARCH_COMPLETE", "early contact canceled active trajectory")
@@ -2102,7 +2263,8 @@ def test_early_contact_restore_failure_blocks_ramp_up_and_aborts():
         _motion_abort_requested=False,
         _contact_search_cancel_on_contact=True,
         _contact_search_step_active=True,
-        _contact_search_context=object(),
+        _contact_search_context={"distance_m": 0.0005, "target": _pose(0.3, 0.0, 0.4)},
+        _contact_search_distance_m=0.002,
         _contact_search_confirmed=False,
         _transition_execution_state=lambda *_args: None,
         _set_contact_collision_allowed=lambda _allowed, callback=None: (
@@ -2125,7 +2287,7 @@ def test_early_contact_restore_failure_blocks_ramp_up_and_aborts():
     assert aborts == ["CONTACT_SEARCH ACM restore failed"]
 
 
-def test_contact_search_guard_requests_one_cancel_after_contact():
+def test_contact_search_guard_marks_contact_without_canceling_bounded_step():
     token = object()
     cancel_future = _ControlledFuture()
     cancel_requests = []
@@ -2145,7 +2307,7 @@ def test_contact_search_guard_requests_one_cancel_after_contact():
         _contact_search_cancel_on_contact=False,
         _fjt_guard_timer=None,
         fjt_cancel_timeout_s=2.0,
-        create_timer=lambda _period, callback: _FakeTimer(callback),
+        create_timer=lambda _period, callback, **_kwargs: _FakeTimer(callback),
         destroy_timer=lambda _timer: None,
         get_logger=lambda: _Logger(),
         _post_tare_fjt_safety_blockers=lambda _now: (),
@@ -2178,8 +2340,10 @@ def test_contact_search_guard_requests_one_cancel_after_contact():
     timer.callback()
 
     assert executor._contact_search_cancel_on_contact is True
-    assert executor._active_trajectory_cancel_requested is True
-    assert cancel_requests == [True]
+    assert executor._contact_search_cancel_token is token
+    assert executor._active_trajectory_cancel_requested is False
+    assert cancel_requests == []
+    assert executor._active_trajectory_goal_token is token
 
 
 def test_contact_search_canceled_result_completes_early_contact_without_abort():
@@ -2296,7 +2460,7 @@ def _contact_search_fjt_race_executor(
         traj_action_client=client,
         executing=True,
         get_logger=lambda: _Logger(),
-        create_timer=lambda _period, callback: (
+        create_timer=lambda _period, callback, **_kwargs: (
             timers.append(_FakeTimer(callback)) or timers[-1]
         ),
         destroy_timer=lambda _timer: None,
@@ -2390,6 +2554,9 @@ def test_contact_then_success_result_beats_late_cancel_response_exactly_once():
     race = _contact_search_fjt_race_executor(result_future)
 
     race.timers[0].callback()
+    # Explicit cancellation may race a terminal result even though the
+    # contact guard no longer cancels its short bounded step automatically.
+    race.executor._cancel_active_follow_joint_goal("explicit contact stop")
     assert race.cancel_requests == [True]
 
     result_future.resolve(_successful_fjt_result())
@@ -2409,6 +2576,9 @@ def test_contact_terminal_cancel_rejection_and_success_converge_exactly_once(
     result_future = _ControlledFuture()
     race = _contact_search_fjt_race_executor(result_future)
     race.timers[0].callback()
+    # Explicit cancellation may race a terminal result even though the
+    # contact guard no longer cancels its short bounded step automatically.
+    race.executor._cancel_active_follow_joint_goal("explicit contact stop")
     assert race.cancel_requests == [True]
 
     if cancel_response_first:
@@ -2428,6 +2598,9 @@ def test_contact_cancel_accepted_then_canceled_result_completes_once():
     result_future = _ControlledFuture()
     race = _contact_search_fjt_race_executor(result_future)
     race.timers[0].callback()
+    # Explicit cancellation may race a terminal result even though the
+    # contact guard no longer cancels its short bounded step automatically.
+    race.executor._cancel_active_follow_joint_goal("explicit contact stop")
     race.cancel_future.resolve(SimpleNamespace(goals_canceling=[object()]))
     result_future.resolve(
         SimpleNamespace(
@@ -2517,6 +2690,9 @@ def test_contact_before_goal_response_sends_one_cancel_and_preserves_deadline():
     )
 
     race.timers[0].callback()
+    # Explicit cancellation may race a terminal result even though the
+    # contact guard no longer cancels its short bounded step automatically.
+    race.executor._cancel_active_follow_joint_goal("explicit contact stop")
     first_deadline = race.executor._active_trajectory_cancel_deadline
     assert race.executor._active_trajectory_cancel_requested is True
     assert first_deadline > 0.0
@@ -2598,6 +2774,9 @@ def test_get_result_request_failure_still_sends_queued_cancel(monkeypatch):
     )
 
     race.timers[0].callback()
+    # Explicit cancellation may race a terminal result even though the
+    # contact guard no longer cancels its short bounded step automatically.
+    race.executor._cancel_active_follow_joint_goal("explicit contact stop")
     first_deadline = race.executor._active_trajectory_cancel_deadline
     clock["now"] = 11.9
     race.client.futures[0].resolve(race.handle)
@@ -2924,7 +3103,7 @@ def test_d405_prescan_progress_states_do_not_invalidate_or_abort(state):
     assert statuses == []
 
 
-def test_d405_prescan_accepts_new_generation_without_hard_abort():
+def test_d405_prescan_requires_new_generation_geometry_without_hard_abort():
     executor, aborts, lock_resets, statuses = (
         _d405_prescan_status_executor()
     )
@@ -2943,15 +3122,16 @@ def test_d405_prescan_accepts_new_generation_without_hard_abort():
         executor, message
     )
 
-    assert executor._d405_plane_accepted is True
-    assert executor._current_plane_generation_id == "plane-new"
-    assert executor._d405_refined_pose_armed is True
-    assert executor._d405_refined_pose_generation_id == "plane-new"
+    assert executor._d405_plane_accepted is False
+    assert executor._current_plane_generation_id == "plane-old"
+    # Metadata alone cannot arm a later bare pose on another topic.
+    assert executor._d405_refined_pose_armed is False
+    assert executor._d405_refined_pose_generation_id == ""
     assert executor._accepted_plan_hash == ""
     assert executor._accepted_plan_path_id == ""
     assert aborts == []
-    assert lock_resets == [("new accepted plane generation", True)]
-    assert statuses == [("PLAN_INVALIDATED", "PLANE_GENERATION_CHANGED")]
+    assert lock_resets == [("accepted geometry missing", True)]
+    assert statuses == []
 
 
 def test_d405_prescan_rejection_clears_candidate_without_hard_abort():
@@ -3102,7 +3282,7 @@ def test_fjt_cancel_timeout_keeps_active_unknown_token_and_republishes_abort(
         _execution_abort_reason="motion_abort",
         executing=False,
         _cancel_fjt_guard_timer=lambda: cancel_timer_calls.append(True),
-        create_timer=lambda _period, callback: (
+        create_timer=lambda _period, callback, **_kwargs: (
             callbacks.append(callback) or object()
         ),
         _publish_motion_abort_latch=lambda: abort_publications.append(True),
@@ -3297,7 +3477,7 @@ def _post_tare_fjt_guard_executor(*, tare_ready, status_time, status):
         _safety_status=status,
         ft_required_timeout_s=0.20,
         _cancel_fjt_guard_timer=lambda: None,
-        create_timer=lambda _period, callback: (
+        create_timer=lambda _period, callback, **_kwargs: (
             callbacks.append(callback) or object()
         ),
         _request_motion_abort=lambda reason: aborts.append(str(reason)),
@@ -3594,7 +3774,7 @@ def _ramp_executor(clock, step, initial_mode, *, initial_active):
         painting_force_pub=_DiscardPublisher(),
         painting_enable_pub=_DiscardPublisher(),
         painting_mode_pub=_DiscardPublisher(),
-        create_timer=lambda _period, callback: _FakeTimer(callback),
+        create_timer=lambda _period, callback, **_kwargs: _FakeTimer(callback),
         destroy_timer=lambda _timer: None,
         _transition_execution_state=lambda *_args, **_kwargs: None,
         _schedule_process_once=lambda delay, callback: scheduled.append(
@@ -4039,7 +4219,7 @@ def test_paint_cartesian_timeout_invalidates_late_result_without_dispatch():
         _segment_cartesian_context=context,
         _segment_cartesian_timeout_timer=None,
         _motion_abort_requested=False,
-        create_timer=lambda _period, callback: timers.append(
+        create_timer=lambda _period, callback, **_kwargs: timers.append(
             _FakeTimer(callback)
         )
         or timers[-1],
@@ -4116,7 +4296,7 @@ def test_force_lease_survives_paint_result_gap_and_aborts_on_stale_guard(
         _force_phase_lease_context=None,
         _force_phase_watchdog_timer=None,
         _motion_abort_requested=False,
-        create_timer=lambda _period, callback: timers.append(
+        create_timer=lambda _period, callback, **_kwargs: timers.append(
             _FakeTimer(callback)
         )
         or timers[-1],
@@ -4186,3 +4366,271 @@ def test_external_spray_stop_does_not_attribute_unrelated_force_diagnostic(
     assert executor._execution_abort_reason == expected
     assert statuses[-1] == ("ABORT", expected)
     assert commands == [(("ABORT", 0.0), {"enable": False})]
+
+
+def _trajectory_deadline_executor(monkeypatch, *, simulation):
+    """Dispatch a real trajectory and drive its guard with separate clocks."""
+    wall, ros = {'now': 200.0}, {'now': 100.0}
+    monkeypatch.setattr(moveit_executor.time, 'monotonic', lambda: wall['now'])
+    clock = SimpleNamespace(ros_time_is_active=simulation,
+        now=lambda: SimpleNamespace(nanoseconds=int(ros['now'] * 1e9)))
+    timers, aborts, unknown = [], [], []
+    def create_timer(period, callback, **kwargs):
+        timer = _FakeTimer(callback)
+        timers.append((timer, kwargs))
+        return timer
+    executor = SimpleNamespace(
+        _motion_abort_requested=False, _active_trajectory_goal_token=None,
+        _active_trajectory_cancel_requested=False, _fjt_guard_timer=None,
+        fjt_result_timeout_margin_s=5.0, traj_action_client=_QueuedActionClient(),
+        executing=True, get_logger=lambda: _Logger(), get_clock=lambda: clock,
+        _trajectory_within_joint_limits=lambda *_args: True,
+        _point_time_sec=lambda point: point.time_from_start.sec + point.time_from_start.nanosec * 1e-9,
+        create_timer=create_timer, destroy_timer=lambda _timer: None,
+        _post_tare_fjt_safety_blockers=lambda _now: (),
+        _request_motion_abort=lambda reason: aborts.append(reason),
+        _latch_fjt_motion_unknown=lambda *args: unknown.append(args),
+    )
+    for name in ('_start_fjt_guard_timer', '_cancel_fjt_guard_timer', '_clear_active_follow_joint_goal'):
+        setattr(executor, name, MethodType(getattr(moveit_executor.MoveItExecutor, name), executor))
+    trajectory = _robot_trajectory([[0.0] * 6], times=[21.6])
+    assert moveit_executor.MoveItExecutor._execute_trajectory_follow_joint(executor, trajectory, label='D405 prescan')
+    return SimpleNamespace(executor=executor, wall=wall, ros=ros, timers=timers, aborts=aborts, unknown=unknown)
+
+
+def test_simulation_trajectory_result_deadline_tracks_slow_ros_time(monkeypatch):
+    trace = _trajectory_deadline_executor(monkeypatch, simulation=True)
+    trace.wall['now'] = 227.0  # Original wall deadline was 226.6.
+    trace.ros['now'] = 120.25  # RTF 0.75: the trajectory is still executing.
+    trace.timers[0][0].callback()
+    assert trace.aborts == []
+    trace.wall['now'] = 236.0
+    trace.ros['now'] = 127.0  # Its own ROS duration + margin has now expired.
+    trace.timers[0][0].callback()
+    assert trace.aborts == ['FJT_RESULT_TIMEOUT:D405 prescan']
+
+
+def test_simulation_frozen_clock_does_not_freeze_cancellation_deadline(monkeypatch):
+    from rclpy.clock import ClockType
+    trace = _trajectory_deadline_executor(monkeypatch, simulation=True)
+    timer, options = trace.timers[0]
+    assert options['clock'].clock_type == ClockType.STEADY_TIME
+    trace.executor._motion_abort_requested = True
+    trace.executor._active_trajectory_cancel_requested = True
+    trace.executor._active_trajectory_cancel_deadline = 202.0
+    trace.wall['now'] = 202.1  # ROS time remains 100.0.
+    timer.callback()
+    assert trace.unknown == [(trace.executor._active_trajectory_goal_token,
+                             'D405 prescan', 'FJT_CANCEL_TIMEOUT')]
+    assert trace.aborts == []
+
+
+def test_physical_trajectory_retains_wall_result_deadline_and_timer(monkeypatch):
+    trace = _trajectory_deadline_executor(monkeypatch, simulation=False)
+    assert trace.timers[0][1] == {}
+    trace.wall['now'] = 227.0
+    trace.timers[0][0].callback()
+    assert trace.aborts == ['FJT_RESULT_TIMEOUT:D405 prescan']
+
+
+def test_trajectory_clear_discards_simulation_deadline(monkeypatch):
+    trace = _trajectory_deadline_executor(monkeypatch, simulation=True)
+    assert trace.executor._active_trajectory_sim_result_deadline == pytest.approx(126.6)
+    trace.executor._clear_active_follow_joint_goal(trace.executor._active_trajectory_goal_token)
+    assert trace.executor._active_trajectory_sim_result_deadline is None
+
+
+def test_simulation_guard_really_ticks_without_clock_publications(monkeypatch):
+    import rclpy
+    from rclpy.context import Context
+    from rclpy.executors import SingleThreadedExecutor
+    from rclpy.parameter import Parameter
+    trace = _trajectory_deadline_executor(monkeypatch, simulation=True)
+    trace.executor._cancel_fjt_guard_timer()
+    context = Context()
+    context.init(domain_id=119)
+    node = rclpy.create_node('fjt_frozen_clock_regression', context=context,
+        parameter_overrides=[Parameter('use_sim_time', value=True)])
+    ros_executor = SingleThreadedExecutor(context=context)
+    ros_executor.add_node(node)
+    try:
+        assert node.get_clock().ros_time_is_active
+        assert node.get_clock().now().nanoseconds == 0
+        trace.executor.get_clock = node.get_clock
+        trace.executor.create_timer = node.create_timer
+        trace.executor.destroy_timer = node.destroy_timer
+        trace.executor._start_fjt_guard_timer(trace.executor._active_trajectory_goal_token,
+                                             'D405 prescan', False)
+        trace.executor._motion_abort_requested = True
+        trace.executor._active_trajectory_cancel_requested = True
+        trace.executor._active_trajectory_cancel_deadline = 202.0
+        trace.wall['now'] = 202.1
+        for _ in range(10):
+            ros_executor.spin_once(timeout_sec=0.05)
+            if trace.unknown:
+                break
+        assert trace.unknown == [(trace.executor._active_trajectory_goal_token,
+                                 'D405 prescan', 'FJT_CANCEL_TIMEOUT')]
+        assert node.get_clock().now().nanoseconds == 0
+    finally:
+        trace.executor._cancel_fjt_guard_timer()
+        ros_executor.shutdown()
+        node.destroy_node()
+        context.shutdown()
+
+
+def test_contact_search_natural_result_completes_once_without_cancel():
+    result_future = _ControlledFuture()
+    race = _contact_search_fjt_race_executor(result_future)
+    race.timers[0].callback()
+    assert race.cancel_requests == []
+    assert race.completions == []
+    result_future.resolve(_successful_fjt_result())
+    assert race.completions == [True]
+    assert race.normal_completions == []
+    assert race.aborts == []
+    assert race.executor._active_trajectory_goal_token is None
+
+
+def test_contact_depth_correction_uses_accumulated_search_and_outward_normal():
+    executor = SimpleNamespace(precontact_clearance_m=.01, _contact_search_distance_m=.007,
+                               get_logger=lambda: _Logger())
+    pose = _pose(.4,.1,.5)
+    step = SimpleNamespace(rows=[SimpleNamespace(normal=(1.,0.,0.))])
+    moveit_executor.MoveItExecutor._apply_contact_depth_correction(executor, step, [pose])
+    assert pose.position.x == pytest.approx(.403)
+    assert pose.position.y == pytest.approx(.1)
+    executor._contact_search_distance_m=.013
+    moveit_executor.MoveItExecutor._apply_contact_depth_correction(executor, step, [pose])
+    assert pose.position.x == pytest.approx(.4)
+
+
+@pytest.mark.parametrize('process,label',[('spray','SPRAY'),('paint','ROLLER')])
+def test_stage1_orientation_rejection_names_selected_process(process,label):
+    node,client,plans,failures=_dual_stage1_ik_executor()
+    node.process_mode=process
+    node._request_stage1_orientation_candidate_iks()
+    for future in client.futures:future.resolve(_stage1_ik_response(error_code=-31))
+    assert failures[0].startswith('NO_COLLISION_FREE_'+label+'_ORIENTATION:')
+    assert plans==[]
+    failures.clear()
+    moveit_executor.MoveItExecutor._try_next_stage1_orientation_branch(node,'MOVEIT_ERROR_99999')
+    assert failures==['ALL_'+label+'_ORIENTATION_PLANS_REJECTED:MOVEIT_ERROR_99999']
+
+
+def _arrival_tick_at(executor, clock, now):
+    clock['now'] = now
+    executor._guard_status_time = executor._guard_status_source_time = executor._safety_status_time = now
+    moveit_executor.MoveItExecutor._runtime_tare_tick(executor)
+
+
+def test_precontact_settling_position_excursion_restarts_full_quiet_window(monkeypatch):
+    executor, step, planned, sample, clock, services, failures, timers = _arrival_tare_executor(
+        monkeypatch, position_error=.002967)
+    executor.runtime_tare_quiet_s = 3.0
+    confirmations = []
+    executor._publish_free_space_confirmation = confirmations.append
+    moveit_executor.MoveItExecutor._begin_runtime_tare_before_contact(executor, step, planned)
+    assert executor._runtime_tare_phase == 'SETTLING'
+    _arrival_tick_at(executor, clock, 10.1)
+    assert executor._runtime_tare_quiet_started_at == 10.1
+    sample['value'][0][0][1] = .003006
+    _arrival_tick_at(executor, clock, 10.5)
+    assert failures == [] and services == []
+    assert executor._runtime_tare_phase == 'WAIT_APPROACH_ARRIVAL'
+    assert executor._runtime_tare_quiet_started_at == 0.0
+    assert confirmations[-1] is False
+    sample['value'][0][0][1] = .0029
+    _arrival_tick_at(executor, clock, 10.8)
+    assert executor._runtime_tare_phase == 'SETTLING'
+    assert executor._runtime_tare_quiet_started_at == 10.8
+    _arrival_tick_at(executor, clock, 13.7)
+    assert services == []
+    _arrival_tick_at(executor, clock, 13.81)
+    assert failures == [] and len(services) == 1
+
+
+def test_precontact_settling_repeated_excursions_never_extend_original_arrival_deadline(monkeypatch):
+    executor, step, planned, sample, clock, services, failures, timers = _arrival_tare_executor(
+        monkeypatch, position_error=.0029)
+    moveit_executor.MoveItExecutor._begin_runtime_tare_before_contact(executor, step, planned)
+    for now, error in [(10.5, .0031), (11.2, .0029), (11.8, .0031)]:
+        sample['value'][0][0][1] = error
+        _arrival_tick_at(executor, clock, now)
+        assert failures == [] and services == []
+    assert executor._runtime_tare_phase == 'WAIT_APPROACH_ARRIVAL'
+    # Even an in-band pose after the original deadline cannot restart settling.
+    sample['value'][0][0][1] = .0029
+    _arrival_tick_at(executor, clock, 12.01)
+    assert len(failures) == 1 and 'arrival timed out' in failures[0]
+    assert services == [] and executor._runtime_tare_started_at == 10.0
+
+
+def test_precontact_in_band_start_uses_steady_timer_for_later_arrival_wait(monkeypatch):
+    executor, step, planned, sample, clock, services, failures, timers = _arrival_tare_executor(
+        monkeypatch, position_error=.0029)
+    moveit_executor.MoveItExecutor._begin_runtime_tare_before_contact(executor, step, planned)
+    assert timers[-1].options['clock'].clock_type == moveit_executor.ClockType.STEADY_TIME
+    sample['value'][0][0][1] = .0031
+    _arrival_tick_at(executor, clock, 10.5)
+    # Simulated ROS time never advances in this fixture; the steady timer still
+    # services the original wall deadline rather than waiting for /clock.
+    clock['now'] = 12.01
+    executor._guard_status_time = executor._guard_status_source_time = executor._safety_status_time = 12.01
+    timers[-1].callback()
+    assert len(failures) == 1 and 'arrival timed out' in failures[0]
+    assert services == []
+
+
+@pytest.mark.parametrize('fault', ['stale_tf', 'contact', 'clearance', 'orientation', 'identity',
+                                   'force', 'compliance', 'guard_controller', 'guard_abort', 'guard_source'])
+def test_precontact_settling_excursion_never_defers_nonposition_interlock_fault(monkeypatch, fault):
+    executor, step, planned, sample, clock, services, failures, _ = _arrival_tare_executor(
+        monkeypatch, position_error=.0029)
+    moveit_executor.MoveItExecutor._begin_runtime_tare_before_contact(executor, step, planned)
+    position, quaternion, age = sample['value'][0]
+    position[1] = .003006
+    if fault == 'stale_tf': sample['value'] = (None, 'actual TCP TF stale')
+    if fault == 'contact': executor._safety_status['contact_confirmed'] = True
+    if fault == 'clearance': position[0] -= .004
+    if fault == 'orientation': sample['value'] = ((position, moveit_executor.quat_multiply([0, 0, .10, (.99)**.5], quaternion), age), '')
+    if fault == 'identity': executor._current_plane_generation_id = 'changed'
+    if fault == 'force': executor._painting_command_enable = True
+    if fault == 'compliance': executor._guard_status['compliance_active'] = True
+    if fault == 'guard_controller': executor._guard_status['controller_fault'] = True
+    if fault == 'guard_abort': executor._guard_status['abort_latched'] = True
+    if fault == 'guard_source': executor._guard_status_source_time = 1.0
+    moveit_executor.MoveItExecutor._runtime_tare_tick(executor)
+    assert len(failures) == 1 and services == []
+    assert executor._runtime_tare_phase != 'WAIT_APPROACH_ARRIVAL'
+
+
+@pytest.mark.parametrize('phase', ['HARDWARE_TARE_PENDING', 'WAIT_FINITE_FT', 'SAFETY_RESET_PENDING',
+                                   'WAIT_MONITOR_BIAS', 'GUARD_RESET_PENDING', 'WAIT_GUARD_STATUS'])
+def test_position_excursion_after_hardware_tare_starts_fails_immediately(monkeypatch, phase):
+    executor, step, planned, sample, _, services, failures, _ = _arrival_tare_executor(
+        monkeypatch, position_error=.0029)
+    moveit_executor.MoveItExecutor._begin_runtime_tare_before_contact(executor, step, planned)
+    executor._runtime_tare_phase = phase
+    sample['value'][0][0][1] = .003006
+    moveit_executor.MoveItExecutor._runtime_tare_tick(executor)
+    assert len(failures) == 1 and 'position error' in failures[0]
+    assert services == [] and executor._runtime_tare_phase == phase
+
+
+def test_first_settling_position_excursion_after_original_deadline_fails(monkeypatch):
+    executor, step, planned, sample, clock, services, failures, _ = _arrival_tare_executor(
+        monkeypatch, position_error=.0029)
+    moveit_executor.MoveItExecutor._begin_runtime_tare_before_contact(executor, step, planned)
+    sample['value'][0][0][1] = .003006
+    _arrival_tick_at(executor, clock, 12.01)
+    assert len(failures) == 1 and 'position error' in failures[0]
+    assert services == [] and executor._runtime_tare_phase == 'SETTLING'
+
+
+def test_real_clock_tare_retains_original_timer_selection(monkeypatch):
+    executor, step, planned, _, _, _, failures, timers = _arrival_tare_executor(
+        monkeypatch, position_error=.0029)
+    executor.get_clock = lambda: SimpleNamespace(ros_time_is_active=False)
+    moveit_executor.MoveItExecutor._begin_runtime_tare_before_contact(executor, step, planned)
+    assert failures == [] and timers[-1].options == {}

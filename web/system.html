@@ -2,13 +2,38 @@
 <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>스케치 로봇 시스템</title>
 <style>
-:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#101720;color:#ecf1f8}body{max-width:1050px;margin:40px auto;padding:0 24px}h1{font-size:28px;margin-bottom:8px}p{color:#afbdd0;line-height:1.6}.panel{background:#192331;border:1px solid #334257;border-radius:12px;padding:22px;margin:20px 0}.row{display:flex;gap:16px;flex-wrap:wrap;align-items:center}label{display:flex;gap:8px;align-items:center}input,select,button,a.button{font:inherit;border-radius:7px;padding:10px;border:1px solid #475974;background:#223247;color:inherit}button,a.button{cursor:pointer;text-decoration:none}button.primary{background:#1d65c1;border-color:#3e8ced}button:disabled{opacity:.4;cursor:default}input[type=checkbox]{accent-color:#579dfa}.process-row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:12px 0;border-bottom:1px solid #334257}.process-row span{flex:1;min-width:250px}.process-row button{padding:6px 10px}pre{max-height:320px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;line-height:1.6}#error{color:#ffadad;white-space:pre-wrap}#state{font-weight:700;color:#8fc7ff}#profile-help{min-height:26px}.caption{font-size:13px}a{color:#8fc7ff}summary{cursor:pointer}
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#101720;color:#ecf1f8}body{max-width:1050px;margin:40px auto;padding:0 24px}h1{font-size:28px;margin-bottom:8px}p{color:#afbdd0;line-height:1.6;overflow-wrap:anywhere}.panel{background:#192331;border:1px solid #334257;border-radius:12px;padding:22px;margin:20px 0}.row{display:flex;gap:16px;flex-wrap:wrap;align-items:center}label{display:flex;gap:8px;align-items:center}input,select,button,a.button{font:inherit;border-radius:7px;padding:10px;border:1px solid #475974;background:#223247;color:inherit}button,a.button{cursor:pointer;text-decoration:none}button.primary{background:#1d65c1;border-color:#3e8ced}button:disabled{opacity:.4;cursor:default}input[type=checkbox]{accent-color:#579dfa}.process-row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:12px 0;border-bottom:1px solid #334257}.process-row span{flex:1;min-width:250px}.process-row button{padding:6px 10px}pre{max-height:320px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;line-height:1.6}#runtime-error,#error{color:#ffadad;white-space:pre-wrap}#state{font-weight:700;color:#8fc7ff}#profile-help{min-height:26px}.caption{font-size:13px}a{color:#8fc7ff}summary{cursor:pointer}h2{font-size:20px}#runtime-pending{color:#ffcf85}#runtime-phase{color:#8fc7ff}[hidden]{display:none!important}input{max-width:100%;box-sizing:border-box}
 </style></head><body>
-<h1>스케치 로봇 시스템</h1><p>Michelo에서 카메라를 연결한 뒤, 스케치 작업 시스템을 시작하세요.</p>
+<h1>스케치 로봇 시스템</h1><p>실행 환경과 공정을 선택하고 설정을 적용한 뒤, 스케치 화면에서 작업하세요.</p>
+<section class="panel" aria-labelledby="runtime-title">
+<h2 id="runtime-title">실행 구성</h2>
+<div class="row"><label>실행 모드 <select id="runtime-mode"><option value="simulation">시뮬레이션</option><option value="mixed">일부 시뮬레이션</option><option value="real">실환경</option></select></label></div>
+<p id="runtime-mode-help"></p>
+<div class="row"><label>로봇 플랫폼 <select id="runtime-platform"><option value="commercial">상용로봇 플랫폼</option><option value="rb10">RB10 베이스</option></select></label><label id="runtime-arm-field">작업 팔 <select id="runtime-arm"><option value="left">왼팔</option><option value="right">오른팔</option></select></label><label>공정 <select id="runtime-process"><option value="spray">내화뿜칠</option><option value="weld">용접</option><option value="paint">롤러도장</option></select></label></div>
+<p>장착 EOAT · <strong id="runtime-eoat">확인 중</strong></p>
+<div id="runtime-camera" hidden><p>실제 카메라 입력 · <span id="runtime-camera-status">연결·보정 확인 필요</span></p><a id="runtime-michelo-link" target="_blank" rel="noopener noreferrer">Michelo 카메라 연결 ↗</a> · <a href="#runtime-connections">카메라 선택·보정 설정</a></div>
+<div id="runtime-robot" hidden><p>실제 로봇 연결과 장착 EOAT·보정을 확인하세요. <a href="#runtime-connections">연결 설정</a></p></div>
+<p id="runtime-capability"></p>
+<p>설정 구성 · <span id="runtime-desired">서버 연결 중</span></p>
+<p>현재 적용 구성 · <strong id="runtime-applied">확인 중</strong></p>
+<p id="runtime-pending" role="status"></p><p>준비 상태 · <span id="runtime-phase">확인 중</span></p>
+<div class="row"><button id="runtime-save" disabled>설정 저장</button><button id="runtime-apply" class="primary" disabled>적용 / 시스템 시작·재시작</button><button id="runtime-stop" disabled>시스템 종료</button><a class="button" href="/sketch/" target="_blank" rel="noopener">스케치 화면 열기 ↗</a></div>
+<p id="runtime-error" role="alert"></p>
+<p class="caption">적용하면 관련 프로세스를 다시 시작하고 이전 작업 정보를 초기화합니다. 실제 작업은 스케치 화면에서 시작합니다.</p>
+</section>
+<section class="panel"><strong>작업 준비 상태</strong><p id="readiness">시스템을 시작하면 표시됩니다.</p><p class="caption">프로세스 기동과 작업 준비 상태는 별도로 확인합니다. 전체 종료는 비상정지 버튼을 대체하지 않습니다.</p></section>
+<details id="advanced"><summary>고급 설정 / 진단 · 기존 실행 구성</summary>
+<section class="panel" id="runtime-connections"><h2>실행 구성 연결 설정</h2><p class="caption">실제 카메라가 필요한 모드에서 사용합니다. 보정 파일은 서버에서 검증합니다.</p>
+<label>Outpost 주소 <input id="runtime-outpost-http" value="http://127.0.0.1:8100" size="28"></label>
+<p><button id="runtime-camera-load">연결된 카메라 목록</button></p>
+<div class="row"><label>ZED <select id="runtime-zed-select"><option value="">카메라를 선택하세요</option></select></label><label>ID <input id="runtime-outpost-zed-hw-id"></label><label>시리얼 <input id="runtime-outpost-zed-serial"></label><label>보정 파일 <input id="runtime-zed-calibration-file"></label></div>
+<br><div class="row"><label>D405 <select id="runtime-d405-select"><option value="">카메라를 선택하세요</option></select></label><label>ID <input id="runtime-outpost-d405-hw-id"></label><label>시리얼 <input id="runtime-outpost-d405-serial"></label><label>보정 파일 <input id="runtime-d405-calibration-file"></label></div>
+<p id="runtime-robot-connection"><label>로봇 IP <input id="runtime-robot-ip" placeholder="10.0.2.7"></label></p>
+</section>
 <section class="panel"><div class="row"><strong>시스템</strong><span id="state">확인 중</span><span id="domain" class="caption"></span></div><p id="detail">API 서버 연결 중…</p>
-<div class="row"><label>API 토큰 <input type="password" id="token" autocomplete="off" placeholder="설정한 경우 입력"></label><button id="connect">연결 확인</button><a href="/docs" target="_blank">API 문서 ↗</a></div><br><div class="row"><label>실행 모드 <select id="profile"><option value="isaac_construct">Construct · Isaac Sim</option><option value="zed_preview">ZED만 · 경로 생성 (로봇 없음)</option><option value="dry_run">실장비 연결 · 모의 실행</option><option value="work">실장비 연결 · 작업 허용</option><option value="spray_motion_test">EOAT 뿜칠 이동 검증 · 분사 OFF</option><option value="fake">가상 하드웨어 · 모의 실행</option></select></label><label>로봇 모델 <select id="model-id"><option value="construct_left">Construct · 왼팔</option><option value="construct_right">Construct · 오른팔</option><option value="rb10_1300e_u">RB10-1300E</option><option value="rb20_1900es">RB20-1900ES</option></select></label><label>로봇 IP <input id="robot-ip" value="10.0.2.7" size="13"></label></div>
+<div class="row"><label>API 토큰 <input type="password" id="token" autocomplete="off" placeholder="설정한 경우 입력"></label><button id="connect">연결 확인</button><a href="/docs" target="_blank">API 문서 ↗</a></div><br><div class="row"><label>실행 모드 <select id="profile"><option value="isaac_rb20_paint">RB20 도장 · Isaac Sim</option><option value="isaac_construct">상용로봇 플랫폼 · Isaac Sim</option><option value="zed_preview">ZED만 · 경로 생성 (로봇 없음)</option><option value="dry_run">실장비 연결 · 모의 실행</option><option value="work">실장비 연결 · 작업 허용</option><option value="spray_motion_test">EOAT 뿜칠 이동 검증 · 분사 OFF</option><option value="fake">가상 하드웨어 · 모의 실행</option></select></label><label>로봇 모델 <select id="model-id"><option value="construct_left">상용로봇 플랫폼 · 왼팔</option><option value="construct_right">상용로봇 플랫폼 · 오른팔</option><option value="rb10_1300e_u">RB10-1300E</option><option value="rb20_1900es">RB20-1900ES</option></select></label><label>로봇 IP <input id="robot-ip" value="10.0.2.7" size="13"></label></div>
 <p id="profile-help">로봇·카메라에 연결하지만 작업 경로와 힘 출력은 모의 실행합니다.</p>
-<div class="row"><label>작업 방식 <select id="process-mode"><option value="paint">롤러 도장 · D405 측정</option><option value="spray">내화뿜칠 · ZED 평면</option><option value="weld">용접 · 3D 용접심</option></select></label></div>
+<div class="row"><label>공정 <select id="process-mode"><option value="paint">롤러 도장 · D405 측정</option><option value="spray">내화뿜칠 · ZED 평면</option><option value="weld">용접 · 3D 용접심</option></select></label></div>
 <div class="row"><label style="flex-wrap:wrap;max-width:100%">Spray EOAT 프로파일 <input type="text" id="spray-eoat-profile" maxlength="4096" size="40" style="min-width:0;max-width:100%;box-sizing:border-box"></label></div>
 <div class="row"><label>카메라 입력 <select id="camera-backend"><option value="outpost">Michelo Outpost 데몬</option><option value="native">기존 ROS 드라이버</option></select></label><a id="michelo-link" class="button" target="_blank" rel="noopener noreferrer">Michelo 카메라 화면 ↗</a></div>
 <div id="outpost-settings"><p class="caption">Michelo에서 ZED의 RGB·깊이 스트리밍을 시작하세요. D405는 롤러 도장에서만 필요합니다. 카메라 연결·종료는 Michelo에서 관리합니다.</p>
@@ -18,9 +43,11 @@
 <div class="row"><label>D405 <select id="outpost-d405-select"><option value="">카메라 목록을 불러오세요</option></select></label><label>ID <input id="outpost-d405-hw-id" size="12"></label><label>보정한 시리얼 <input id="outpost-d405-serial" size="14"></label></div></div>
 <p class="caption">Outpost 사용 시 ROS 브리지만 실행합니다. 원본 IPC에 접근할 수 있는 계정으로 실행해야 합니다.</p>
 <div class="row"><label><input type="checkbox" id="zed">ZED 드라이버 시작</label><label><input type="checkbox" id="d405">D405 드라이버 시작</label><label><input type="checkbox" id="rviz" checked>RViz 표시</label></div>
-<div class="row"><button id="start" class="primary" disabled>전체 시작</button><button id="stop" disabled>전체 종료</button><a class="button" href="/sketch/" target="_blank" rel="noopener">스케치 화면 열기 ↗</a></div>
+<div class="row"><button id="start" disabled>기존 구성 시작</button><button id="stop" disabled>전체 종료</button><a class="button" href="/sketch/" target="_blank" rel="noopener">스케치 화면 열기 ↗</a></div>
 <p id="error" role="alert"></p></section>
 <section class="panel"><strong>프로세스 관리</strong><p class="caption">선행 프로세스가 실행 중이어야 개별 시작할 수 있습니다. 종료·재시작 시 의존 프로세스도 종료됩니다.</p><div id="processes"></div></section>
-<section class="panel"><strong>작업 준비 상태</strong><p id="readiness">시스템을 시작하면 표시됩니다.</p><p class="caption">프로세스 기동과 작업 준비 상태는 별도로 확인합니다. 실제 작업은 스케치 화면에서 실행합니다. 전체 종료는 비상정지 버튼을 대체하지 않습니다.</p><details><summary>상태 상세</summary><pre id="status-json"></pre></details></section>
+<section class="panel"><details><summary>상태 상세</summary><pre id="status-json"></pre></details></section>
 <section class="panel"><strong>실행 로그</strong> <select id="log-process"></select><pre id="logs">아직 실행 로그가 없습니다.</pre></section>
+</details>
+<script src="/sketch/js/runtime_settings.js"></script>
 <script src="/sketch/js/system.js"></script></body></html>

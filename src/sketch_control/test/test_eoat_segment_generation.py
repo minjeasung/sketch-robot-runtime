@@ -557,7 +557,7 @@ def test_outside_free_sketch_is_rejected_with_json_point_count_not_clipped():
     assert cleared == ["World"]
 
 
-def test_accepted_status_arms_exactly_the_next_refined_pose_generation():
+def test_metadata_only_accepted_status_never_arms_an_unbound_refined_pose():
     node = _generator_stub(real=True, accepted=False)
     old_pose = PoseStamped()
     old_pose.pose.position.x = -1.0
@@ -576,16 +576,16 @@ def test_accepted_status_arms_exactly_the_next_refined_pose_generation():
     node._on_d405_refinement_status(status)
 
     assert node.latest_refined_work_area is None
-    assert node.d405_refined_pose_armed is True
-    assert node.d405_refined_pose_generation_id == "plane-2"
+    assert node.d405_refined_pose_armed is False
+    assert node.d405_refined_pose_generation_id == ""
 
     accepted_pose = PoseStamped()
     accepted_pose.pose.position.x = 2.0
     node._on_refined_work_area(accepted_pose)
-    assert node.latest_refined_work_area is accepted_pose
+    assert node.latest_refined_work_area is None
     assert node.d405_refined_pose_armed is False
 
     extra_pose = PoseStamped()
     extra_pose.pose.position.x = 3.0
     node._on_refined_work_area(extra_pose)
-    assert node.latest_refined_work_area is accepted_pose
+    assert node.latest_refined_work_area is None
